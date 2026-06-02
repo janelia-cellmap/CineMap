@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mvideo"
+version = "0.1.0"
+description = "Agentic video generation for large-scale EM segmentation data (Neuroglancer + Blender, Claude-directed keyframe timeline)"
+readme = "plan.md"
+requires-python = ">=3.11"
+authors = [{ name = "zouinkhim" }]
+
+# Python runtime dependencies. Add new deps HERE, then:
+#   conda run -n mv_env pip install -e .
+# (Blender is NOT a pip dep — it is installed into mv_env via conda-forge; see plan.md.)
+dependencies = [
+  # --- backend / API ---
+  "fastapi",
+  "uvicorn[standard]",
+  "websockets",
+  "pydantic>=2",
+  "python-multipart",
+  # --- agent ---
+  "anthropic",
+  # --- visualization / state ---
+  "neuroglancer",
+  "selenium",       # drives neuroglancer.webdriver for headless screenshots
+                    # (needs chromium + chromedriver binaries, installed into mv_env via conda-forge)
+  # --- data access ---
+  "cloud-volume",   # precomputed volumes + meshes
+  "tensorstore",    # zarr/n5/ome-zarr array + metadata reads
+  "zarr<3",         # cloud-volume / ome compatibility
+  "trimesh",        # mesh load/convert for Blender import
+  # --- blender (render worker) ---
+  "bpy",            # Blender as a Python module (Cycles); run in a subprocess script for isolation
+  # --- core ---
+  "numpy<2",        # bpy 5.x requires numpy<2; keep the whole env on 1.x
+  "pillow",
+  "scipy",          # slerp / interpolation helpers
+]
+
+[project.optional-dependencies]
+dev = ["ruff", "pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mvideo"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

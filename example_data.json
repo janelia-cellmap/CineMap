@@ -1,0 +1,301 @@
+{
+  "title": "jrc_mus-salivary-1",
+  "neuroglancer_state_url": "https://storage.googleapis.com/flyem-user-links/short/jrc_mus-salivary/jrc_mus-salivary-1.json",
+  "server": "https://cellmap-vm1.int.janelia.org",
+  "nrs_root": "/nrs/data/jrc_mus-salivary-1",
+  "zarr_root": "/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1",
+  "voxel_size_nm": {
+    "x": 8.0,
+    "y": 8.0,
+    "z": 8.0
+  },
+  "dimensions": {
+    "x": {
+      "resolution_m": 8e-09,
+      "unit": "m"
+    },
+    "y": {
+      "resolution_m": 8e-09,
+      "unit": "m"
+    },
+    "z": {
+      "resolution_m": 8e-09,
+      "unit": "m"
+    }
+  },
+  "position_voxels": [
+    7696.0,
+    6933.0,
+    7443.0
+  ],
+  "layers": [
+    {
+      "name": "fibsem-uint8",
+      "type": "image",
+      "visible": true,
+      "category": "em",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/em/fibsem-uint8",
+          "format": "zarr",
+          "role": "volume"
+        }
+      ]
+    },
+    {
+      "name": "er",
+      "type": "segmentation",
+      "visible": true,
+      "category": "inference",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/inference/segmentations/er",
+          "format": "zarr",
+          "role": "volume"
+        }
+      ]
+    },
+    {
+      "name": "mito",
+      "type": "segmentation",
+      "visible": true,
+      "category": "inference",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/inference/segmentations/mito",
+          "format": "zarr",
+          "role": "volume"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/mesh/inference/segmentations/mito/",
+          "format": "neuroglancer-precomputed",
+          "role": "mesh"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/skeleton/inference/segmentations/mito/simplified/",
+          "format": "neuroglancer-precomputed",
+          "role": "skeleton"
+        }
+      ]
+    },
+    {
+      "name": "nuc",
+      "type": "segmentation",
+      "visible": true,
+      "category": "inference",
+      "num_segments": 1916,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/inference/segmentations/nuc",
+          "format": "zarr",
+          "role": "volume"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/mesh/inference/segmentations/nuc/",
+          "format": "neuroglancer-precomputed",
+          "role": "mesh"
+        }
+      ]
+    },
+    {
+      "name": "crop1000",
+      "type": "segmentation",
+      "visible": false,
+      "category": "groundtruth",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/groundtruth/crop1000/all/",
+          "format": "zarr2",
+          "role": "volume"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/mesh/groundtruth/crop1000/all/",
+          "format": "neuroglancer-precomputed",
+          "role": "mesh"
+        }
+      ]
+    },
+    {
+      "name": "crop1001",
+      "type": "segmentation",
+      "visible": false,
+      "category": "groundtruth",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/groundtruth/crop1001/all/",
+          "format": "zarr2",
+          "role": "volume"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/mesh/groundtruth/crop1001/all/",
+          "format": "neuroglancer-precomputed",
+          "role": "mesh"
+        }
+      ]
+    },
+    {
+      "name": "crop1002",
+      "type": "segmentation",
+      "visible": false,
+      "category": "groundtruth",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/groundtruth/crop1002/all/",
+          "format": "zarr2",
+          "role": "volume"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/mesh/groundtruth/crop1002/all/",
+          "format": "neuroglancer-precomputed",
+          "role": "mesh"
+        }
+      ]
+    },
+    {
+      "name": "crop1003",
+      "type": "segmentation",
+      "visible": false,
+      "category": "groundtruth",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/groundtruth/crop1003/all/",
+          "format": "zarr2",
+          "role": "volume"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/mesh/groundtruth/crop1003/all/",
+          "format": "neuroglancer-precomputed",
+          "role": "mesh"
+        }
+      ]
+    },
+    {
+      "name": "crop1068",
+      "type": "segmentation",
+      "visible": false,
+      "category": "groundtruth",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/groundtruth/crop1068/all/",
+          "format": "zarr2",
+          "role": "volume"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/mesh/groundtruth/crop1068/all/",
+          "format": "neuroglancer-precomputed",
+          "role": "mesh"
+        }
+      ]
+    },
+    {
+      "name": "crop507",
+      "type": "segmentation",
+      "visible": false,
+      "category": "groundtruth",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/groundtruth/crop507/all/",
+          "format": "zarr2",
+          "role": "volume"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/mesh/groundtruth/crop507/all/",
+          "format": "neuroglancer-precomputed",
+          "role": "mesh"
+        }
+      ]
+    },
+    {
+      "name": "crop508",
+      "type": "segmentation",
+      "visible": false,
+      "category": "groundtruth",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/groundtruth/crop508/all/",
+          "format": "zarr2",
+          "role": "volume"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/mesh/groundtruth/crop508/all/",
+          "format": "neuroglancer-precomputed",
+          "role": "mesh"
+        }
+      ]
+    },
+    {
+      "name": "crop509",
+      "type": "segmentation",
+      "visible": false,
+      "category": "groundtruth",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/groundtruth/crop509/all/",
+          "format": "zarr2",
+          "role": "volume"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/mesh/groundtruth/crop509/all/",
+          "format": "neuroglancer-precomputed",
+          "role": "mesh"
+        }
+      ]
+    },
+    {
+      "name": "crop552",
+      "type": "segmentation",
+      "visible": false,
+      "category": "groundtruth",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/groundtruth/crop552/all/",
+          "format": "zarr2",
+          "role": "volume"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/mesh/groundtruth/crop552/all/",
+          "format": "neuroglancer-precomputed",
+          "role": "mesh"
+        }
+      ]
+    },
+    {
+      "name": "crop999",
+      "type": "segmentation",
+      "visible": false,
+      "category": "groundtruth",
+      "num_segments": 0,
+      "sources": [
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/groundtruth/crop999/all/",
+          "format": "zarr2",
+          "role": "volume"
+        },
+        {
+          "url": "https://cellmap-vm1.int.janelia.org/nrs/data/jrc_mus-salivary-1/neuroglancer/mesh/groundtruth/crop999/all/",
+          "format": "neuroglancer-precomputed",
+          "role": "mesh"
+        }
+      ]
+    }
+  ],
+  "_notes": {
+    "em_source": "fibsem-uint8 zarr -> EM cross-section slice planes",
+    "mesh_sources": "inference mito/nuc have neuroglancer-precomputed meshes -> Blender",
+    "er": "label volume only (no precomputed mesh listed) -> mesh must be generated",
+    "groundtruth_crops": "10 hand-annotated crops, hidden by default (zarr2 + precomputed mesh)",
+    "access": "https urls resolve to nrs_root on the filesystem; prefer direct /nrs reads from the cluster if mounted"
+  }
+}

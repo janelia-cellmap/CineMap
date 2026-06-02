@@ -1,0 +1,256 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <linearGradient id="emvol" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2430"/>
+      <stop offset="0.5" stop-color="#2a3b4d"/>
+      <stop offset="1" stop-color="#10161e"/>
+    </linearGradient>
+    <radialGradient id="mesh" cx="0.5" cy="0.45" r="0.6">
+      <stop offset="0" stop-color="#ffb86b"/>
+      <stop offset="0.55" stop-color="#e8743b"/>
+      <stop offset="1" stop-color="#7a2f1a"/>
+    </radialGradient>
+    <radialGradient id="mesh2" cx="0.5" cy="0.5" r="0.6">
+      <stop offset="0" stop-color="#7ad0ff"/>
+      <stop offset="1" stop-color="#1f5f8a"/>
+    </radialGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a1d24"/>
+      <stop offset="1" stop-color="#141720"/>
+    </linearGradient>
+  </defs>
+
+  <!-- app background -->
+  <rect width="1600" height="1000" fill="#0d0f14"/>
+
+  <!-- ===================== TOP BAR ===================== -->
+  <rect x="0" y="0" width="1600" height="48" fill="#161922"/>
+  <rect x="0" y="47" width="1600" height="1" fill="#2a2f3a"/>
+  <circle cx="26" cy="24" r="9" fill="#e8743b"/>
+  <text x="44" y="29" fill="#e9edf3" font-size="16" font-weight="600">mvideo</text>
+  <text x="120" y="29" fill="#7d8694" font-size="13">project:</text>
+  <text x="178" y="29" fill="#c7cfda" font-size="13" font-weight="600">jrc_mus-salivary-1</text>
+  <text x="340" y="29" fill="#7d8694" font-size="13" font-family="monospace">/nrs/cellmap/.../jrc_mus-salivary/em.zarr</text>
+  <!-- top right buttons -->
+  <rect x="1300" y="12" width="92" height="26" rx="5" fill="#222734" stroke="#333a48"/>
+  <text x="1346" y="29" fill="#c7cfda" font-size="12" text-anchor="middle">Analyze</text>
+  <rect x="1400" y="12" width="92" height="26" rx="5" fill="#222734" stroke="#333a48"/>
+  <text x="1446" y="29" fill="#c7cfda" font-size="12" text-anchor="middle">Save</text>
+  <rect x="1500" y="12" width="84" height="26" rx="5" fill="#2e7d46"/>
+  <text x="1542" y="29" fill="#ffffff" font-size="12" font-weight="600" text-anchor="middle">Render ▸</text>
+
+  <!-- ===================== NEUROGLANCER VIEWER ===================== -->
+  <rect x="12" y="60" width="784" height="560" rx="8" fill="url(#emvol)" stroke="#2a2f3a"/>
+  <!-- cross-section grid hint -->
+  <g opacity="0.18" stroke="#9fb6cc" stroke-width="1">
+    <line x1="404" y1="60" x2="404" y2="620"/>
+    <line x1="12" y1="340" x2="796" y2="340"/>
+  </g>
+  <!-- volume / mesh blobs -->
+  <ellipse cx="300" cy="300" rx="150" ry="110" fill="url(#mesh)" opacity="0.92" transform="rotate(-18 300 300)"/>
+  <ellipse cx="520" cy="420" rx="95" ry="70" fill="url(#mesh2)" opacity="0.85" transform="rotate(22 520 420)"/>
+  <ellipse cx="560" cy="210" rx="70" ry="55" fill="#b06be8" opacity="0.7" transform="rotate(10 560 210)"/>
+  <!-- speckle EM texture dots -->
+  <g fill="#9fb6cc" opacity="0.10">
+    <circle cx="120" cy="140" r="2"/><circle cx="180" cy="500" r="2"/><circle cx="650" cy="150" r="2"/>
+    <circle cx="700" cy="500" r="2"/><circle cx="430" cy="120" r="2"/><circle cx="250" cy="560" r="2"/>
+    <circle cx="600" cy="560" r="2"/><circle cx="90" cy="400" r="2"/>
+  </g>
+  <!-- NG label + axis gizmo -->
+  <rect x="24" y="72" width="160" height="24" rx="4" fill="#000000" opacity="0.45"/>
+  <text x="34" y="88" fill="#9fe0ff" font-size="12" font-weight="600">◆ Neuroglancer</text>
+  <g transform="translate(740,576)" stroke-width="2" font-size="11" font-weight="700">
+    <line x1="0" y1="0" x2="22" y2="0" stroke="#ff5a5a"/><text x="26" y="4" fill="#ff5a5a">x</text>
+    <line x1="0" y1="0" x2="0" y2="-22" stroke="#5aff7a"/><text x="-3" y="-26" fill="#5aff7a">y</text>
+    <line x1="0" y1="0" x2="-15" y2="13" stroke="#5a9aff"/><text x="-26" y="20" fill="#5a9aff">z</text>
+  </g>
+
+  <!-- ===================== BLENDER PREVIEW ===================== -->
+  <rect x="804" y="60" width="370" height="270" rx="8" fill="#0c0d11" stroke="#2a2f3a"/>
+  <ellipse cx="989" cy="200" rx="120" ry="92" fill="url(#mesh)" transform="rotate(-12 989 200)"/>
+  <ellipse cx="1040" cy="250" rx="55" ry="42" fill="url(#mesh2)" opacity="0.9"/>
+  <!-- soft studio light highlight -->
+  <ellipse cx="950" cy="160" rx="40" ry="26" fill="#ffffff" opacity="0.20"/>
+  <rect x="814" y="70" width="150" height="22" rx="4" fill="#000000" opacity="0.5"/>
+  <text x="824" y="85" fill="#ffb86b" font-size="12" font-weight="600">⬡ Blender · Cycles</text>
+  <text x="1164" y="322" fill="#6b7280" font-size="11" text-anchor="end">preview · 480p</text>
+
+  <!-- ===================== CLAUDE CHAT ===================== -->
+  <rect x="804" y="338" width="370" height="282" rx="8" fill="url(#panel)" stroke="#2a2f3a"/>
+  <text x="820" y="364" fill="#e9edf3" font-size="14" font-weight="700">Claude</text>
+  <circle cx="1158" cy="359" r="4" fill="#2e7d46"/>
+  <!-- user bubble -->
+  <rect x="900" y="378" width="258" height="46" rx="8" fill="#243246"/>
+  <text x="916" y="397" fill="#c7cfda" font-size="11.5">rotate 360° around the mito mesh,</text>
+  <text x="916" y="413" fill="#c7cfda" font-size="11.5">fade in the ER, then zoom to nucleus</text>
+  <!-- claude bubble -->
+  <rect x="820" y="432" width="300" height="92" rx="8" fill="#1d2530"/>
+  <text x="834" y="450" fill="#c7cfda" font-size="11.5">Added 14 keyframes:</text>
+  <text x="834" y="468" fill="#8fb7e0" font-size="11" font-family="monospace">↳ make_orbit(mito, 360°, n=12)</text>
+  <text x="834" y="484" fill="#8fb7e0" font-size="11" font-family="monospace">↳ reveal_layers([er], fade=1.5s)</text>
+  <text x="834" y="500" fill="#8fb7e0" font-size="11" font-family="monospace">↳ set_camera(target=nucleus)</text>
+  <text x="834" y="516" fill="#7fcf95" font-size="11">✓ timeline updated · preview ready</text>
+  <!-- input box -->
+  <rect x="820" y="582" width="340" height="28" rx="6" fill="#0c0d11" stroke="#333a48"/>
+  <text x="834" y="601" fill="#6b7280" font-size="12">Ask Claude to direct a shot…</text>
+
+  <!-- ===================== LAYERS / SCENE STRIP (left under viewer) ===================== -->
+  <rect x="12" y="628" width="784" height="0" fill="none"/>
+
+  <!-- ===================== KEYFRAME TIMELINE ===================== -->
+  <rect x="12" y="636" width="1162" height="352" rx="8" fill="#12151c" stroke="#2a2f3a"/>
+  <text x="28" y="664" fill="#e9edf3" font-size="14" font-weight="700">Keyframe Timeline</text>
+  <text x="190" y="664" fill="#7d8694" font-size="12">14 frames · 11.5s · composite · 1080p · 60fps</text>
+  <!-- transport -->
+  <rect x="1000" y="650" width="74" height="22" rx="4" fill="#222734" stroke="#333a48"/>
+  <text x="1037" y="665" fill="#c7cfda" font-size="11" text-anchor="middle">▶ Preview</text>
+  <rect x="1084" y="650" width="78" height="22" rx="4" fill="#2e7d46"/>
+  <text x="1123" y="665" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">Render mp4</text>
+
+  <!-- ruler -->
+  <rect x="28" y="680" width="1130" height="2" fill="#2a2f3a"/>
+  <g fill="#6b7280" font-size="10">
+    <text x="28" y="697">0s</text><text x="240" y="697">2s</text><text x="450" y="697">4s</text>
+    <text x="660" y="697">6s</text><text x="870" y="697">8s</text><text x="1080" y="697">10s</text>
+  </g>
+
+  <!-- keyframe cards row -->
+  <g>
+    <!-- KF template via repeated groups -->
+    <!-- KF0 selected -->
+    <g>
+      <rect x="28" y="712" width="150" height="150" rx="6" fill="url(#emvol)" stroke="#e8743b" stroke-width="2.5"/>
+      <ellipse cx="80" cy="775" rx="44" ry="32" fill="url(#mesh)"/>
+      <rect x="28" y="712" width="150" height="20" rx="6" fill="#000" opacity="0.4"/>
+      <text x="36" y="726" fill="#fff" font-size="10" font-weight="600">KF0 · establish</text>
+      <text x="36" y="855" fill="#cbd3de" font-size="9.5">orbit 0° · ng</text>
+    </g>
+    <!-- transition arrow -->
+    <text x="190" y="792" fill="#5a6473" font-size="14" text-anchor="middle">→</text>
+    <g>
+      <rect x="202" y="712" width="150" height="150" rx="6" fill="url(#emvol)" stroke="#333a48"/>
+      <ellipse cx="262" cy="780" rx="44" ry="32" fill="url(#mesh)" transform="rotate(40 262 780)"/>
+      <rect x="202" y="712" width="150" height="20" rx="6" fill="#000" opacity="0.4"/>
+      <text x="210" y="726" fill="#fff" font-size="10" font-weight="600">KF4 · orbit</text>
+      <text x="210" y="855" fill="#cbd3de" font-size="9.5">120° · ease-in-out</text>
+    </g>
+    <text x="364" y="792" fill="#5a6473" font-size="14" text-anchor="middle">→</text>
+    <g>
+      <rect x="376" y="712" width="150" height="150" rx="6" fill="url(#emvol)" stroke="#333a48"/>
+      <ellipse cx="436" cy="780" rx="44" ry="32" fill="url(#mesh)" transform="rotate(220 436 780)"/>
+      <ellipse cx="470" cy="800" rx="30" ry="22" fill="url(#mesh2)" opacity="0.6"/>
+      <rect x="376" y="712" width="150" height="20" rx="6" fill="#000" opacity="0.4"/>
+      <text x="384" y="726" fill="#fff" font-size="10" font-weight="600">KF8 · ER fade-in</text>
+      <text x="384" y="855" fill="#cbd3de" font-size="9.5">opacity 0→1 · 1.5s</text>
+    </g>
+    <text x="538" y="792" fill="#5a6473" font-size="14" text-anchor="middle">→</text>
+    <g>
+      <rect x="550" y="712" width="150" height="150" rx="6" fill="url(#emvol)" stroke="#333a48"/>
+      <ellipse cx="625" cy="788" rx="60" ry="46" fill="url(#mesh)" transform="rotate(330 625 788)"/>
+      <ellipse cx="600" cy="775" rx="26" ry="20" fill="#b06be8" opacity="0.8"/>
+      <rect x="550" y="712" width="150" height="20" rx="6" fill="#000" opacity="0.4"/>
+      <text x="558" y="726" fill="#fff" font-size="10" font-weight="600">KF11 · zoom nuc</text>
+      <text x="558" y="855" fill="#cbd3de" font-size="9.5">zoom 2.4× · composite</text>
+    </g>
+    <text x="712" y="792" fill="#5a6473" font-size="14" text-anchor="middle">→</text>
+    <g>
+      <rect x="724" y="712" width="150" height="150" rx="6" fill="url(#emvol)" stroke="#333a48"/>
+      <ellipse cx="799" cy="788" rx="78" ry="60" fill="#b06be8" opacity="0.85"/>
+      <ellipse cx="780" cy="775" rx="30" ry="24" fill="#ffffff" opacity="0.15"/>
+      <rect x="724" y="712" width="150" height="20" rx="6" fill="#000" opacity="0.4"/>
+      <text x="732" y="726" fill="#fff" font-size="10" font-weight="600">KF13 · nucleus</text>
+      <text x="732" y="855" fill="#cbd3de" font-size="9.5">hold · blender hero</text>
+    </g>
+    <!-- add keyframe card -->
+    <g>
+      <rect x="898" y="712" width="150" height="150" rx="6" fill="#161922" stroke="#333a48" stroke-dasharray="5 4"/>
+      <text x="973" y="795" fill="#5a6473" font-size="34" text-anchor="middle">+</text>
+      <text x="973" y="822" fill="#6b7280" font-size="11" text-anchor="middle">capture frame</text>
+    </g>
+  </g>
+
+  <!-- selected-keyframe inspector (right column, beside timeline) -->
+  <rect x="1186" y="60" width="402" height="928" rx="8" fill="url(#panel)" stroke="#2a2f3a"/>
+  <text x="1204" y="86" fill="#e9edf3" font-size="14" font-weight="700">Inspector — KF0</text>
+  <rect x="1204" y="100" width="366" height="1" fill="#2a2f3a"/>
+
+  <!-- camera section -->
+  <text x="1204" y="126" fill="#9fb6cc" font-size="12" font-weight="600">Camera</text>
+  <text x="1204" y="150" fill="#7d8694" font-size="11">position</text>
+  <text x="1560" y="150" fill="#c7cfda" font-size="11" font-family="monospace" text-anchor="end">[18240, 9120, 6300]</text>
+  <text x="1204" y="172" fill="#7d8694" font-size="11">orientation (quat)</text>
+  <text x="1560" y="172" fill="#c7cfda" font-size="11" font-family="monospace" text-anchor="end">[0.71, 0, 0.71, 0]</text>
+  <text x="1204" y="194" fill="#7d8694" font-size="11">zoom</text>
+  <text x="1560" y="194" fill="#c7cfda" font-size="11" font-family="monospace" text-anchor="end">1.0×</text>
+  <text x="1204" y="216" fill="#7d8694" font-size="11">mode</text>
+  <text x="1560" y="216" fill="#c7cfda" font-size="11" font-family="monospace" text-anchor="end">3D projection</text>
+
+  <!-- transition section -->
+  <text x="1204" y="252" fill="#9fb6cc" font-size="12" font-weight="600">Transition in</text>
+  <text x="1204" y="276" fill="#7d8694" font-size="11">duration</text>
+  <rect x="1360" y="266" width="210" height="6" rx="3" fill="#222734"/>
+  <rect x="1360" y="266" width="84" height="6" rx="3" fill="#e8743b"/>
+  <text x="1455" y="262" fill="#c7cfda" font-size="10">0.8s</text>
+  <text x="1204" y="300" fill="#7d8694" font-size="11">easing</text>
+  <text x="1560" y="300" fill="#c7cfda" font-size="11" font-family="monospace" text-anchor="end">ease-in-out</text>
+
+  <!-- layers section -->
+  <text x="1204" y="338" fill="#9fb6cc" font-size="12" font-weight="600">Layers</text>
+  <g font-size="11">
+    <rect x="1204" y="350" width="366" height="26" rx="4" fill="#1a1f2a"/>
+    <rect x="1212" y="358" width="10" height="10" rx="2" fill="#9fb6cc"/>
+    <text x="1232" y="367" fill="#c7cfda">em  (raw EM · zarr)</text>
+    <text x="1560" y="367" fill="#7fcf95" text-anchor="end">100%</text>
+
+    <rect x="1204" y="380" width="366" height="26" rx="4" fill="#1a1f2a"/>
+    <rect x="1212" y="388" width="10" height="10" rx="2" fill="#e8743b"/>
+    <text x="1232" y="397" fill="#c7cfda">mito  (instance seg · precomputed)</text>
+    <text x="1560" y="397" fill="#7fcf95" text-anchor="end">90%</text>
+
+    <rect x="1204" y="410" width="366" height="26" rx="4" fill="#1a1f2a"/>
+    <rect x="1212" y="418" width="10" height="10" rx="2" fill="#7ad0ff"/>
+    <text x="1232" y="427" fill="#c7cfda">er  (mesh)</text>
+    <text x="1560" y="427" fill="#6b7280" text-anchor="end">0% (hidden)</text>
+
+    <rect x="1204" y="440" width="366" height="26" rx="4" fill="#1a1f2a"/>
+    <rect x="1212" y="448" width="10" height="10" rx="2" fill="#b06be8"/>
+    <text x="1232" y="457" fill="#c7cfda">nucleus  (mesh)</text>
+    <text x="1560" y="457" fill="#7fcf95" text-anchor="end">100%</text>
+  </g>
+
+  <!-- render backend section -->
+  <text x="1204" y="500" fill="#9fb6cc" font-size="12" font-weight="600">Render backend</text>
+  <rect x="1204" y="512" width="118" height="28" rx="5" fill="#222734" stroke="#333a48"/>
+  <text x="1263" y="530" fill="#c7cfda" font-size="11" text-anchor="middle">Neuroglancer</text>
+  <rect x="1328" y="512" width="118" height="28" rx="5" fill="#222734" stroke="#333a48"/>
+  <text x="1387" y="530" fill="#c7cfda" font-size="11" text-anchor="middle">Blender</text>
+  <rect x="1452" y="512" width="118" height="28" rx="5" fill="#2e7d46"/>
+  <text x="1511" y="530" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">Composite</text>
+
+  <!-- data manifest section -->
+  <text x="1204" y="576" fill="#9fb6cc" font-size="12" font-weight="600">Data manifest</text>
+  <g font-size="10.5" font-family="monospace" fill="#8a93a2">
+    <text x="1204" y="598">voxel size      8 × 8 × 8 nm</text>
+    <text x="1204" y="616">volume          24k × 16k × 9k vx</text>
+    <text x="1204" y="634">scales          s0 … s6 (multiscale)</text>
+    <text x="1204" y="652">segments        12,481 instances</text>
+    <text x="1204" y="670">meshes          mito, er, nucleus</text>
+  </g>
+
+  <!-- render status -->
+  <rect x="1204" y="690" width="366" height="1" fill="#2a2f3a"/>
+  <text x="1204" y="716" fill="#9fb6cc" font-size="12" font-weight="600">Render queue</text>
+  <rect x="1204" y="728" width="366" height="30" rx="5" fill="#1a1f2a"/>
+  <text x="1214" y="747" fill="#c7cfda" font-size="11">composite · 1080p60</text>
+  <rect x="1380" y="739" width="150" height="8" rx="4" fill="#222734"/>
+  <rect x="1380" y="739" width="96" height="8" rx="4" fill="#e8743b"/>
+  <text x="1560" y="747" fill="#ffb86b" font-size="10" text-anchor="end">64%</text>
+
+  <!-- preview output -->
+  <rect x="1204" y="772" width="366" height="200" rx="6" fill="#000000" stroke="#2a2f3a"/>
+  <ellipse cx="1387" cy="872" rx="120" ry="86" fill="url(#mesh)" transform="rotate(-15 1387 872)"/>
+  <ellipse cx="1440" cy="905" rx="46" ry="36" fill="url(#mesh2)" opacity="0.85"/>
+  <circle cx="1387" cy="872" r="26" fill="#000" opacity="0.45"/>
+  <path d="M1379 860 L1379 884 L1401 872 Z" fill="#ffffff" opacity="0.9"/>
+  <text x="1214" y="965" fill="#9fe0ff" font-size="11">output · jrc_mus-salivary-1.mp4</text>
+</svg>
