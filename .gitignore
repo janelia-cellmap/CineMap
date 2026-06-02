@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+
+# mvideo runtime data (projects, renders, frames, assets)
+projects/
+
+# spike outputs
+spikes/out/
+spikes/*.log

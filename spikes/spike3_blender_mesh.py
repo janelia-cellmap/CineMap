@@ -60,7 +60,7 @@ def build_scene() -> None:
     bsdf.inputs["Roughness"].default_value = 0.4
     obj.data.materials.append(mat)
 
-    # camera (this is what mvideo animates along the keyframe path)
+    # camera (this is what cinemap animates along the keyframe path)
     cam_data = bpy.data.cameras.new("Camera")
     cam = bpy.data.objects.new("Camera", cam_data)
     scene.collection.objects.link(cam)

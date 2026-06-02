@@ -1,6 +1,6 @@
 """Spike #1 — Neuroglancer headless screenshot at a given state.
 
-Proves the mvideo capture primitive: load a scene, drive a headless browser,
+Proves the cinemap capture primitive: load a scene, drive a headless browser,
 capture a PNG, mutate the camera (projection orientation quaternion), capture a
 SECOND PNG. Two different frames from two states == a keyframe-driven video.
 

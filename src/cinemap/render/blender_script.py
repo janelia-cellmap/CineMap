@@ -1,0 +1,227 @@
+"""Blender (bpy) render script — runs as an isolated subprocess.
+
+Reads a scene spec JSON (produced by worker.py, all coordinates already in
+Blender units) and renders one PNG per frame:
+
+  - imports each mesh OBJ once (static geometry),
+  - per frame: positions the camera, (re)builds the EM slice planes with that
+    frame's image + placement, sets mesh/slice opacity & visibility, renders.
+
+Invoke:  python -m cinemap.render.blender_script <scene.json>
+(launched via the env python so `import bpy` resolves.)
+"""
+from __future__ import annotations
+
+import json
+import sys
+
+import bpy
+from mathutils import Vector
+
+
+def _clear() -> None:
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+
+
+def _setup_render(scene_spec: dict) -> None:
+    scene = bpy.context.scene
+    r = scene_spec["render"]
+    scene.render.engine = r.get("engine", "CYCLES")
+    if scene.render.engine == "CYCLES":
+        try:
+            prefs = bpy.context.preferences.addons["cycles"].preferences
+            prefs.compute_device_type = "OPTIX"
+            prefs.get_devices()
+            for d in prefs.devices:
+                d.use = d.type in ("OPTIX", "CPU")
+            scene.cycles.device = "GPU"
+        except Exception as e:  # noqa: BLE001
+            print(f"[blender] GPU unavailable, CPU: {e}")
+        scene.cycles.samples = r.get("samples", 64)
+    scene.render.resolution_x = r["width"]
+    scene.render.resolution_y = r["height"]
+    scene.render.image_settings.file_format = "PNG"
+
+    world = bpy.data.worlds.new("World")
+    world.use_nodes = True
+    bg = world.node_tree.nodes.get("Background")
+    if bg:
+        c = scene_spec["world"].get("background", [0.02, 0.02, 0.03])
+        bg.inputs[0].default_value = (c[0], c[1], c[2], 1.0)
+    scene.world = world
+
+
+def _add_light(scene_spec: dict) -> None:
+    energy = scene_spec.get("lighting", {}).get("key_energy", 3000.0)
+    base = max(2.0, energy / 600.0)
+    for name, rot, mult in [("Key", (0.6, 0.2, 0.4), 1.0),
+                            ("Fill", (-0.5, -0.3, 2.4), 0.45),
+                            ("Rim", (1.2, 0.0, -1.8), 0.6)]:
+        data = bpy.data.lights.new(name, type="SUN")
+        data.energy = base * mult
+        obj = bpy.data.objects.new(name, data)
+        obj.rotation_euler = rot
+        bpy.context.scene.collection.objects.link(obj)
+    # gentle ambient so nothing is pure black
+    world = bpy.context.scene.world
+    if world and world.use_nodes:
+        bg = world.node_tree.nodes.get("Background")
+        if bg:
+            bg.inputs[1].default_value = 0.3
+
+
+def _import_meshes(scene_spec: dict) -> dict:
+    """Import each mesh once; return name -> (object, material).
+
+    PLY assets may carry per-vertex colors (distinct color per segment); if so the
+    material drives Base Color from the color attribute. Otherwise a solid color.
+    """
+    out = {}
+    for m in scene_spec["meshes"]:
+        path = m["obj_path"]
+        before = set(bpy.data.objects)
+        if path.lower().endswith(".ply"):
+            bpy.ops.wm.ply_import(filepath=path)
+        else:
+            bpy.ops.wm.obj_import(filepath=path)
+        new = [o for o in bpy.data.objects if o not in before]
+        if not new:
+            continue
+        obj = new[0]
+        if len(new) > 1:
+            with bpy.context.temp_override(active_object=obj, selected_editable_objects=new):
+                bpy.ops.object.join()
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.shade_smooth()
+        s = 1.0 / scene_spec["world"]["nm_per_bu"]  # nm -> BU
+        obj.scale = (s, s, s)
+
+        mat = bpy.data.materials.new(f"mat_{m['id']}")
+        mat.use_nodes = True
+        nt = mat.node_tree
+        bsdf = nt.nodes["Principled BSDF"]
+        col = m["color"]
+        bsdf.inputs["Roughness"].default_value = 0.35
+        has_colors = bool(getattr(obj.data, "color_attributes", None)) and len(obj.data.color_attributes) > 0
+        if has_colors:  # per-vertex (per-segment) colors
+            attr = nt.nodes.new("ShaderNodeVertexColor")
+            attr.layer_name = obj.data.color_attributes[0].name
+            nt.links.new(attr.outputs["Color"], bsdf.inputs["Base Color"])
+            if "Emission Color" in bsdf.inputs:
+                nt.links.new(attr.outputs["Color"], bsdf.inputs["Emission Color"])
+        else:  # solid color
+            bsdf.inputs["Base Color"].default_value = (col[0], col[1], col[2], 1.0)
+            if "Emission Color" in bsdf.inputs:
+                bsdf.inputs["Emission Color"].default_value = (col[0], col[1], col[2], 1.0)
+        if "Emission Strength" in bsdf.inputs:
+            bsdf.inputs["Emission Strength"].default_value = 0.15
+        mat.blend_method = "BLEND"
+        obj.data.materials.clear()
+        obj.data.materials.append(mat)
+        out[m["id"]] = (obj, mat)
+    return out
+
+
+def _set_mesh_state(meshes: dict, overrides: dict) -> None:
+    for mid, (obj, mat) in meshes.items():
+        ov = overrides.get(mid)
+        if ov is None:  # not referenced this frame -> hidden (belongs to another keyframe)
+            obj.hide_render = True
+            continue
+        opacity = ov.get("opacity", 1.0)
+        visible = ov.get("visible", True) and opacity > 0.001
+        obj.hide_render = not visible
+        bsdf = mat.node_tree.nodes["Principled BSDF"]
+        if "Alpha" in bsdf.inputs:
+            bsdf.inputs["Alpha"].default_value = opacity
+
+
+_slice_objs: list = []
+
+
+def _build_slices(frame: dict) -> None:
+    global _slice_objs
+    for o in _slice_objs:
+        if o.name in bpy.data.objects:
+            bpy.data.objects.remove(o, do_unlink=True)
+    _slice_objs = []
+    for i, sl in enumerate(frame.get("slices", [])):
+        if sl.get("opacity", 1.0) <= 0.001:
+            continue
+        origin = Vector(sl["origin_bu"])
+        u = Vector(sl["u_bu"])
+        v = Vector(sl["v_bu"])
+        # build a quad from origin, +u, +u+v, +v
+        verts = [origin, origin + u, origin + u + v, origin + v]
+        mesh = bpy.data.meshes.new(f"slice_{i}")
+        mesh.from_pydata([list(p) for p in verts], [], [[0, 1, 2, 3]])
+        mesh.update()
+        # UVs
+        mesh.uv_layers.new(name="UVMap")
+        uvs = [(0, 0), (1, 0), (1, 1), (0, 1)]
+        for li, loop in enumerate(mesh.loops):
+            mesh.uv_layers.active.data[li].uv = uvs[li % 4]
+        obj = bpy.data.objects.new(f"slice_{i}", mesh)
+        bpy.context.scene.collection.objects.link(obj)
+        obj.visible_shadow = False  # don't shadow meshes that sit below the plane
+
+        mat = bpy.data.materials.new(f"slice_mat_{i}")
+        mat.use_nodes = True
+        nt = mat.node_tree
+        nt.nodes.clear()
+        tex = nt.nodes.new("ShaderNodeTexImage")
+        img = bpy.data.images.load(sl["image_path"], check_existing=True)
+        img.colorspace_settings.name = "Non-Color"
+        tex.image = img
+        emit = nt.nodes.new("ShaderNodeEmission")
+        emit.inputs["Strength"].default_value = 0.9  # slightly tame the bright EM plane
+        transp = nt.nodes.new("ShaderNodeBsdfTransparent")
+        mix = nt.nodes.new("ShaderNodeMixShader")
+        out = nt.nodes.new("ShaderNodeOutputMaterial")
+        nt.links.new(tex.outputs["Color"], emit.inputs["Color"])
+        mix.inputs[0].default_value = sl.get("opacity", 1.0)
+        nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
+        nt.links.new(emit.outputs["Emission"], mix.inputs[2])
+        nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+        mat.blend_method = "BLEND"
+        obj.data.materials.append(mat)
+        _slice_objs.append(obj)
+
+
+def _set_camera(frame: dict) -> None:
+    scene = bpy.context.scene
+    cam = scene.objects.get("Camera")
+    if cam is None:
+        cam_data = bpy.data.cameras.new("Camera")
+        cam = bpy.data.objects.new("Camera", cam_data)
+        scene.collection.objects.link(cam)
+        scene.camera = cam
+    cam.location = Vector(frame["camera"]["position_bu"])
+    cam.data.angle_y = frame["camera"]["fov_rad"]
+    cam.data.lens_unit = "FOV"
+    direction = Vector(frame["camera"]["look_at_bu"]) - cam.location
+    up = frame["camera"].get("up", [0, 0, 1])
+    cam.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+    _ = up
+
+
+def main(scene_path: str) -> None:
+    with open(scene_path) as f:
+        spec = json.load(f)
+    _clear()
+    _setup_render(spec)
+    _add_light(spec)
+    meshes = _import_meshes(spec)
+    scene = bpy.context.scene
+    out_dir = spec["output_dir"]
+    for fi, frame in enumerate(spec["frames"]):
+        _set_camera(frame)
+        _build_slices(frame)
+        _set_mesh_state(meshes, frame.get("mesh_overrides", {}))
+        scene.render.filepath = f"{out_dir}/frame_{fi:05d}.png"
+        print(f"[blender] frame {fi + 1}/{len(spec['frames'])}", flush=True)
+        bpy.ops.render.render(write_still=True)
+
+
+if __name__ == "__main__":
+    main(sys.argv[-1])

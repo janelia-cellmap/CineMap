@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CineMap</title>
+<style>
+  :root { --bg:#0d0f14; --panel:#161922; --line:#2a2f3a; --fg:#e9edf3; --mut:#7d8694; --accent:#e8743b; --green:#2e7d46; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:'Segoe UI',system-ui,sans-serif; background:var(--bg); color:var(--fg); height:100vh; display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header .dot { width:16px;height:16px;border-radius:50%;background:var(--accent); }
+  header b { font-size:15px; }
+  input, select, button { font:inherit; }
+  input, select { background:#0c0d11; border:1px solid var(--line); color:var(--fg); border-radius:5px; padding:5px 8px; }
+  button { background:#222734; border:1px solid var(--line); color:var(--fg); border-radius:5px; padding:5px 10px; cursor:pointer; }
+  button:hover { border-color:#46506280; }
+  button.primary { background:var(--green); border-color:transparent; color:#fff; font-weight:600; }
+  button.accent { background:var(--accent); border-color:transparent; color:#fff; font-weight:600; }
+  .grow { flex:1; }
+  main { flex:1; display:flex; min-height:0; }
+  .col { display:flex; flex-direction:column; min-width:0; }
+  .left { flex:2; border-right:1px solid var(--line); }
+  .right { flex:1.1; }
+  .chatcol { flex:1.1; border-left:1px solid var(--line); }
+  #chat { flex:1; overflow:auto; padding:10px; display:flex; flex-direction:column; gap:8px; }
+  .bubble { padding:7px 10px; border-radius:8px; font-size:12.5px; max-width:92%; white-space:pre-wrap; line-height:1.4; }
+  .bubble.user { background:#243246; align-self:flex-end; }
+  .bubble.claude { background:#1d2530; align-self:flex-start; }
+  .bubble.tool { background:#161922; align-self:flex-start; color:#8fb7e0; font-family:monospace; font-size:11px; }
+  .bubble.err { background:#3a1f1f; align-self:flex-start; color:#e8a0a0; }
+  .bubble ul, .bubble ol { margin:4px 0; padding-left:18px; }
+  .bubble li { margin:2px 0; }
+  .bubble code { background:#0c0d11; padding:1px 4px; border-radius:3px; font-size:11.5px; }
+  .bubble pre { background:#0c0d11; padding:6px 8px; border-radius:5px; overflow-x:auto; white-space:pre; margin:4px 0; }
+  .bubble a { color:#8fb7e0; }
+  .bubble strong { color:#fff; }
+  .pane-title { padding:6px 10px; font-size:12px; color:var(--mut); border-bottom:1px solid var(--line); display:flex; align-items:center; gap:8px; }
+  iframe { border:0; width:100%; height:100%; background:#000; }
+  #ngWrap { flex:1; min-height:0; }
+  #preview { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; background:#000; }
+  #preview img, #preview video { max-width:100%; max-height:100%; }
+  .controls { padding:8px 10px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; border-top:1px solid var(--line); }
+  .controls label { font-size:12px; color:var(--mut); }
+  .controls input { width:64px; }
+  #bar { height:6px; background:#222734; border-radius:3px; overflow:hidden; }
+  #barFill { height:100%; width:0%; background:var(--accent); transition:width .2s; }
+  footer { height:200px; border-top:1px solid var(--line); background:#12151c; display:flex; flex-direction:column; }
+  #timeline { flex:1; display:flex; gap:8px; padding:10px; overflow-x:auto; }
+  .kf { flex:0 0 150px; height:150px; border:1px solid var(--line); border-radius:6px; background:linear-gradient(#1b2430,#10161e); position:relative; padding:6px; font-size:11px; cursor:pointer; }
+  .kf:hover { border-color:#5a6473; }
+  .kf.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  .kf.drop { border-color:#5aff7a; box-shadow:-3px 0 0 #5aff7a; }
+  .kf .lbl { cursor:grab; }
+  .kf .lbl { font-weight:600; }
+  .kf .meta { color:var(--mut); position:absolute; bottom:6px; left:6px; right:6px; }
+  .kf .del { position:absolute; top:4px; right:6px; color:var(--mut); cursor:pointer; }
+  .msg { font-size:12px; color:var(--mut); }
+</style>
+</head>
+<body>
+<header>
+  <div class="dot"></div><b>CineMap</b>
+  <select id="projectSel" title="open project"><option value="">— projects —</option></select>
+  <input id="name" placeholder="new project name" style="width:140px" />
+  <input id="dataPath" class="grow" placeholder="neuroglancer state URL"
+    value="https://neuroglancer-demo.appspot.com/#!gs://flyem-user-links/short/jrc_mus-salivary/jrc_mus-salivary-1.json" />
+  <button class="primary" onclick="createProject()">Create</button>
+  <button onclick="exportProject()" title="download this project as a .cinemap.json file">⭳ Export</button>
+  <button onclick="document.getElementById('importFile').click()" title="open a saved .cinemap.json">⭱ Import</button>
+  <input type="file" id="importFile" accept=".json,application/json" style="display:none" onchange="importProject(event)" />
+  <span id="status" class="msg"></span>
+</header>
+
+<main>
+  <div class="col left">
+    <div class="pane-title">◆ Neuroglancer — scouting
+      <button onclick="bake()">★ Bake keyframe</button>
+      <button onclick="updateFrame()" title="overwrite the selected keyframe with the current Neuroglancer view (camera + layers + segments)">⟳ Update current frame</button>
+      <button onclick="addKeyframe()">+ Duplicate last</button>
+    </div>
+    <div id="ngWrap"><iframe id="ng"></iframe></div>
+  </div>
+  <div class="col right">
+    <div class="pane-title">⬡ Render preview</div>
+    <div id="preview"><span class="msg">render output appears here</span></div>
+    <div class="controls">
+      <button onclick="orbit()">Orbit 360°</button>
+      <button onclick="sweep()">Sweep z-slice</button>
+      <label>w</label><input id="w" value="1280" />
+      <label>h</label><input id="h" value="720" />
+      <label>fps</label><input id="fps" value="30" />
+      <label>samples</label><input id="samples" value="48" />
+      <button id="previewBtn" onclick="startRender('preview')">▷ Preview</button>
+      <label title="preview renders at fps ÷ this">1/</label><input id="ratio" value="10" style="width:44px" />
+      <button id="cancelBtn" onclick="cancelRender()" style="display:none;background:#7d2e2e;border-color:transparent;color:#fff">■ Cancel</button>
+    </div>
+    <div class="controls" style="border-top:0"><div id="bar" class="grow"><div id="barFill"></div></div></div>
+    <div class="controls" style="border-top:0"><span id="renderMsg" class="msg"></span></div>
+  </div>
+  <div class="col chatcol">
+    <div class="pane-title">✦ Claude — director</div>
+    <div id="keyBar" style="display:none; padding:8px; border-bottom:1px solid var(--line)">
+      <div class="msg" style="margin-bottom:6px">🔑 Set your Anthropic API key to enable Claude:</div>
+      <div style="display:flex; gap:6px">
+        <input id="apiKey" type="password" class="grow" placeholder="sk-ant-…"
+          onkeydown="if(event.key==='Enter')saveApiKey()" />
+        <button class="accent" onclick="saveApiKey()">Save</button>
+      </div>
+    </div>
+    <div id="chat"></div>
+    <div class="controls">
+      <input id="chatInput" class="grow" placeholder="Ask Claude to direct a shot…"
+        onkeydown="if(event.key==='Enter')sendChat()" />
+      <button class="accent" onclick="sendChat()">Send</button>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="pane-title">Keyframe timeline — <span id="kfCount" class="msg">0 frames</span>
+    <span class="grow"></span>
+    <button id="exportBtn" class="primary" onclick="startRender('export')">⬇ Export video</button>
+  </div>
+  <div id="timeline"></div>
+</footer>
+
+<script>
+let PID = null;
+const $ = (id) => document.getElementById(id);
+const api = async (m, url, body) => {
+  const r = await fetch(url, { method:m, headers:{'Content-Type':'application/json'}, body: body?JSON.stringify(body):undefined });
+  if (!r.ok) throw new Error((await r.text()) || r.statusText);
+  return r.headers.get('content-type')?.includes('json') ? r.json() : r;
+};
+const setStatus = (s) => $('status').textContent = s;
+
+async function refreshProjects() {
+  const list = await api('GET','/api/projects');
+  const sel = $('projectSel');
+  sel.innerHTML = '<option value="">— projects —</option>' +
+    list.map(p => `<option value="${p.id}">${p.name} (${p.keyframes} kf)</option>`).join('');
+}
+$('projectSel').onchange = async (e) => { if (e.target.value) await openProject(e.target.value); };
+
+async function createProject() {
+  setStatus('analyzing dataset…');
+  try {
+    const p = await api('POST','/api/projects', { name: $('name').value || 'untitled', data_path: $('dataPath').value });
+    PID = p.id; await refreshProjects(); $('projectSel').value = PID;
+    await loadNg(); renderKeyframes(p); setStatus('project ready: ' + p.manifest.title);
+  } catch (e) { setStatus('error: ' + e.message); }
+}
+
+function exportProject() {
+  if (!PID) { setStatus('open a project first'); return; }
+  window.location.href = `/api/projects/${PID}/export`;  // Content-Disposition -> download
+}
+
+async function importProject(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  setStatus('importing…');
+  try {
+    const data = JSON.parse(await file.text());
+    const p = await api('POST', '/api/projects/import', data);
+    PID = p.id; await refreshProjects(); $('projectSel').value = PID;
+    await loadNg(); renderKeyframes(p);
+    setStatus('imported: ' + (p.name || p.id));
+  } catch (err) { setStatus('import failed: ' + err.message); }
+  e.target.value = '';
+}
+
+async function openProject(pid) {
+  PID = pid; setStatus('opening…');
+  await api('POST', `/api/projects/${pid}/open`);
+  const p = await api('GET', `/api/projects/${pid}`);
+  await loadNg(); renderKeyframes(p); setStatus('opened ' + p.name);
+}
+
+async function loadNg() {
+  const { ng_url } = await api('GET','/api/ng_url');
+  $('ng').src = ng_url;
+}
+
+async function reload() { renderKeyframes(await api('GET', `/api/projects/${PID}`)); }
+
+let LAST_KF_ID = null, KF_ORDER = [];
+function renderKeyframes(p) {
+  const tl = $('timeline');
+  LAST_KF_ID = p.keyframes.length ? p.keyframes[p.keyframes.length - 1].id : null;
+  KF_ORDER = p.keyframes.map(k => k.id);
+  $('kfCount').textContent = `${p.keyframes.length} frames`;
+  tl.innerHTML = p.keyframes.map((k,i) => `
+    <div class="kf" draggable="true" data-id="${k.id}"
+         title="click to view · drag to reorder"
+         onclick="gotoKf('${k.id}', this)"
+         ondragstart="kfDragStart(event,'${k.id}')"
+         ondragover="kfDragOver(event, this)"
+         ondragleave="this.classList.remove('drop')"
+         ondrop="kfDrop(event,'${k.id}')">
+      <span class="del" onclick="event.stopPropagation(); delKf('${k.id}')">✕</span>
+      <div class="lbl">⠿ KF${i} · ${k.label||''}</div>
+      <div class="meta">${k.slices.map(s=>s.axis+'='+Math.round(s.position_nm)).join(' ')}<br>
+        ${k.meshes.map(m=>m.mesh_name).join(',')||'—'}</div>
+    </div>`).join('') || '<span class="msg" style="padding:10px">no keyframes yet — Bake one from the scouting view</span>';
+}
+
+let DRAG_ID = null;
+function kfDragStart(e, id) { DRAG_ID = id; e.dataTransfer.effectAllowed = 'move'; }
+function kfDragOver(e, el) { e.preventDefault(); el.classList.add('drop'); }
+async function kfDrop(e, targetId) {
+  e.preventDefault();
+  document.querySelectorAll('.kf').forEach(k => k.classList.remove('drop'));
+  if (!DRAG_ID || DRAG_ID === targetId) return;
+  const ids = KF_ORDER.slice();
+  ids.splice(ids.indexOf(DRAG_ID), 1);           // remove dragged
+  ids.splice(ids.indexOf(targetId), 0, DRAG_ID); // insert before target
+  DRAG_ID = null;
+  try { await api('POST', `/api/projects/${PID}/keyframes/reorder`, { order: ids }); reload(); }
+  catch (err) { setStatus('reorder failed: ' + err.message); }
+}
+
+let ACTIVE_KF = null;
+async function gotoKf(id, el) {
+  if (!PID) return;
+  ACTIVE_KF = id;
+  document.querySelectorAll('.kf').forEach(k => k.classList.remove('active'));
+  if (el) el.classList.add('active');
+  try { await api('POST', `/api/projects/${PID}/keyframes/${id}/goto`); }
+  catch (e) { setStatus('goto failed: ' + e.message); }
+}
+
+async function updateFrame() {
+  if (!PID) { setStatus('create/open a project first'); return; }
+  const id = ACTIVE_KF || LAST_KF_ID;
+  if (!id) { setStatus('click a keyframe to select it first'); return; }
+  try {
+    const kf = await api('POST', `/api/projects/${PID}/keyframes/${id}/update_from_ng`);
+    const n = kf.meshes.reduce((a, m) => a + (m.segment_ids?.length || 0), 0);
+    setStatus(`updated current frame from Neuroglancer (camera + ${n} segment(s))`);
+    reload();
+  } catch (e) { setStatus('update failed: ' + e.message); }
+}
+
+async function bake()       { if(!PID)return; await api('POST', `/api/projects/${PID}/bake`); reload(); }
+async function addKeyframe() { if(!PID)return; await api('POST', `/api/projects/${PID}/keyframes`); reload(); }
+async function delKf(id)     { await api('DELETE', `/api/projects/${PID}/keyframes/${id}`); reload(); }
+async function orbit()       { if(!PID)return; setStatus('adding orbit…'); await api('POST', `/api/projects/${PID}/orbit`, {degrees:360,n:12}); reload(); setStatus('orbit added'); }
+async function sweep()       { if(!PID)return; await api('POST', `/api/projects/${PID}/sweep_slice`, {axis:'z',n:12}); reload(); }
+
+let JOB = null;
+function renderingUI(on, mode) {
+  $('previewBtn').style.display = on ? 'none' : '';
+  $('exportBtn').style.display  = on ? 'none' : '';
+  $('cancelBtn').style.display  = on ? '' : 'none';
+  $('cancelBtn').textContent = '■ Cancel' + (on && mode ? ' ' + mode : '');
+}
+
+// Preview = fast (fps ÷ ratio); Export = full-quality final video. Both stream
+// the latest rendered frame into the preview pane, then loop the finished mp4.
+async function startRender(mode) {
+  if (!PID) { setStatus('create/open a project first'); return; }
+  let fps = +$('fps').value;
+  if (mode === 'preview') {
+    const r = Math.max(1, +$('ratio').value || 1);
+    fps = Math.max(1, Math.floor(fps / r));
+  }
+  const body = { width:+$('w').value, height:+$('h').value, fps, samples:+$('samples').value };
+  const { job_id } = await api('POST', `/api/projects/${PID}/render`, body);
+  JOB = job_id; renderingUI(true, mode);
+  $('preview').innerHTML = '<img id="liveFrame" alt="rendering…" />';
+
+  const ws = new WebSocket(`ws://${location.host}/api/renders/${job_id}/ws`);
+  ws.onmessage = (ev) => {
+    const s = JSON.parse(ev.data);
+    $('barFill').style.width = Math.round((s.progress||0)*100) + '%';
+    $('renderMsg').textContent = `${s.status}: ${s.message||''}`;
+    // live-update the preview with the most recent rendered frame
+    if (s.status === 'running' && (s.message||'').includes('blender] frame')) {
+      const img = $('liveFrame');
+      if (img) img.src = `/api/renders/${job_id}/latest_frame?t=${Date.now()}`;
+    }
+    if (['done','error','cancelled'].includes(s.status)) {
+      renderingUI(false); JOB = null;
+      if (s.status === 'done') showOutput(job_id, s.output);  // loops automatically
+    }
+  };
+  ws.onclose = () => { if (JOB === job_id) { renderingUI(false); JOB = null; } };
+}
+
+async function cancelRender() {
+  if (!JOB) return;
+  $('cancelBtn').disabled = true;
+  try { await api('POST', `/api/renders/${JOB}/cancel`); }
+  finally { $('cancelBtn').disabled = false; }
+}
+
+function showOutput(job_id, out) {
+  const prev = $('preview');
+  const url = `/api/projects/${PID}/renders/${job_id}/output?t=${Date.now()}`;
+  prev.innerHTML = (out && out.endsWith('.mp4'))
+    ? `<video src="${url}" controls autoplay loop></video>`
+    : `<img src="${url}" />`;
+}
+
+// ----------------------------- Claude chat -----------------------------
+let CHAT_HISTORY = [];
+async function checkConfig() {
+  try {
+    const c = await api('GET', '/api/config');
+    $('keyBar').style.display = c.has_anthropic_key ? 'none' : 'block';
+  } catch (e) {}
+}
+async function saveApiKey() {
+  const k = $('apiKey').value.trim();
+  if (!k) return;
+  try {
+    await api('POST', '/api/config/anthropic_key', { key: k });
+    $('apiKey').value = '';
+    $('keyBar').style.display = 'none';
+    addBubble('tool', '✓ API key set — Claude is ready');
+  } catch (e) { setStatus('could not set key: ' + e.message); }
+}
+function escapeHtml(s) { return s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
+function inlineMd(s) {
+  s = escapeHtml(s);
+  s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  return s;
+}
+function mdToHtml(text) {
+  const lines = (text || '').split('\n');
+  let html = '', inCode = false, list = null;
+  const closeList = () => { if (list) { html += list === 'ul' ? '</ul>' : '</ol>'; list = null; } };
+  for (const raw of lines) {
+    if (raw.trim().startsWith('```')) {
+      if (!inCode) { closeList(); html += '<pre>'; inCode = true; } else { html += '</pre>'; inCode = false; }
+      continue;
+    }
+    if (inCode) { html += escapeHtml(raw) + '\n'; continue; }
+    let m;
+    if ((m = raw.match(/^\s*[-*]\s+(.*)/))) {
+      if (list !== 'ul') { closeList(); html += '<ul>'; list = 'ul'; }
+      html += '<li>' + inlineMd(m[1]) + '</li>'; continue;
+    }
+    if ((m = raw.match(/^\s*\d+\.\s+(.*)/))) {
+      if (list !== 'ol') { closeList(); html += '<ol>'; list = 'ol'; }
+      html += '<li>' + inlineMd(m[1]) + '</li>'; continue;
+    }
+    closeList();
+    if ((m = raw.match(/^\s*#{1,6}\s+(.*)/))) { html += '<strong>' + inlineMd(m[1]) + '</strong><br>'; continue; }
+    html += raw.trim() === '' ? '<br>' : inlineMd(raw) + '<br>';
+  }
+  closeList(); if (inCode) html += '</pre>';
+  return html;
+}
+function addBubble(cls, text) {
+  const b = document.createElement('div');
+  b.className = 'bubble ' + cls;
+  if (cls === 'claude') b.innerHTML = mdToHtml(text);  // render Claude's markdown
+  else b.textContent = text;
+  $('chat').appendChild(b);
+  $('chat').scrollTop = $('chat').scrollHeight;
+  return b;
+}
+async function sendChat() {
+  if (!PID) { setStatus('create/open a project first'); return; }
+  const inp = $('chatInput');
+  const msg = inp.value.trim();
+  if (!msg) return;
+  inp.value = '';
+  addBubble('user', msg);
+  const thinking = addBubble('claude', '…thinking');
+  try {
+    const r = await api('POST', `/api/projects/${PID}/chat`, { message: msg, history: CHAT_HISTORY });
+    thinking.remove();
+    if (r.error === 'no_api_key' || r.error === 'bad_api_key') { $('keyBar').style.display = 'block'; addBubble('err', r.text); return; }
+    (r.actions || []).forEach(a => {
+      const res = a.result || {};
+      const note = res.added != null ? `+${res.added} kf` : (res.job_id ? 'render started'
+        : (res.error ? 'error: ' + res.error : 'ok'));
+      addBubble('tool', `↳ ${a.tool}(${JSON.stringify(a.input)}) → ${note}`);
+    });
+    if (r.text) addBubble('claude', r.text);
+    CHAT_HISTORY.push({ role: 'user', content: msg });
+    CHAT_HISTORY.push({ role: 'assistant', content: r.text || '(did actions)' });
+    if (r.actions && r.actions.length) reload();        // refresh timeline after edits
+    if (r.render_job_id) attachRender(r.render_job_id); // show render progress
+  } catch (e) {
+    thinking.remove();
+    addBubble('err', 'error: ' + e.message);
+  }
+}
+
+// reused by chat-triggered renders: drive the same progress UI as Preview/Export
+function attachRender(job_id) {
+  JOB = job_id; renderingUI(true, 'render');
+  $('preview').innerHTML = '<img id="liveFrame" alt="rendering…" />';
+  const ws = new WebSocket(`ws://${location.host}/api/renders/${job_id}/ws`);
+  ws.onmessage = (ev) => {
+    const s = JSON.parse(ev.data);
+    $('barFill').style.width = Math.round((s.progress || 0) * 100) + '%';
+    $('renderMsg').textContent = `${s.status}: ${s.message || ''}`;
+    if (s.status === 'running' && (s.message || '').includes('blender] frame')) {
+      const img = $('liveFrame'); if (img) img.src = `/api/renders/${job_id}/latest_frame?t=${Date.now()}`;
+    }
+    if (['done', 'error', 'cancelled'].includes(s.status)) {
+      renderingUI(false); JOB = null;
+      if (s.status === 'done') showOutput(job_id, s.output);
+    }
+  };
+}
+
+refreshProjects();
+checkConfig();
+</script>
+</body>
+</html>

@@ -1,0 +1,101 @@
+"""Analyze a dataset (a neuroglancer state URL) into an cinemap Manifest.
+
+Splits each neuroglancer layer source into its volume/mesh role, picks the EM
+image layer as the slice source, and collects precomputed mesh layers.
+"""
+from __future__ import annotations
+
+import json
+import urllib.parse
+import urllib.request
+
+from ..models import EMSource, Manifest, MeshSource
+
+_MESH_PREFIXES = ("zarr://", "zarr2://", "n5://", "precomputed://")
+
+
+def _clean_url(u: str) -> tuple[str, str | None, str]:
+    """Return (url, format, role) for one neuroglancer source string."""
+    fmt = None
+    for pre in _MESH_PREFIXES:
+        if u.startswith(pre):
+            fmt = pre[:-3]
+            u = u[len(pre) :]
+            break
+    if "|" in u:
+        u, tail = u.rsplit("|", 1)
+        tail = tail.rstrip(":")
+        if tail:
+            fmt = tail
+    role = "mesh" if "/mesh/" in u else "skeleton" if "/skeleton/" in u else "volume"
+    return u, fmt, role
+
+
+def _sources(layer: dict) -> list[tuple[str, str | None, str]]:
+    src = layer.get("source")
+    items = src if isinstance(src, list) else [src]
+    out = []
+    for s in items:
+        u = s if isinstance(s, str) else (s.get("url", "") if isinstance(s, dict) else "")
+        if u:
+            out.append(_clean_url(u))
+    return out
+
+
+def fetch_state(url: str) -> dict:
+    """Resolve a neuroglancer state from any of the forms the viewer produces:
+      - inline state:  …/#!%7B…%7D   (URL-encoded JSON embedded in the fragment)
+      - gs link:       …/#!gs://bucket/path.json
+      - raw json URL:  …/#!https://…/state.json  (or a plain https json URL)
+      - a bare JSON string pasted directly
+    """
+    src = url.strip()
+    if "#!" in src:
+        src = src.split("#!", 1)[1]
+    ref = urllib.parse.unquote(src).strip()
+
+    if ref.startswith("{"):  # inline JSON state
+        return json.loads(ref)
+    if ref.startswith("gs://"):
+        ref = "https://storage.googleapis.com/" + ref[len("gs://") :]
+    with urllib.request.urlopen(ref, timeout=30) as r:
+        return json.load(r)
+
+
+def analyze_state(url: str) -> Manifest:
+    state = fetch_state(url)
+    dim = state.get("dimensions", {})
+    # dimensions are {axis: [resolution_m, unit]} in x,y,z order
+    voxel_nm = [dim.get(a, [8e-9, "m"])[0] * 1e9 for a in ("x", "y", "z")]
+
+    em: EMSource | None = None
+    meshes: list[MeshSource] = []
+    for layer in state.get("layers", []):
+        name = layer.get("name", "")
+        ltype = layer.get("type")
+        srcs = _sources(layer)
+        if ltype == "image" and em is None:
+            vol = next((u for u, _, role in srcs if role == "volume"), None)
+            if vol:
+                em = EMSource(name=name, zarr_url=vol, voxel_size_nm=voxel_nm)
+        elif ltype == "segmentation":
+            mesh_url = next((u for u, _, role in srcs if role == "mesh"), None)
+            label_zarr = next((u for u, _, role in srcs if role == "volume"), None)
+            if mesh_url or label_zarr:
+                seg_ids = [int(s) for s in (layer.get("segments") or []) if str(s).isdigit()]
+                meshes.append(MeshSource(name=name, mesh_url=mesh_url or "",
+                                         label_zarr=label_zarr or "", segment_ids=seg_ids))
+
+    server = ""
+    if em:
+        # https://host/...  -> https://host
+        parts = em.zarr_url.split("/", 3)
+        server = "/".join(parts[:3]) if len(parts) >= 3 else ""
+
+    return Manifest(
+        title=state.get("title", "untitled"),
+        server=server,
+        em=em,
+        meshes=meshes,
+        voxel_size_nm=voxel_nm,
+    )

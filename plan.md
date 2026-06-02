@@ -1,4 +1,4 @@
-# mvideo — Agentic Video Generation for Segmentation Data
+# CineMap — Agentic Video Generation for Segmentation Data
 
 An interactive web app for authoring videos of large 3D EM datasets and their
 instance segmentations / meshes. **Neuroglancer** is the interactive *scouting*
@@ -211,8 +211,13 @@ all deps via `pyproject.toml`. Blender ships as the `bpy` PyPI module.
 1. **EM slice fidelity & multiscale selection** — pick the right zarr scale level
    for a slice's on-screen extent; handle OME-Zarr multiscale groups + voxel-size
    metadata. (Real-data version of the passed synthetic spike.)
-2. **Blender mesh import** from real precomputed sharded meshes
-   (`cloud-volume` → `trimesh` → `bpy`) at scale.
+2. **Meshes are generated from the label zarr via marching cubes**, NOT from the
+   precomputed draco meshes: cloud-volume mis-decodes this dataset's
+   `multilod_draco` (each chunk's fragment comes back shrunk within its grid cell
+   → gaps → a "stippled" look at every LOD). `data/mesh_from_labels.py` reads the
+   label volume in the segment's bbox (bbox from the draco mesh, whose global
+   placement is correct) and marching-cubes a single watertight surface. The draco
+   path remains a fallback when no label volume exists.
 3. **NG → Blender camera bake** — one-way conversion of a scouting view into a
    Blender camera (we own both sides; far easier than the old two-engine align).
 4. **Interpolation quality** — quaternion slerp + easing for smooth motion;
@@ -221,10 +226,17 @@ all deps via `pyproject.toml`. Blender ships as the `bpy` PyPI module.
 ## Phasing
 
 - **Phase 0 — Spikes:** ✅ core mechanisms validated (Blender GPU, zarr-slice+mesh).
-- **Phase 1 — Editor (no AI):** new project → analyze → embedded NG scouting →
-  bake/capture keyframes → Blender render (meshes + slice planes) → mp4. Proves
-  the loop on real data.
-- **Phase 2 — Agent:** Claude hybrid tools + `run_code`, driving the Phase-1 API.
+- **Phase 1 — Editor (no AI):** ✅ **working end-to-end on real data.** Analyze a
+  neuroglancer state → project; embedded NG scouting + bake keyframe; presets
+  (orbit, slice-sweep); real EM slice loader (OME-Zarr multiscale over https) +
+  precomputed mesh loader; Blender GPU render → mp4; FastAPI + WebSocket + no-build
+  frontend. Render aesthetics (hero-mesh lighting/material, concave-mesh framing)
+  deferred to Phase 3.
+- **Phase 2 — Agent:** ✅ Claude director (`agent.py`) — structured tools
+  (make_orbit, sweep_slice, bake, set segments/slice, reorder, render, …) calling
+  the same operations/scouting funnel, with prompt-cached tools + system prompt.
+  Chat panel in the UI; needs `ANTHROPIC_API_KEY`. (`run_code` bpy escape hatch
+  still TODO.)
 - **Phase 3 — Fidelity:** multiscale EM slices, real precomputed meshes, materials
   & lighting presets, EEVEE thumbnails.
 - **Phase 4 — Polish:** easing, preset shots (orbit/flythrough/slice-sweep/

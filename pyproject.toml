@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mvideo"
+name = "cinemap"
 version = "0.1.0"
-description = "Agentic video generation for large-scale EM segmentation data (Neuroglancer + Blender, Claude-directed keyframe timeline)"
+description = "CineMap — agentic video generation for large-scale EM segmentation data (Neuroglancer + Blender, Claude-directed keyframe timeline)"
 readme = "plan.md"
 requires-python = ">=3.11"
 authors = [{ name = "zouinkhim" }]
@@ -31,11 +31,13 @@ dependencies = [
   "tensorstore",    # zarr/n5/ome-zarr array + metadata reads
   "zarr<3",         # cloud-volume / ome compatibility
   "trimesh",        # mesh load/convert for Blender import
+  "scikit-image",   # marching-cubes mesh generation from label volumes
   # --- blender (render worker) ---
   "bpy",            # Blender as a Python module (Cycles); run in a subprocess script for isolation
   # --- core ---
   "numpy<2",        # bpy 5.x requires numpy<2; keep the whole env on 1.x
   "pillow",
+  "imageio-ffmpeg", # bundles an ffmpeg binary (don't rely on a system ffmpeg on PATH)
   "scipy",          # slerp / interpolation helpers
 ]
 
@@ -43,7 +45,7 @@ dependencies = [
 dev = ["ruff", "pytest"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mvideo"]
+packages = ["src/cinemap"]
 
 [tool.ruff]
 line-length = 100

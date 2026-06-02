@@ -1,0 +1,115 @@
+"""Pydantic data model — the project, keyframes, and render jobs.
+
+This mirrors the data model in plan.md. A Keyframe is a Blender-renderable scene
+state (camera + EM slice planes + meshes); a video is interpolation between
+consecutive keyframes. project.json is the single source of truth that both the
+UI and the Claude agent mutate (through operations.py).
+"""
+from __future__ import annotations
+
+from typing import Literal, Optional
+
+from pydantic import BaseModel, Field
+
+Axis = Literal["x", "y", "z"]
+
+
+# ----------------------------- data sources -----------------------------
+class MeshSource(BaseModel):
+    """A precomputed (neuroglancer) mesh layer: name -> mesh dir + selected ids."""
+
+    name: str
+    mesh_url: str = ""  # multilod-draco mesh dir + segment_properties (for ids/bbox)
+    label_zarr: str = ""  # OME-Zarr label volume — preferred geometry via marching cubes
+    segment_ids: list[int] = Field(default_factory=list)
+
+
+class EMSource(BaseModel):
+    """An OME-Zarr multiscale EM volume to slice from."""
+
+    name: str
+    zarr_url: str  # directory holding .zattrs (multiscales) + sN/ levels
+    voxel_size_nm: list[float] = Field(default_factory=lambda: [8.0, 8.0, 8.0])
+
+
+class Manifest(BaseModel):
+    """Result of analyzing a dataset (from a neuroglancer state or a path)."""
+
+    title: str = "untitled"
+    server: str = ""
+    em: Optional[EMSource] = None
+    meshes: list[MeshSource] = Field(default_factory=list)
+    voxel_size_nm: list[float] = Field(default_factory=lambda: [8.0, 8.0, 8.0])
+    bbox_nm: Optional[list[list[float]]] = None  # [[x0,y0,z0],[x1,y1,z1]]
+
+
+# ----------------------------- scene / keyframe -----------------------------
+class Camera(BaseModel):
+    # All in nm world coordinates; orientation is a quaternion [x,y,z,w].
+    position_nm: list[float]
+    look_at_nm: list[float]
+    fov_deg: float = 40.0
+    up: list[float] = Field(default_factory=lambda: [0.0, 0.0, 1.0])
+
+
+class SlicePlane(BaseModel):
+    em_name: str = "em"
+    axis: Axis = "z"
+    position_nm: float = 0.0
+    scale_level: Optional[int] = None  # None => auto-pick from on-screen extent
+    opacity: float = 1.0
+    visible: bool = True
+
+
+class MeshInstance(BaseModel):
+    mesh_name: str
+    segment_ids: list[int] = Field(default_factory=list)
+    color: list[float] = Field(default_factory=lambda: [0.91, 0.45, 0.23])
+    opacity: float = 1.0
+    visible: bool = True
+
+
+class Lighting(BaseModel):
+    key_energy: float = 3000.0
+    background: list[float] = Field(default_factory=lambda: [0.02, 0.02, 0.03])
+
+
+class Keyframe(BaseModel):
+    id: str
+    label: str = ""
+    camera: Camera
+    slices: list[SlicePlane] = Field(default_factory=list)
+    meshes: list[MeshInstance] = Field(default_factory=list)
+    lighting: Lighting = Field(default_factory=Lighting)
+    duration_in_s: float = 2.0  # transition duration INTO this keyframe
+    easing: Literal["linear", "ease-in-out"] = "ease-in-out"
+    ng_state: Optional[dict] = None  # originating scouting state (round-trip)
+    thumbnail_path: Optional[str] = None
+
+
+class RenderSettings(BaseModel):
+    width: int = 1280
+    height: int = 720
+    fps: int = 30
+    samples: int = 64
+    engine: Literal["CYCLES", "BLENDER_EEVEE_NEXT"] = "CYCLES"
+
+
+class RenderJob(BaseModel):
+    id: str
+    kf_range: Optional[list[int]] = None  # [start, end] keyframe indices; None => all
+    settings: RenderSettings = Field(default_factory=RenderSettings)
+    status: Literal["pending", "running", "done", "error", "cancelled"] = "pending"
+    progress: float = 0.0
+    message: str = ""
+    output_path: Optional[str] = None
+
+
+class Project(BaseModel):
+    id: str
+    name: str
+    data_path: str = ""  # neuroglancer state URL or dataset path
+    manifest: Manifest = Field(default_factory=Manifest)
+    lighting: Lighting = Field(default_factory=Lighting)
+    keyframes: list[Keyframe] = Field(default_factory=list)
+    renders: list[RenderJob] = Field(default_factory=list)
