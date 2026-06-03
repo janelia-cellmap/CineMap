@@ -67,6 +67,14 @@ class MeshInstance(BaseModel):
     color: list[float] = Field(default_factory=lambda: [0.91, 0.45, 0.23])
     opacity: float = 1.0
     visible: bool = True
+    # render as a 3D mesh? A layer with a precomputed-mesh source does; a
+    # label-only segmentation layer is shown only on the EM slice (like neuroglancer).
+    render_3d: bool = True
+    # neuroglancer color config (captured per keyframe -> coloring can change frame
+    # to frame): hash seed, one fixed color for all, and per-segment overrides.
+    color_seed: int = 0
+    default_color: Optional[list[float]] = None
+    segment_colors: dict[str, list[float]] = Field(default_factory=dict)
 
 
 class Lighting(BaseModel):

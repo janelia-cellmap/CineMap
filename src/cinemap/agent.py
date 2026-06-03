@@ -65,6 +65,9 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "index": {"type": "integer"}, "mesh_name": {"type": "string"},
          "segment_ids": {"type": "array", "items": {"type": "integer"}}}, "required": ["index", "mesh_name", "segment_ids"]}},
+    {"name": "set_mesh_opacity", "description": "Set the 3D mesh opacity for a keyframe (0..1). Lower it (e.g. 0) so the EM slice and its segmentation overlay are visible without the 3D meshes occluding them.",
+     "input_schema": {"type": "object", "properties": {
+         "index": {"type": "integer"}, "opacity": {"type": "number"}}, "required": ["index", "opacity"]}},
     {"name": "set_slice", "description": "Set a keyframe's EM slice axis/position/visibility.",
      "input_schema": {"type": "object", "properties": {
          "index": {"type": "integer"}, "axis": {"type": "string", "enum": ["x", "y", "z"]},
@@ -142,6 +145,12 @@ def _dispatch(name: str, args: dict, p: Project, render_fn: Callable | None) -> 
         meshes.append(MeshInstance(mesh_name=args["mesh_name"], segment_ids=args["segment_ids"]))
         ops.update_keyframe(p, kf.id, meshes=meshes)
         return {"ok": True, "n_segments": len(args["segment_ids"])}
+    if name == "set_mesh_opacity":
+        kf = p.keyframes[args["index"]]
+        op = max(0.0, min(1.0, args["opacity"]))
+        meshes = [m.model_copy(update={"opacity": op, "visible": op > 0.001}) for m in kf.meshes]
+        ops.update_keyframe(p, kf.id, meshes=meshes)
+        return {"ok": True, "opacity": op}
     if name == "set_slice":
         kf = p.keyframes[args["index"]]
         from .models import SlicePlane

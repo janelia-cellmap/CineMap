@@ -86,6 +86,17 @@ def analyze_state(url: str) -> Manifest:
                 meshes.append(MeshSource(name=name, mesh_url=mesh_url or "",
                                          label_zarr=label_zarr or "", segment_ids=seg_ids))
 
+    # A mesh-only layer (precomputed mesh, no label volume) can still be generated
+    # cleanly from labels: borrow the label volume of a layer sharing the same
+    # structure name (last path component of the mesh dir == that of the labels).
+    def _struct(u: str) -> str:
+        return u.rstrip("/").rsplit("/", 1)[-1]
+
+    label_by_struct = {_struct(m.label_zarr): m.label_zarr for m in meshes if m.label_zarr}
+    for m in meshes:
+        if m.mesh_url and not m.label_zarr:
+            m.label_zarr = label_by_struct.get(_struct(m.mesh_url), "")
+
     server = ""
     if em:
         # https://host/...  -> https://host

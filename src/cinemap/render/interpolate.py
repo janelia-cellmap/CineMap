@@ -37,6 +37,10 @@ class FrameMesh:
     segment_ids: list[int]
     color: list[float]
     opacity: float
+    render_3d: bool = True
+    color_seed: int = 0
+    default_color: list[float] | None = None
+    segment_colors: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -83,14 +87,17 @@ def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
     for key in dict.fromkeys(list(a_m) + list(b_m)):
         ma, mb = a_m.get(key), b_m.get(key)
         name, ids = key[0], list(key[1])
+        src = mb or ma  # color config from the target keyframe of the transition
+        cc = dict(color_seed=src.color_seed, default_color=src.default_color,
+                  segment_colors=src.segment_colors)
         if ma and mb:
             op = (ma.opacity if ma.visible else 0.0) * (1 - t) + (mb.opacity if mb.visible else 0.0) * t
-            fs.meshes.append(FrameMesh(name, ids, mb.color, op))
+            fs.meshes.append(FrameMesh(name, ids, mb.color, op, mb.render_3d, **cc))
         else:
             m = ma or mb
             base = (m.opacity if m.visible else 0.0)
             op = base * (1 - t) if ma else base * t   # ma-only fades out; mb-only fades in
-            fs.meshes.append(FrameMesh(name, ids, m.color, op))
+            fs.meshes.append(FrameMesh(name, ids, m.color, op, m.render_3d, **cc))
     return fs
 
 

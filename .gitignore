@@ -11,3 +11,6 @@ projects/
 # spike outputs
 spikes/out/
 spikes/*.log
+projects/
+cluster/
+cluster_render/

@@ -75,31 +75,56 @@ def frame_camera(center, radius_nm, fov_deg=40.0, azimuth_deg=35.0, elevation_de
 
 # ----------------------------- project lifecycle -----------------------------
 def create_project(name: str, data_path: str) -> Project:
+    from .data.manifest import fetch_state
+
     manifest = analyze_state(data_path)
     project = Project(id=_uid("proj"), name=name, data_path=data_path, manifest=manifest)
     em_name = manifest.em.name if manifest.em else "em"
 
-    # Opening keyframe: show the segments the user selected in neuroglancer.
-    #  - many selected  -> show them all, framed on the whole volume (overview)
-    #  - one (or none)  -> a hero close-up framed on that mesh
+    # which layers are visible in the state, their selected segments, and colors
+    from .data import colors as _colors
+
+    state = fetch_state(data_path)
+    visible, segs_by, colors_by = {}, {}, {}
+    for layer in state.get("layers", []):
+        nm = layer.get("name")
+        visible[nm] = layer.get("visible", True) is not False
+        segs_by[nm] = [int(s) for s in (layer.get("segments") or []) if str(s).isdigit()]
+        if layer.get("type") == "segmentation":
+            colors_by[nm] = _colors.from_layer_dict(layer)
+    by_name = {m.name: m for m in manifest.meshes}
+
+    # Opening keyframe: each VISIBLE segmentation layer. A layer with a mesh source
+    # renders in 3D; a label-only layer shows on the EM slice only (like neuroglancer).
     meshes = []
+    for m in manifest.meshes:
+        if not visible.get(m.name, True):
+            continue
+        ids = segs_by.get(m.name) or m.segment_ids
+        if not ids:
+            continue
+        lc = colors_by.get(m.name)
+        cf = {} if lc is None else dict(color_seed=lc.seed, default_color=lc.default,
+                                        segment_colors={str(k): v for k, v in lc.overrides.items()})
+        meshes.append(MeshInstance(mesh_name=m.name, segment_ids=ids,
+                                   render_3d=bool(m.mesh_url), **cf))
+
+    # frame on the visible content: a single 3D hero mesh -> close-up; otherwise
+    # the dense cluster of whatever's shown (mesh or label layer).
     center, size = volume_extent_nm(project)
     target, radius = center, 0.5 * max(size)
-    if manifest.meshes:
-        from .data.mesh_loader import MeshLoader
-
-        m = next((mm for mm in manifest.meshes if mm.segment_ids), manifest.meshes[0])
-        ids = m.segment_ids or list(MeshLoader(m.mesh_url).list_segments()[:1])
-        meshes.append(MeshInstance(mesh_name=m.name, segment_ids=ids))
-        if len(ids) == 1 and m.mesh_url:  # hero close-up
-            bbox = mesh_bbox_nm(m.mesh_url, ids)
+    hero = next((mi for mi in meshes), None)
+    if hero is not None:
+        src = by_name[hero.mesh_name]
+        if len(hero.segment_ids) == 1 and src.mesh_url:
+            bbox = mesh_bbox_nm(src.mesh_url, hero.segment_ids)
             if bbox:
                 target, radius = bbox[0], bbox[1] * 2.2
-        elif m.label_zarr:  # many segments -> frame the dense cluster, slice through it
+        elif src.label_zarr:
             from .data.mesh_from_labels import selected_region
 
             try:
-                target, radius = selected_region(m.label_zarr, ids)
+                target, radius = selected_region(src.label_zarr, hero.segment_ids)
                 radius *= 1.6
             except Exception:  # noqa: BLE001
                 pass

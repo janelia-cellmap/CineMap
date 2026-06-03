@@ -52,6 +52,8 @@
   .kf.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
   .kf.drop { border-color:#5aff7a; box-shadow:-3px 0 0 #5aff7a; }
   .kf .lbl { cursor:grab; }
+  .kf.hasthumb .lbl, .kf.hasthumb .meta { text-shadow:0 1px 3px #000, 0 0 2px #000; }
+  .kf.hasthumb .lbl { background:linear-gradient(#000a,#0000); margin:-6px -6px 0; padding:4px 6px; border-radius:6px 6px 0 0; }
   .kf .lbl { font-weight:600; }
   .kf .meta { color:var(--mut); position:absolute; bottom:6px; left:6px; right:6px; }
   .kf .del { position:absolute; top:4px; right:6px; color:var(--mut); cursor:pointer; }
@@ -120,6 +122,9 @@
 <footer>
   <div class="pane-title">Keyframe timeline — <span id="kfCount" class="msg">0 frames</span>
     <span class="grow"></span>
+    <label class="msg" title="3D mesh opacity for the selected frame; lower it to reveal the EM slice + its segmentation">3D meshes</label>
+    <input id="meshOp" type="range" min="0" max="1" step="0.05" value="1" style="width:90px"
+      onchange="setMeshOpacity()" title="3D mesh opacity (0 = show only the segmented EM slice)" />
     <button id="exportBtn" class="primary" onclick="startRender('export')">⬇ Export video</button>
   </div>
   <div id="timeline"></div>
@@ -185,14 +190,20 @@ async function loadNg() {
 
 async function reload() { renderKeyframes(await api('GET', `/api/projects/${PID}`)); }
 
-let LAST_KF_ID = null, KF_ORDER = [];
+let LAST_KF_ID = null, KF_ORDER = [], THUMB_VER = {};
 function renderKeyframes(p) {
   const tl = $('timeline');
   LAST_KF_ID = p.keyframes.length ? p.keyframes[p.keyframes.length - 1].id : null;
   KF_ORDER = p.keyframes.map(k => k.id);
   $('kfCount').textContent = `${p.keyframes.length} frames`;
-  tl.innerHTML = p.keyframes.map((k,i) => `
-    <div class="kf" draggable="true" data-id="${k.id}"
+  tl.innerHTML = p.keyframes.map((k,i) => {
+    // versioned URL: stable unless this thumbnail was just re-rendered, so the
+    // browser caches it instead of re-decoding every thumbnail on every reload
+    const bg = k.thumbnail_path
+      ? `background-image:url('/api/projects/${PID}/keyframes/${k.id}/thumbnail?v=${THUMB_VER[k.id]||0}');background-size:cover;background-position:center;`
+      : '';
+    return `
+    <div class="kf${k.thumbnail_path ? ' hasthumb' : ''}" draggable="true" data-id="${k.id}" style="${bg}"
          title="click to view · drag to reorder"
          onclick="gotoKf('${k.id}', this)"
          ondragstart="kfDragStart(event,'${k.id}')"
@@ -203,7 +214,7 @@ function renderKeyframes(p) {
       <div class="lbl">⠿ KF${i} · ${k.label||''}</div>
       <div class="meta">${k.slices.map(s=>s.axis+'='+Math.round(s.position_nm)).join(' ')}<br>
         ${k.meshes.map(m=>m.mesh_name).join(',')||'—'}</div>
-    </div>`).join('') || '<span class="msg" style="padding:10px">no keyframes yet — Bake one from the scouting view</span>';
+    </div>`; }).join('') || '<span class="msg" style="padding:10px">no keyframes yet — Bake one from the scouting view</span>';
 }
 
 let DRAG_ID = null;
@@ -227,8 +238,41 @@ async function gotoKf(id, el) {
   ACTIVE_KF = id;
   document.querySelectorAll('.kf').forEach(k => k.classList.remove('active'));
   if (el) el.classList.add('active');
+  showKeyframeThumb(id);                 // load this frame's rendered image in the preview
   try { await api('POST', `/api/projects/${PID}/keyframes/${id}/goto`); }
   catch (e) { setStatus('goto failed: ' + e.message); }
+}
+
+// load a keyframe's saved render into the Blender preview pane (if it has one)
+function showKeyframeThumb(id) {
+  if (JOB) return;                       // a live render is using the preview
+  const img = new Image();
+  img.onload = () => { $('preview').innerHTML = ''; $('preview').appendChild(img); };
+  img.onerror = () => { $('preview').innerHTML = '<span class="msg">no render yet — Bake or Update to render this frame</span>'; };
+  img.src = `/api/projects/${PID}/keyframes/${id}/thumbnail?v=${THUMB_VER[id] || 0}`;
+}
+
+// render the single keyframe to a still; show it live and keep it as the frame thumbnail
+let THUMB_JOB = null;
+async function renderThumbnail(id) {
+  if (THUMB_JOB) { api('POST', `/api/renders/${THUMB_JOB}/cancel`).catch(() => {}); }  // don't pile up
+  try {
+    const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`);
+    THUMB_JOB = job_id;
+    attachRender(job_id, () => {
+      if (THUMB_JOB === job_id) THUMB_JOB = null;
+      THUMB_VER[id] = Date.now();   // bump only this thumbnail's cache version
+      reload();
+    }, true);
+  } catch (e) { setStatus('thumbnail render failed: ' + e.message); }
+}
+
+async function setMeshOpacity() {
+  const id = ACTIVE_KF || LAST_KF_ID;
+  if (!PID || !id) { setStatus('click a keyframe first'); return; }
+  await api('POST', `/api/projects/${PID}/keyframes/${id}/mesh_opacity`, { opacity: +$('meshOp').value });
+  setStatus(`3D mesh opacity ${$('meshOp').value} — rendering…`);
+  renderThumbnail(id);
 }
 
 async function updateFrame() {
@@ -238,12 +282,21 @@ async function updateFrame() {
   try {
     const kf = await api('POST', `/api/projects/${PID}/keyframes/${id}/update_from_ng`);
     const n = kf.meshes.reduce((a, m) => a + (m.segment_ids?.length || 0), 0);
-    setStatus(`updated current frame from Neuroglancer (camera + ${n} segment(s))`);
+    setStatus(`updated frame from Neuroglancer (camera + ${n} segment(s)) — rendering…`);
     reload();
+    renderThumbnail(id);
   } catch (e) { setStatus('update failed: ' + e.message); }
 }
 
-async function bake()       { if(!PID)return; await api('POST', `/api/projects/${PID}/bake`); reload(); }
+async function bake() {
+  if (!PID) { setStatus('create/open a project first'); return; }
+  try {
+    const kf = await api('POST', `/api/projects/${PID}/bake`);
+    ACTIVE_KF = kf.id; reload();
+    setStatus('baked keyframe — rendering…');
+    renderThumbnail(kf.id);
+  } catch (e) { setStatus('bake failed: ' + e.message); }
+}
 async function addKeyframe() { if(!PID)return; await api('POST', `/api/projects/${PID}/keyframes`); reload(); }
 async function delKf(id)     { await api('DELETE', `/api/projects/${PID}/keyframes/${id}`); reload(); }
 async function orbit()       { if(!PID)return; setStatus('adding orbit…'); await api('POST', `/api/projects/${PID}/orbit`, {degrees:360,n:12}); reload(); setStatus('orbit added'); }
@@ -396,11 +449,23 @@ async function sendChat() {
   }
 }
 
-// reused by chat-triggered renders: drive the same progress UI as Preview/Export
-function attachRender(job_id) {
-  JOB = job_id; renderingUI(true, 'render');
+// reused by chat-triggered renders & per-frame thumbnails: drive the progress UI
+// light=true (per-frame thumbnails) shows live progress in the preview WITHOUT
+// hijacking the Preview/Export buttons or the global render state, so the rest of
+// the UI stays fully clickable. The socket always restores state on close/error.
+function attachRender(job_id, afterDone, light) {
+  if (!light) { JOB = job_id; renderingUI(true, 'render'); }
   $('preview').innerHTML = '<img id="liveFrame" alt="rendering…" />';
-  const ws = new WebSocket(`ws://${location.host}/api/renders/${job_id}/ws`);
+  let finished = false;
+  const finish = (status, output) => {
+    if (finished) return; finished = true;
+    if (!light) { renderingUI(false); if (JOB === job_id) JOB = null; }
+    if (status === 'done') showOutput(job_id, output);
+    if (afterDone) afterDone();
+  };
+  let ws;
+  try { ws = new WebSocket(`ws://${location.host}/api/renders/${job_id}/ws`); }
+  catch (e) { finish('error'); return; }
   ws.onmessage = (ev) => {
     const s = JSON.parse(ev.data);
     $('barFill').style.width = Math.round((s.progress || 0) * 100) + '%';
@@ -408,11 +473,10 @@ function attachRender(job_id) {
     if (s.status === 'running' && (s.message || '').includes('blender] frame')) {
       const img = $('liveFrame'); if (img) img.src = `/api/renders/${job_id}/latest_frame?t=${Date.now()}`;
     }
-    if (['done', 'error', 'cancelled'].includes(s.status)) {
-      renderingUI(false); JOB = null;
-      if (s.status === 'done') showOutput(job_id, s.output);
-    }
+    if (['done', 'error', 'cancelled'].includes(s.status)) { finish(s.status, s.output); try { ws.close(); } catch (e) {} }
   };
+  ws.onerror = () => finish('error');
+  ws.onclose = () => finish('error');   // never leave the UI stuck if the socket drops
 }
 
 refreshProjects();

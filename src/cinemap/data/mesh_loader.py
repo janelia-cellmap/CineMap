@@ -67,7 +67,7 @@ class MeshLoader:
             process=False,
         )
 
-    def load(self, seg_id: int) -> trimesh.Trimesh:
+    def load(self, seg_id: int, colorize=None) -> trimesh.Trimesh:
         """Clean mesh for a segment.
 
         Prefers marching cubes on the label volume (gap-free, watertight); uses
@@ -78,21 +78,22 @@ class MeshLoader:
             from .mesh_from_labels import generate
 
             bbox = self._draco(seg_id).bounds if self.mesh_url else self._label_bbox(seg_id)
-            return generate(self.label_zarr, seg_id, (tuple(bbox[0]), tuple(bbox[1])))
+            return generate(self.label_zarr, seg_id, (tuple(bbox[0]), tuple(bbox[1])), colorize=colorize)
         return self._draco(seg_id)
 
-    def load_many(self, seg_ids) -> trimesh.Trimesh:
+    def load_many(self, seg_ids, colorize=None) -> trimesh.Trimesh:
         """One mesh for a set of segments. A single segment gets the fine
-        per-segment surface; many segments use the cheap whole-volume union."""
+        per-segment surface; many segments use the cheap whole-volume union.
+        `colorize(seg_id)->rgb` provides the (neuroglancer-matched) colors."""
         seg_ids = list(seg_ids)
         if not seg_ids:
             raise ValueError("no segment ids")
         if len(seg_ids) == 1:
-            return self.load(seg_ids[0])
+            return self.load(seg_ids[0], colorize=colorize)
         if self.label_zarr:
             from .mesh_from_labels import generate_union
 
-            return generate_union(self.label_zarr, seg_ids)
+            return generate_union(self.label_zarr, seg_ids, colorize=colorize)
         parts = []
         for s in seg_ids:
             try:
@@ -111,9 +112,10 @@ class MeshLoader:
         zz, yy, xx = np.where(arr == seg_id)
         if len(zz) == 0:
             raise ValueError(f"segment {seg_id} not found in labels")
-        sc = vol.level_scale_nm[level]  # z,y,x
-        lo = (xx.min() * sc[2], yy.min() * sc[1], zz.min() * sc[0])
-        hi = ((xx.max() + 1) * sc[2], (yy.max() + 1) * sc[1], (zz.max() + 1) * sc[0])
+        sc = vol.level_scale_nm[level]          # z,y,x
+        tr = vol.level_translation_nm[level]    # z,y,x; world = voxel*scale + translation
+        lo = (xx.min() * sc[2] + tr[2], yy.min() * sc[1] + tr[1], zz.min() * sc[0] + tr[0])
+        hi = ((xx.max() + 1) * sc[2] + tr[2], (yy.max() + 1) * sc[1] + tr[1], (zz.max() + 1) * sc[0] + tr[0])
         return np.array([lo, hi])
 
     def export_obj(self, seg_id: int, out_path: str) -> str:

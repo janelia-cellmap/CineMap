@@ -218,7 +218,8 @@ def main(scene_path: str) -> None:
         _set_camera(frame)
         _build_slices(frame)
         _set_mesh_state(meshes, frame.get("mesh_overrides", {}))
-        scene.render.filepath = f"{out_dir}/frame_{fi:05d}.png"
+        idx = frame.get("index", fi)  # global frame index (for split cluster jobs)
+        scene.render.filepath = f"{out_dir}/frame_{idx:05d}.png"
         print(f"[blender] frame {fi + 1}/{len(spec['frames'])}", flush=True)
         bpy.ops.render.render(write_still=True)
 

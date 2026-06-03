@@ -45,7 +45,8 @@ class RenderWorker:
         self.cancel = threading.Event()   # set to request cancellation
         self._proc: subprocess.Popen | None = None
         self._em: EMVolume | None = None
-        self._slice_cache: dict[tuple, str] = {}
+        self._label_vols: dict[str, EMVolume] = {}
+        self._slice_cache: dict[tuple, dict] = {}
 
     # ---- asset preparation ----
     def _em_vol(self) -> EMVolume:
@@ -54,47 +55,92 @@ class RenderWorker:
             self._em = EMVolume(self.manifest.em.zarr_url)
         return self._em
 
-    def _slice_png(self, em_name, axis, position_nm, level, region) -> dict:
-        vol = self._em_vol()
-        res = vol.read_slice(axis, position_nm, level=level, region=region)
-        key = (axis, res.scale_level, round(res.position_nm),
-               round(res.origin_nm[0]), round(res.origin_nm[1]), round(res.origin_nm[2]),
-               round(res.u_nm[0] + res.u_nm[1] + res.u_nm[2]))
-        if key not in self._slice_cache:
-            from PIL import Image
+    def _label_vol(self, url: str) -> EMVolume:
+        if url not in self._label_vols:
+            self._label_vols[url] = EMVolume(url)
+        return self._label_vols[url]
 
-            path = self.assets_dir / f"slice_{axis}_{res.scale_level}_{abs(hash(key)) % 10**8}.png"
-            Image.fromarray(res.image).save(path)
-            self._slice_cache[key] = str(path)
-        return {
-            "image_path": self._slice_cache[key],
+    def _slice_png(self, sl, region, seg_overlays) -> dict:
+        """Render the EM cross-section, with the segmentation labels of
+        `seg_overlays` [(label_zarr, segment_ids), …] colored on top (like the
+        neuroglancer cross-section). Cached per (slice, region, overlay)."""
+        import numpy as np
+        from PIL import Image
+
+        center, half = region
+        key = (sl.em_name, sl.axis, round(sl.position_nm),
+               tuple(round(c) for c in center), round(half),
+               tuple((u, tuple(sorted(ids)), lc.cache_key()) for u, ids, lc in seg_overlays))
+        if key in self._slice_cache:
+            return self._slice_cache[key]
+
+        res = self._em_vol().read_slice(sl.axis, sl.position_nm, level=sl.scale_level, region=region)
+        rgb = np.repeat(res.image[:, :, None].astype(np.float64), 3, axis=2)  # grayscale EM
+        H, W = rgb.shape[:2]
+
+        for label_zarr, ids, lc in seg_overlays:
+            if not ids:
+                continue
+            lres = self._label_vol(label_zarr).read_slice(sl.axis, sl.position_nm, region=region)
+            lab = np.asarray(lres.image)
+            yi = (np.arange(H) * lab.shape[0] / H).astype(int).clip(0, lab.shape[0] - 1)
+            xi = (np.arange(W) * lab.shape[1] / W).astype(int).clip(0, lab.shape[1] - 1)
+            lab_rs = lab[yi][:, xi]                         # nearest-resample to EM size
+            mask = np.isin(lab_rs, np.asarray(sorted(ids)))
+            if not mask.any():
+                continue
+            color = np.zeros((H, W, 3))
+            for u in np.unique(lab_rs[mask]):
+                color[lab_rs == u] = lc.rgb(int(u))         # neuroglancer color
+            a = 0.6                                          # overlay opacity
+            m = mask[:, :, None]
+            rgb = np.where(m, rgb * (1 - a) + color * 255 * a, rgb)
+
+        path = self.assets_dir / f"slice_{sl.axis}_{abs(hash(key)) % 10**8}.png"
+        Image.fromarray(rgb.clip(0, 255).astype(np.uint8)).save(path)
+        out = {
+            "image_path": str(path),
             "origin_bu": _bu(res.origin_nm, self.nm_per_bu),
             "u_bu": _bu(res.u_nm, self.nm_per_bu),
             "v_bu": _bu(res.v_nm, self.nm_per_bu),
         }
+        self._slice_cache[key] = out
+        return out
 
     @staticmethod
-    def _mesh_uid(mesh_name, ids) -> str:
-        """Stable id per (layer, exact segment set) so different sets are different
-        objects (a keyframe showing few segments != one showing all)."""
+    def _mesh_uid(mesh_name, ids, color_key=()) -> str:
+        """Stable id per (layer, exact segment set, coloring) so a different segment
+        set OR a different color (seed/fixed) becomes a distinct object/asset."""
         import hashlib
 
-        h = hashlib.md5((",".join(map(str, sorted(ids)))).encode()).hexdigest()[:8]
-        return f"{mesh_name}_{h}"
+        sig = ",".join(map(str, sorted(ids))) + "|" + str(color_key)
+        return f"{mesh_name}_{hashlib.md5(sig.encode()).hexdigest()[:8]}"
 
-    def _mesh_obj(self, mesh_name, segment_ids) -> str | None:
+    @staticmethod
+    def _frame_colors(m):
+        """LayerColors (neuroglancer seed / fixed colors) from a FrameMesh."""
+        from ..data.colors import LayerColors
+
+        return LayerColors(
+            seed=getattr(m, "color_seed", 0),
+            default=getattr(m, "default_color", None),
+            overrides={int(k): v for k, v in (getattr(m, "segment_colors", {}) or {}).items()},
+        )
+
+    def _mesh_obj(self, mesh_name, segment_ids, lc) -> str | None:
         src = next((m for m in self.manifest.meshes if m.name == mesh_name), None)
         if not src:
             return None
         ids = segment_ids or src.segment_ids
         if not ids:
             return None
-        out = self.assets_dir / f"mesh_{self._mesh_uid(mesh_name, ids)}.ply"  # PLY keeps vertex colors
+        uid = self._mesh_uid(mesh_name, ids, lc.cache_key())
+        out = self.assets_dir / f"mesh_{uid}.ply"  # PLY keeps vertex colors
         if out.exists():
             return str(out)
         loader = MeshLoader(src.mesh_url, src.label_zarr)
         try:
-            combined = loader.load_many(ids)
+            combined = loader.load_many(ids, colorize=lc.rgb)
         except Exception as e:  # noqa: BLE001
             print(f"[worker] mesh {mesh_name} ({len(ids)} segs) failed: {e}")
             return None
@@ -103,14 +149,17 @@ class RenderWorker:
         return str(out)
 
     # ---- scene spec ----
-    def _build_scene_spec(self, frames: list[FrameState]) -> dict:
+    def _build_scene_spec(self, frames: list[FrameState], index_offset: int = 0) -> dict:
         # one Blender object per distinct (layer, segment set) across all frames
         mesh_specs: dict[str, dict] = {}
         for fr in frames:
             for m in fr.meshes:
-                uid = self._mesh_uid(m.mesh_name, m.segment_ids)
+                if not m.render_3d:           # label-only layer -> slice overlay only
+                    continue
+                lc = self._frame_colors(m)
+                uid = self._mesh_uid(m.mesh_name, m.segment_ids, lc.cache_key())
                 if uid not in mesh_specs:
-                    obj = self._mesh_obj(m.mesh_name, m.segment_ids)
+                    obj = self._mesh_obj(m.mesh_name, m.segment_ids, lc)
                     if obj:
                         mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": m.color}
         frame_specs = []
@@ -121,16 +170,23 @@ class RenderWorker:
             dist = math.dist(fr.position_nm, fr.look_at_nm)
             half = max(500.0, dist * math.tan(math.radians(fr.fov_deg) / 2) * 1.25)
             region = (tuple(fr.look_at_nm), half)
+            # segmentation layers in this frame -> overlaid on the EM slice.
+            # Decoupled from the 3D mesh opacity: the slice shows the cross-section
+            # even when the 3D meshes are faded/hidden (so they don't occlude it).
+            seg_overlays = []
+            for m in fr.meshes:
+                src = next((s for s in self.manifest.meshes if s.name == m.mesh_name), None)
+                if src and src.label_zarr and m.segment_ids:
+                    seg_overlays.append((src.label_zarr, m.segment_ids, self._frame_colors(m)))
             slices = []
             for sl in fr.slices:
                 if sl.opacity <= 0.001:
                     continue
-                s = self._slice_png(sl.em_name, sl.axis, sl.position_nm, sl.scale_level, region)
-                s["opacity"] = sl.opacity
+                s = {**self._slice_png(sl, region, seg_overlays), "opacity": sl.opacity}
                 slices.append(s)
             overrides = {}
             for m in fr.meshes:
-                uid = self._mesh_uid(m.mesh_name, m.segment_ids)
+                uid = self._mesh_uid(m.mesh_name, m.segment_ids, self._frame_colors(m).cache_key())
                 if uid in mesh_specs:
                     overrides[uid] = {"opacity": m.opacity, "visible": m.opacity > 0.001}
             frame_specs.append({
@@ -142,6 +198,7 @@ class RenderWorker:
                 },
                 "slices": slices,
                 "mesh_overrides": overrides,
+                "index": index_offset + fi,   # global frame index (split cluster jobs)
             })
             self._progress(0.1 + 0.5 * (fi + 1) / len(frames), f"assets {fi + 1}/{len(frames)}")
         return {

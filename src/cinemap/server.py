@@ -7,17 +7,31 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import threading
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, Response
+
+
+def _image_response(path: str, media: str = "image/png", cacheable: bool = False) -> Response:
+    """Serve a small image from in-memory bytes so Content-Length always matches —
+    these files (thumbnails, live frames) can be overwritten while being served.
+    `cacheable` lets the browser cache (used with versioned thumbnail URLs)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        raise HTTPException(404, "not available")
+    cc = "public, max-age=31536000, immutable" if cacheable else "no-store"
+    return Response(content=data, media_type=media, headers={"Cache-Control": cc})
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import config, operations as ops
 from . import scouting, store
 from .config import FRONTEND_DIR
-from .models import Project, RenderSettings
+from .models import Project, RenderJob, RenderSettings
 from .render.worker import RenderCancelled, RenderWorker
 
 app = FastAPI(title="CineMap")
@@ -107,7 +121,7 @@ def create_project(req: CreateProject):
     try:
         project = ops.create_project(req.name, req.data_path)
         scouting.load_dataset(req.data_path)
-        return project.model_dump()
+        return _light_project(project)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"could not analyze dataset: {e}") from e
 
@@ -116,7 +130,16 @@ def create_project(req: CreateProject):
 def get_project(pid: str):
     if not store.exists(pid):
         raise HTTPException(404, "no such project")
-    return store.load(pid).model_dump()
+    return _light_project(store.load(pid))
+
+
+def _light_project(project) -> dict:
+    """Project dict without each keyframe's huge neuroglancer state (the frontend
+    never uses it) — keeps these responses small and the browser memory low."""
+    d = project.model_dump()
+    for k in d.get("keyframes", []):
+        k.pop("ng_state", None)
+    return d
 
 
 @app.get("/api/projects/{pid}/export")
@@ -147,17 +170,29 @@ def import_project(body: dict):
     return p.model_dump()
 
 
+def _ng_url_for(request: Request) -> str:
+    """The neuroglancer viewer URL with its host rewritten to whatever host the
+    browser used to reach this app. NG binds to 0.0.0.0 and would otherwise hand
+    back a 0.0.0.0/127.0.0.1 URL that a remote browser can't open."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(scouting.viewer_url())
+    host = request.url.hostname or "127.0.0.1"
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
 @app.post("/api/projects/{pid}/open")
-def open_project(pid: str):
+def open_project(pid: str, request: Request):
     p = store.load(pid)
     scouting.load_dataset(p.data_path)
-    return {"ng_url": scouting.viewer_url()}
+    return {"ng_url": _ng_url_for(request)}
 
 
 # ----------------------------- scouting -----------------------------
 @app.get("/api/ng_url")
-def ng_url():
-    return {"ng_url": scouting.viewer_url()}
+def ng_url(request: Request):
+    return {"ng_url": _ng_url_for(request)}
 
 
 @app.post("/api/projects/{pid}/bake")
@@ -174,6 +209,27 @@ def goto_keyframe(pid: str, kid: str):
     if not ok:
         raise HTTPException(404, "no such keyframe")
     return {"ok": True}
+
+
+@app.post("/api/projects/{pid}/keyframes/{kid}/thumbnail")
+def render_thumbnail(pid: str, kid: str):
+    """Render this single keyframe to a still and keep it as the frame's thumbnail."""
+    p = store.load(pid)
+    idx = next((i for i, k in enumerate(p.keyframes) if k.id == kid), None)
+    if idx is None:
+        raise HTTPException(404, "no such keyframe")
+    settings = RenderSettings(width=640, height=480, samples=24, fps=1)
+    job_id = _start_render(pid, settings, kf_range=[idx, idx], thumbnail_for=kid)
+    return {"job_id": job_id}
+
+
+@app.get("/api/projects/{pid}/keyframes/{kid}/thumbnail")
+def get_thumbnail(pid: str, kid: str):
+    p = store.load(pid)
+    kf = next((k for k in p.keyframes if k.id == kid), None)
+    if not kf or not kf.thumbnail_path or not os.path.exists(kf.thumbnail_path):
+        raise HTTPException(404, "no thumbnail yet")
+    return _image_response(kf.thumbnail_path, cacheable=True)  # URL is versioned (?v=)
 
 
 @app.post("/api/projects/{pid}/keyframes/{kid}/update_from_ng")
@@ -205,6 +261,24 @@ class ReorderReq(BaseModel):
     order: list[str]  # keyframe ids in the new order
 
 
+class MeshOpacityReq(BaseModel):
+    opacity: float
+
+
+@app.post("/api/projects/{pid}/keyframes/{kid}/mesh_opacity")
+def set_mesh_opacity(pid: str, kid: str, req: MeshOpacityReq):
+    """Set the 3D mesh opacity for a keyframe (0 = hidden -> EM slice + its
+    segmentation overlay show without the 3D meshes occluding)."""
+    p = store.load(pid)
+    kf = next((k for k in p.keyframes if k.id == kid), None)
+    if kf is None:
+        raise HTTPException(404, "no such keyframe")
+    op = max(0.0, min(1.0, req.opacity))
+    meshes = [m.model_copy(update={"opacity": op, "visible": op > 0.001}) for m in kf.meshes]
+    ops.update_keyframe(p, kid, meshes=meshes)
+    return {"ok": True, "opacity": op}
+
+
 @app.post("/api/projects/{pid}/keyframes/reorder")
 def reorder_keyframes(pid: str, req: ReorderReq):
     p = store.load(pid)
@@ -227,7 +301,7 @@ def sweep(pid: str, req: SweepReq):
 
 
 # ----------------------------- render -----------------------------
-def _run_render(pid: str, job_id: str, worker: RenderWorker):
+def _run_render(pid: str, job_id: str, worker: RenderWorker, thumbnail_for: str | None = None):
     def cb(pr, msg):
         # keep status as "cancelling" once requested, until the worker bails out
         cur = _render_state.get(job_id, {}).get("status")
@@ -236,6 +310,17 @@ def _run_render(pid: str, job_id: str, worker: RenderWorker):
 
     try:
         out = worker.run(progress=cb)
+        if thumbnail_for and out:  # keep a per-keyframe thumbnail and point the kf at it
+            tdir = config.PROJECTS_DIR / pid / "thumbnails"
+            tdir.mkdir(parents=True, exist_ok=True)
+            dst = tdir / f"{thumbnail_for}.png"
+            tmp = tdir / f".{thumbnail_for}.png.tmp"
+            shutil.copy(out, tmp)
+            os.replace(tmp, dst)  # atomic swap so a concurrent GET never reads a half-written file
+            for k in worker.project.keyframes:
+                if k.id == thumbnail_for:
+                    k.thumbnail_path = str(dst)
+            out = str(dst)
         _render_state[job_id] = {"progress": 1.0, "message": "done", "status": "done", "output": out}
     except RenderCancelled:
         _render_state[job_id] = {"progress": 0.0, "message": "cancelled", "status": "cancelled"}
@@ -246,13 +331,16 @@ def _run_render(pid: str, job_id: str, worker: RenderWorker):
         _workers.pop(job_id, None)
 
 
-def _start_render(pid: str, settings: RenderSettings, kf_range=None) -> str:
+def _start_render(pid: str, settings: RenderSettings, kf_range=None, thumbnail_for=None) -> str:
     p = store.load(pid)
-    job = ops.create_render_job(p, settings, kf_range=kf_range)
+    if thumbnail_for:  # don't clutter the render history with thumbnail jobs
+        job = RenderJob(id=ops._uid("thumb"), kf_range=kf_range, settings=settings)
+    else:
+        job = ops.create_render_job(p, settings, kf_range=kf_range)
     worker = RenderWorker(p, job)
     _workers[job.id] = worker
     _render_state[job.id] = {"progress": 0.0, "message": "queued", "status": "pending"}
-    threading.Thread(target=_run_render, args=(pid, job.id, worker), daemon=True).start()
+    threading.Thread(target=_run_render, args=(pid, job.id, worker, thumbnail_for), daemon=True).start()
     return job.id
 
 
@@ -302,8 +390,9 @@ def render_output(pid: str, job_id: str):
         out = j.output_path if j else None
     if not out:
         raise HTTPException(404, "no output yet")
-    media = "video/mp4" if out.endswith(".mp4") else "image/png"
-    return FileResponse(out, media_type=media)
+    if out.endswith(".mp4"):
+        return FileResponse(out, media_type="video/mp4")  # large, not overwritten
+    return _image_response(out)  # PNG output may be overwritten by a re-render
 
 
 @app.get("/api/renders/{job_id}/latest_frame")
@@ -316,8 +405,7 @@ def latest_frame(job_id: str):
     if not frames:
         raise HTTPException(404, "no frame yet")
     # last fully-written frame (the highest-numbered one already on disk)
-    return FileResponse(str(frames[-1]), media_type="image/png",
-                        headers={"Cache-Control": "no-store"})
+    return _image_response(str(frames[-1]))
 
 
 @app.websocket("/api/renders/{job_id}/ws")
@@ -337,7 +425,8 @@ async def render_ws(ws: WebSocket, job_id: str):
 # ----------------------------- frontend (static) -----------------------------
 @app.get("/")
 def index():
-    return FileResponse(FRONTEND_DIR / "index.html")
+    # no-store so the browser always loads the latest UI (avoids stale cached JS)
+    return FileResponse(FRONTEND_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
 
 if FRONTEND_DIR.exists():

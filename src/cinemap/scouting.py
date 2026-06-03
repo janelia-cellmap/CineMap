@@ -20,8 +20,11 @@ _viewer: neuroglancer.Viewer | None = None
 def get_viewer() -> neuroglancer.Viewer:
     global _viewer
     if _viewer is None:
+        # Bind on all interfaces so the embedded viewer is reachable when the app
+        # is opened from another machine (the URL host is rewritten per-request to
+        # whatever host the browser used — see server._ng_url_for).
         neuroglancer.set_server_bind_address(
-            os.environ.get("CINEMAP_NG_BIND", "127.0.0.1")
+            os.environ.get("CINEMAP_NG_BIND", "0.0.0.0")
         )
         _viewer = neuroglancer.Viewer()
     return _viewer
@@ -68,17 +71,30 @@ def current_visible_segments(project: Project) -> dict[str, list[int]]:
     return out
 
 
+def current_layer_colors(project: Project) -> dict:
+    """{layer_name: LayerColors} captured from the current neuroglancer state."""
+    from .data import colors as _colors
+
+    st = get_viewer().state.to_json()
+    return {l.get("name"): _colors.from_layer_dict(l)
+            for l in st.get("layers", []) if l.get("type") == "segmentation"}
+
+
 def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = None) -> list[MeshInstance]:
-    """Build mesh instances from the current NG visible segments, preserving the
-    color/opacity of any matching previous instance."""
-    prev_by = {m.mesh_name: m for m in (prev or [])}
+    """Build mesh instances from the current NG visible segments. A layer renders
+    a 3D mesh only if it has a precomputed-mesh source (like neuroglancer);
+    label-only segmentation layers are shown on the EM slice only. Also captures
+    the layer's neuroglancer coloring (seed / fixed colors)."""
+    has_mesh = {m.name: bool(m.mesh_url) for m in project.manifest.meshes}
+    lcolors = current_layer_colors(project)
     meshes: list[MeshInstance] = []
     for name, ids in current_visible_segments(project).items():
-        base = prev_by.get(name)
-        if base is not None:
-            meshes.append(base.model_copy(update={"segment_ids": ids}))
-        else:
-            meshes.append(MeshInstance(mesh_name=name, segment_ids=ids))
+        lc = lcolors.get(name)
+        fields = {"segment_ids": ids, "render_3d": has_mesh.get(name, True)}
+        if lc is not None:
+            fields.update(color_seed=lc.seed, default_color=lc.default,
+                          segment_colors={str(k): v for k, v in lc.overrides.items()})
+        meshes.append(MeshInstance(mesh_name=name, **fields))
     return meshes
 
 
@@ -147,17 +163,49 @@ def sync_segments(project: Project, keyframe_id: str) -> Keyframe | None:
     return updated
 
 
-def goto_keyframe(project: Project, keyframe_id: str) -> bool:
-    """Navigate the scouting viewer to a keyframe's view (the iframe updates live)."""
+def _rgb_to_hex(rgb) -> str:
+    r, g, b = (max(0, min(255, round(c * 255))) for c in rgb[:3])
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _state_from_keyframe(project: Project, kf: Keyframe, base: dict) -> dict:
+    """Reconstruct a full neuroglancer state for a keyframe that has no captured
+    ng_state (orbit/sweep/duplicate/establish frames). Starts from the live state
+    (so all layers exist), then applies the keyframe's own view: per-segmentation-
+    layer visible segments + visibility + colors, EM-image-layer visibility, and
+    finally the camera/zoom. This makes clicking ANY keyframe restore everything,
+    not just the camera."""
     from .data.ng_camera import camera_to_ng
 
+    state = camera_to_ng(kf.camera, project.manifest.voxel_size_nm, base)
+    meshes = {m.mesh_name: m for m in kf.meshes}
+    shown_em = {s.em_name for s in kf.slices if getattr(s, "visible", True)}
+    em_name = project.manifest.em.name if project.manifest.em else None
+    for layer in state.get("layers", []):
+        name = layer.get("name")
+        m = meshes.get(name)
+        if m is not None:                                   # segmentation layer
+            layer["segments"] = [str(s) for s in (m.segment_ids or [])]
+            layer["visible"] = bool(m.visible)
+            layer["colorSeed"] = int(getattr(m, "color_seed", 0) or 0)
+            if getattr(m, "default_color", None):
+                layer["segmentDefaultColor"] = _rgb_to_hex(m.default_color)
+            if getattr(m, "segment_colors", None):
+                layer["segmentColors"] = {str(k): _rgb_to_hex(v)
+                                          for k, v in m.segment_colors.items()}
+        elif em_name and name == em_name:                   # EM image layer
+            layer["visible"] = name in shown_em
+    return state
+
+
+def goto_keyframe(project: Project, keyframe_id: str) -> bool:
+    """Navigate the scouting viewer to a keyframe's view (the iframe updates live)."""
     kf = next((k for k in project.keyframes if k.id == keyframe_id), None)
     if kf is None:
         return False
     v = get_viewer()
     if kf.ng_state:  # baked from neuroglancer -> exact round-trip
         v.set_state(kf.ng_state)
-    else:  # programmatic keyframe -> synthesize a state from the camera
-        base = v.state.to_json()
-        v.set_state(camera_to_ng(kf.camera, project.manifest.voxel_size_nm, base))
+    else:  # programmatic keyframe -> rebuild full state from the keyframe's data
+        v.set_state(_state_from_keyframe(project, kf, v.state.to_json()))
     return True

@@ -40,13 +40,17 @@ class EMVolume:
         self.url = zarr_url.rstrip("/")
         self.multiscales = self._read_attrs()
         self.datasets = self.multiscales["datasets"]  # [{path, coordinateTransformations}]
-        # nm scale (z,y,x) per level
+        # nm scale + translation (z,y,x) per level. The OME-Zarr translation aligns
+        # each downsampled level to the s0 grid; world = voxel*scale + translation.
+        # Ignoring it offsets coarse levels (and makes meshes drift from the EM).
         self.level_scale_nm: list[list[float]] = []
+        self.level_translation_nm: list[list[float]] = []
         for ds in self.datasets:
-            scale = next(
-                t["scale"] for t in ds["coordinateTransformations"] if t["type"] == "scale"
-            )
+            ct = ds["coordinateTransformations"]
+            scale = next(t["scale"] for t in ct if t["type"] == "scale")
+            trans = next((t["translation"] for t in ct if t["type"] == "translation"), [0, 0, 0])
             self.level_scale_nm.append([float(s) for s in scale])
+            self.level_translation_nm.append([float(t) for t in trans])
 
     def _read_attrs(self) -> dict:
         with urllib.request.urlopen(f"{self.url}/.zattrs", timeout=30) as r:
@@ -88,17 +92,19 @@ class EMVolume:
     def read_box(self, bbox_xyz_nm, level: int, pad: int = 2):
         """Read a 3D subvolume covering bbox at `level`.
 
-        Returns (array_zyx, origin_voxel_zyx, scale_zyx_nm).
+        Returns (array_zyx, origin_voxel_zyx, scale_zyx_nm, translation_zyx_nm),
+        where world_zyx = (voxel_index * scale) + translation.
         """
         arr = self._open_level(level)
-        sc = self.level_scale_nm[level]  # z,y,x nm/voxel
+        sc = self.level_scale_nm[level]          # z,y,x nm/voxel
+        tr = self.level_translation_nm[level]    # z,y,x nm
         (x0n, y0n, z0n), (x1n, y1n, z1n) = bbox_xyz_nm
-        z0 = max(0, int(z0n / sc[0]) - pad); z1 = min(arr.shape[0], int(z1n / sc[0]) + pad)
-        y0 = max(0, int(y0n / sc[1]) - pad); y1 = min(arr.shape[1], int(y1n / sc[1]) + pad)
-        x0 = max(0, int(x0n / sc[2]) - pad); x1 = min(arr.shape[2], int(x1n / sc[2]) + pad)
+        z0 = max(0, int((z0n - tr[0]) / sc[0]) - pad); z1 = min(arr.shape[0], int((z1n - tr[0]) / sc[0]) + pad)
+        y0 = max(0, int((y0n - tr[1]) / sc[1]) - pad); y1 = min(arr.shape[1], int((y1n - tr[1]) / sc[1]) + pad)
+        x0 = max(0, int((x0n - tr[2]) / sc[2]) - pad); x1 = min(arr.shape[2], int((x1n - tr[2]) / sc[2]) + pad)
         z1 = max(z1, z0 + 1); y1 = max(y1, y0 + 1); x1 = max(x1, x0 + 1)
         sub = np.asarray(arr[z0:z1, y0:y1, x0:x1].read().result())
-        return sub, (z0, y0, x0), tuple(sc)
+        return sub, (z0, y0, x0), tuple(sc), tuple(tr)
 
     def pick_level(self, extent_nm: float, target_px: int = 1600) -> int:
         """Coarsest level that still gives >= target_px across `extent_nm`."""
@@ -138,8 +144,9 @@ class EMVolume:
             level = self.pick_level(extent_nm, target_px)
 
         arr = self._open_level(level)
-        scale = self.level_scale_nm[level]  # z,y,x nm/voxel
-        idx = max(0, min(int(round(position_nm / scale[zyx])), arr.shape[zyx] - 1))
+        scale = self.level_scale_nm[level]        # z,y,x nm/voxel
+        trans = self.level_translation_nm[level]  # z,y,x nm; world = voxel*scale + trans
+        idx = max(0, min(int(round((position_nm - trans[zyx]) / scale[zyx])), arr.shape[zyx] - 1))
 
         # in-plane world ranges
         if region is not None:
@@ -147,12 +154,12 @@ class EMVolume:
             urange = (c[self._XYZ[ua]] - h, c[self._XYZ[ua]] + h)
             vrange = (c[self._XYZ[va]] - h, c[self._XYZ[va]] + h)
         else:
-            urange = (0.0, arr.shape[_AXIS_TO_ZYX[ua]] * scale[_AXIS_TO_ZYX[ua]])
-            vrange = (0.0, arr.shape[_AXIS_TO_ZYX[va]] * scale[_AXIS_TO_ZYX[va]])
+            urange = (trans[_AXIS_TO_ZYX[ua]], trans[_AXIS_TO_ZYX[ua]] + arr.shape[_AXIS_TO_ZYX[ua]] * scale[_AXIS_TO_ZYX[ua]])
+            vrange = (trans[_AXIS_TO_ZYX[va]], trans[_AXIS_TO_ZYX[va]] + arr.shape[_AXIS_TO_ZYX[va]] * scale[_AXIS_TO_ZYX[va]])
 
         u_zyx, v_zyx = _AXIS_TO_ZYX[ua], _AXIS_TO_ZYX[va]
-        u0 = max(0, int(urange[0] / scale[u_zyx])); u1 = min(arr.shape[u_zyx], int(urange[1] / scale[u_zyx]))
-        v0 = max(0, int(vrange[0] / scale[v_zyx])); v1 = min(arr.shape[v_zyx], int(vrange[1] / scale[v_zyx]))
+        u0 = max(0, int((urange[0] - trans[u_zyx]) / scale[u_zyx])); u1 = min(arr.shape[u_zyx], int((urange[1] - trans[u_zyx]) / scale[u_zyx]))
+        v0 = max(0, int((vrange[0] - trans[v_zyx]) / scale[v_zyx])); v1 = min(arr.shape[v_zyx], int((vrange[1] - trans[v_zyx]) / scale[v_zyx]))
         u1 = max(u1, u0 + 1); v1 = max(v1, v0 + 1)
 
         sel = [slice(None)] * 3
@@ -163,9 +170,9 @@ class EMVolume:
         # orient so rows=v, cols=u
         sub = np.moveaxis(sub, (0, 1), (0, 1)) if v_zyx < u_zyx else sub.T
 
-        # actual world rectangle covered (snap to voxel bounds)
-        uo, ue = u0 * scale[u_zyx], u1 * scale[u_zyx]
-        vo, ve = v0 * scale[v_zyx], v1 * scale[v_zyx]
+        # actual world rectangle covered (snap to voxel bounds; world = voxel*scale + trans)
+        uo, ue = u0 * scale[u_zyx] + trans[u_zyx], u1 * scale[u_zyx] + trans[u_zyx]
+        vo, ve = v0 * scale[v_zyx] + trans[v_zyx], v1 * scale[v_zyx] + trans[v_zyx]
         origin = [0.0, 0.0, 0.0]; origin[self._XYZ[axis]] = position_nm
         origin[self._XYZ[ua]] = uo; origin[self._XYZ[va]] = vo
         u = [0.0, 0.0, 0.0]; u[self._XYZ[ua]] = ue - uo
