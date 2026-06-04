@@ -1,83 +1,88 @@
-# CineMap
+<p align="center"><img src="imgs/logo.png" width="110" alt="CineMap logo"></p>
 
-Agentic video generation for large-scale EM segmentation data. **Scout in
-Neuroglancer, render in Blender.** See [plan.md](plan.md) for the full design.
+<h1 align="center">CineMap</h1>
 
-Neuroglancer is the interactive scouting tool; Blender is the single render
-engine. EM context comes from cross-section **slice planes sampled from zarr**;
-the segmentation **meshes** are loaded from precomputed sources — composited in
-one Blender scene, one camera, one coordinate system. Videos are built from a
-**keyframe timeline** that both the UI and (later) a Claude agent edit through one
-`operations` funnel.
+<p align="center"><b>Cinematic videos from large-scale EM segmentation data.</b><br>
+Scout in Neuroglancer, render in Blender.</p>
 
-## Status — Phase 1 (editor, no AI) working end-to-end on real data
+![CineMap interface](imgs/screenshot.png)
 
-- Analyze a neuroglancer state → project (EM + mesh sources).
-- Embedded Neuroglancer **scouting** viewer; "bake" a view into a keyframe.
-- Preset shots: **orbit**, **slice sweep**; manual keyframes.
-- Real **EM slice loader** (OME-Zarr multiscale, region-cropped, over https) +
-  **mesh loader** (precomputed multilod-draco via cloud-volume).
-- **Blender GPU (OPTIX Cycles)** render worker → frames → mp4, with live progress.
-- FastAPI + WebSocket backend; no-build static frontend.
+---
 
-## Setup
+## How it works
 
-Everything runs in the **`mv_env`** conda env; deps are tracked in
-[pyproject.toml](pyproject.toml).
+CineMap turns Neuroglancer views into a keyframe timeline that Blender renders
+into a smooth video.
+
+**Neuroglancer is not the renderer — it is your control surface.** You arrange
+the scene exactly how you want it in Neuroglancer (and frame it in the 3D
+preview), then capture it as a keyframe. Blender generates the actual frames.
+
+## Quick start
+
+**1. Paste your Neuroglancer state link into the field and click `Create`.**
+
+![Create a project](imgs/create_project_button.png)
+
+**2. Scout freely in the Neuroglancer pane** — choose layers, segments, colors,
+whatever you want to show.
+
+**3. Capture the view.** Click `★ Bake keyframe` to save the current view as a new
+keyframe, or `⟳ Update current frame` to overwrite the selected one. Each keyframe
+becomes one Blender frame.
+
+![Framing buttons](imgs/framing_buttons.png)
+
+## What a keyframe captures
+
+Baking (or updating) a keyframe records the full state of your view:
+
+- **Visible layers** — which Neuroglancer layers are shown
+- **Visible segments** — for mesh layers, which segment IDs are on
+- **Segment colors** — the exact colors from Neuroglancer
+- **3D mesh opacity & silhouette** — the mesh rendering style
+- **Camera** — position, zoom, and rotation, taken from the **3D preview** panel
+
+To frame a shot, use the **3D preview** (right pane): zoom in, zoom out, and rotate
+there — that camera is what gets baked.
+
+## Working with the timeline
+
+- **Preview the motion** — click `▷ Preview` to see the interpolated animation
+  between your keyframes.
+- **Update a frame** — select a keyframe and `⟳ Update current frame` to replace it
+  with your latest view.
+- **Reorder frames** — drag keyframes along the timeline to change their order.
+- **Import / Export project** — save and reload a whole project with `⭱ Import` /
+  `⭳ Export`.
+
+## Exporting
+
+- `⬇ Export video` — render the full shot to an mp4.
+- `⬇ Export .blend` — a self-contained Blender file (camera, meshes, EM slices,
+  packed textures) for manual finishing.
+
+![Export buttons](imgs/export_buttons.png)
+
+## Run locally
 
 ```bash
-# (one time) create + install
 mamba create -y -n mv_env python=3.11
-conda run -n mv_env pip install -e .
-conda run -n mv_env pip install bpy   # Blender as a Python module (Cycles)
+conda run -n mv_env pip install -e .     # installs all deps incl. bpy (Blender/Cycles)
+./run.sh                                 # -> http://0.0.0.0:8000
 ```
 
-## Run
+Requires an NVIDIA GPU (OPTIX / Cycles) and network access to the data host (data
+is read over https; `/nrs` need not be mounted).
 
-```bash
-export ANTHROPIC_API_KEY=sk-...   # optional: enables the Claude director chat panel
-./run.sh                          # -> http://0.0.0.0:8000
-# or: conda run -n mv_env uvicorn cinemap.server:app --host 127.0.0.1 --port 8000
-```
+## Let Claude help
 
-The **Claude director** (right-hand chat panel) turns plain requests
-("orbit the nuclei, then sweep a z-slice") into keyframe edits via the same
-`operations` funnel the UI uses. It needs `ANTHROPIC_API_KEY`; without it the
-panel explains how to set it. Model via `CINEMAP_AGENT_MODEL` (default
-`claude-sonnet-4-6`).
+Click `✦ Help me! Claude` to open the director panel and just ask in plain
+language — *"orbit the nuclei, then sweep a z-slice"*. Claude builds the
+keyframes for you.
 
-Open the URL, paste a neuroglancer state link (the example is pre-filled), click
-**Create**, scout in the Neuroglancer pane, **Bake** keyframes (or **Orbit
-360°**), then **Render ▸**. The mp4 plays in the preview pane.
+![Help me! Claude](imgs/claude_help_me.png)
 
-Requirements observed on the dev box: an NVIDIA GPU (OPTIX), network access to the
-data host (data is read over https; `/nrs` need not be mounted). ffmpeg is bundled via imageio-ffmpeg.
-
-## Layout
-
-```
-src/cinemap/
-  models.py            pydantic project/keyframe/render schemas
-  operations.py        the single funnel (UI + agent call through this)
-  store.py             project.json persistence
-  scouting.py          neuroglancer scouting viewer + bake_keyframe
-  server.py            FastAPI: REST + websocket
-  data/
-    manifest.py        neuroglancer state -> EM + mesh sources
-    slice_loader.py    OME-Zarr multiscale EM cross-section reader (https)
-    mesh_loader.py     precomputed multilod-draco meshes (cloud-volume)
-  render/
-    interpolate.py     keyframes -> per-frame states
-    worker.py          assets -> scene.json -> blender subprocess -> mp4
-    blender_script.py  bpy: build scene (slices+meshes), render frames
-frontend/index.html    no-build UI (NG iframe + timeline + render)
-spikes/                Phase-0 validation scripts
-```
-
-## Known follow-ups (Phase 3 — fidelity)
-
-- Hero-mesh lighting/material tuning; smarter framing for concave meshes.
-- Generate meshes for label-only layers (e.g. `er`).
-- React/Vite frontend (needs Node, not installed on the dev box yet).
-- Claude agent (Phase 2): wrap `operations.*` as tools.
-- GPU headless Neuroglancer capture (only if NG thumbnails are wanted).
+Everything Claude creates is normal keyframes, so you stay in control — **tweak,
+reframe, reorder, or re-bake any of them afterward** exactly as if you'd made them
+by hand. (Requires `ANTHROPIC_API_KEY`.)

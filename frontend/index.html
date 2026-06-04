@@ -71,13 +71,14 @@
   <button onclick="exportProject()" title="download this project as a .cinemap.json file">⭳ Export</button>
   <button onclick="document.getElementById('importFile').click()" title="open a saved .cinemap.json">⭱ Import</button>
   <input type="file" id="importFile" accept=".json,application/json" style="display:none" onchange="importProject(event)" />
+  <button id="claudeToggle" class="accent" onclick="toggleClaude()" title="show / hide the Claude director panel">✦ Help me! Claude</button>
   <span id="status" class="msg"></span>
 </header>
 
 <main>
   <div class="col left">
     <div class="pane-title">◆ Neuroglancer — scouting
-      <button onclick="bake()">★ Bake keyframe</button>
+      <button class="accent" onclick="bake()">★ Bake keyframe</button>
       <button onclick="updateFrame()" title="overwrite the selected keyframe with the current Neuroglancer view (camera + layers + segments)">⟳ Update current frame</button>
       <button onclick="addKeyframe()">+ Duplicate last</button>
     </div>
@@ -100,7 +101,7 @@
     <div class="controls" style="border-top:0"><div id="bar" class="grow"><div id="barFill"></div></div></div>
     <div class="controls" style="border-top:0"><span id="renderMsg" class="msg"></span></div>
   </div>
-  <div class="col chatcol">
+  <div class="col chatcol" id="chatcol" style="display:none">
     <div class="pane-title">✦ Claude — director</div>
     <div id="keyBar" style="display:none; padding:8px; border-bottom:1px solid var(--line)">
       <div class="msg" style="margin-bottom:6px">🔑 Set your Anthropic API key to enable Claude:</div>
@@ -297,6 +298,11 @@ async function bake() {
     setStatus('baked keyframe — rendering…');
     renderThumbnail(kf.id);
   } catch (e) { setStatus('bake failed: ' + e.message); }
+}
+function toggleClaude() {
+  const open = $('chatcol').style.display === 'none';
+  $('chatcol').style.display = open ? 'flex' : 'none';
+  $('claudeToggle').textContent = open ? '✦ Bye! Claude' : '✦ Help me! Claude';
 }
 async function addKeyframe() { if(!PID)return; await api('POST', `/api/projects/${PID}/keyframes`); reload(); }
 async function delKf(id)     { await api('DELETE', `/api/projects/${PID}/keyframes/${id}`); reload(); }

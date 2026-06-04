@@ -12,7 +12,7 @@ authors = [{ name = "zouinkhim" }]
 
 # Python runtime dependencies. Add new deps HERE, then:
 #   conda run -n mv_env pip install -e .
-# (Blender is NOT a pip dep — it is installed into mv_env via conda-forge; see plan.md.)
+# (Blender ships as the `bpy` pip wheel below — installed by `pip install -e .`.)
 dependencies = [
   # --- backend / API ---
   "fastapi",
