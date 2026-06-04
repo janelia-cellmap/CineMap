@@ -125,8 +125,14 @@ def generate_union(
         if shp[0] * shp[1] * shp[2] <= target_voxels:
             level = lvl
             break
-    arr = np.asarray(vol._open_level(level)[:, :, :].read().result())
-    sc = vol.level_scale_nm[level]          # z,y,x nm
+    # Even the coarsest available level can blow the budget (e.g. a single-scale
+    # volume with no downsampled levels). Subsample on read with an integer stride
+    # so the materialized array — and thus peak memory — stays bounded regardless.
+    shp = vol.level_shape_zyx(level)
+    total = shp[0] * shp[1] * shp[2]
+    stride = max(1, int(np.ceil((total / max(1, target_voxels)) ** (1 / 3))))
+    arr = np.asarray(vol._open_level(level)[::stride, ::stride, ::stride].read().result())
+    sc = [s * stride for s in vol.level_scale_nm[level]]   # nm/voxel after striding (z,y,x)
     tr = vol.level_translation_nm[level]    # z,y,x nm; world = voxel*scale + translation
     mask = np.isin(arr, list(seg_ids)).astype(np.uint8)
     if not mask.any():
