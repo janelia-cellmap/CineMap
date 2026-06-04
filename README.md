@@ -5,6 +5,9 @@
 <p align="center"><b>Cinematic videos from large-scale EM segmentation data.</b><br>
 Scout in Neuroglancer, render in Blender.</p>
 
+<p align="center"><img src="imgs/result_video.gif" width="640" alt="Example CineMap render"></p>
+<p align="center"><sub><i>An example shot rendered with CineMap.</i></sub></p>
+
 ![CineMap interface](imgs/screenshot.png)
 
 ---
