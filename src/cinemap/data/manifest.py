@@ -86,10 +86,12 @@ def analyze_state(url: str) -> Manifest:
         elif ltype == "segmentation":
             mesh_url = next((u for u, _, role in srcs if role == "mesh"), None)
             label_zarr = next((u for u, _, role in srcs if role == "volume"), None)
-            if mesh_url or label_zarr:
+            skel_url = next((u for u, _, role in srcs if role == "skeleton"), None)
+            if mesh_url or label_zarr or skel_url:
                 seg_ids = [int(s) for s in (layer.get("segments") or []) if str(s).isdigit()]
                 meshes.append(MeshSource(name=name, mesh_url=mesh_url or "",
-                                         label_zarr=label_zarr or "", segment_ids=seg_ids))
+                                         label_zarr=label_zarr or "", skeleton_url=skel_url or "",
+                                         segment_ids=seg_ids))
 
     # A mesh-only layer (precomputed mesh, no label volume) can still be generated
     # cleanly from labels: borrow the label volume of a layer sharing the same

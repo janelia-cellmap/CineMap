@@ -21,6 +21,7 @@ class MeshSource(BaseModel):
     name: str
     mesh_url: str = ""  # multilod-draco mesh dir + segment_properties (for ids/bbox)
     label_zarr: str = ""  # OME-Zarr label volume — preferred geometry via marching cubes
+    skeleton_url: str = ""  # precomputed neuroglancer_skeletons dir (rendered as tubes)
     segment_ids: list[int] = Field(default_factory=list)
 
 

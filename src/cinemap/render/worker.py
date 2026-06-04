@@ -149,11 +149,17 @@ class RenderWorker:
         out = self.assets_dir / f"mesh_{uid}.ply"  # PLY keeps vertex colors
         if out.exists():
             return str(out)
-        loader = MeshLoader(src.mesh_url, src.label_zarr)
         try:
-            combined = loader.load_many(ids, colorize=lc.rgb,
-                                        target_voxels_single=self._mesh_voxels_single,
-                                        target_voxels_union=self._mesh_voxels_union)
+            if src.skeleton_url and not src.mesh_url and not src.label_zarr:
+                # skeleton-only layer -> sweep skeletons into tubes
+                from ..data.skeleton import SkeletonLoader
+
+                combined = SkeletonLoader(src.skeleton_url).load_many(ids, colorize=lc.rgb)
+            else:
+                combined = MeshLoader(src.mesh_url, src.label_zarr).load_many(
+                    ids, colorize=lc.rgb,
+                    target_voxels_single=self._mesh_voxels_single,
+                    target_voxels_union=self._mesh_voxels_union)
         except Exception as e:  # noqa: BLE001
             print(f"[worker] mesh {mesh_name} ({len(ids)} segs) failed: {e}")
             return None

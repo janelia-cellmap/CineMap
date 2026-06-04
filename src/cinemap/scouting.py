@@ -97,7 +97,9 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
 
     if st is None:
         st = get_viewer().state.to_json()
-    has_mesh = {m.name: bool(m.mesh_url) for m in project.manifest.meshes}
+    # a layer renders 3D geometry if it has a precomputed mesh OR a skeleton source;
+    # label-only layers stay on the EM slice (render_3d=False).
+    has_mesh = {m.name: bool(m.mesh_url or m.skeleton_url) for m in project.manifest.meshes}
     lcolors = current_layer_colors(project, st)
     # per-layer 3D render state (Opacity/Silhouette) from the serialized state
     layers = {l.get("name"): l for l in st.get("layers", [])}
