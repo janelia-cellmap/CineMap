@@ -9,6 +9,7 @@ Validated path (spike): tensorstore zarr driver + http kvstore, zstd, '/' sep.
 from __future__ import annotations
 
 import json
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from functools import lru_cache
@@ -55,6 +56,7 @@ class EMVolume:
 
     def __init__(self, zarr_url: str):
         self.url = zarr_url.rstrip("/")
+        self.zarr_v3 = False  # set by _read_attrs (v3 datasets expose zarr.json)
         self.multiscales = self._read_attrs()
         self.datasets = self.multiscales["datasets"]  # [{path, coordinateTransformations}]
         # nm scale + translation (z,y,x) per level. The OME-Zarr translation aligns
@@ -69,18 +71,45 @@ class EMVolume:
             self.level_scale_nm.append([float(s) for s in scale])
             self.level_translation_nm.append([float(t) for t in trans])
 
+    @staticmethod
+    def _get_json(url: str) -> dict:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            return json.load(r)
+
     def _read_attrs(self) -> dict:
-        with urllib.request.urlopen(f"{self.url}/.zattrs", timeout=30) as r:
-            attrs = json.load(r)
-        return attrs["multiscales"][0]
+        """Multiscales metadata, supporting both OME-Zarr layouts:
+          - v2 / OME-0.4:  `.zattrs` with a top-level `multiscales`
+          - v3 / OME-0.5:  `zarr.json` with `attributes.ome.multiscales`
+        Sets `self.zarr_v3` so `_open_level` picks the matching tensorstore driver."""
+        try:
+            attrs = self._get_json(f"{self.url}/.zattrs")
+            self.zarr_v3 = False
+            return attrs["multiscales"][0]
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+        # No .zattrs -> assume Zarr v3 group metadata.
+        grp = self._get_json(f"{self.url}/zarr.json")
+        self.zarr_v3 = True
+        attrs = grp.get("attributes", {})
+        ome = attrs.get("ome", attrs)  # OME-Zarr 0.5 nests multiscales under "ome"
+        return ome["multiscales"][0]
 
     @lru_cache(maxsize=16)
     def _open_level(self, level: int):
         path = self.datasets[level]["path"]
         base = f"{self.url}/{path}/"
-        # Some cellmap arrays add a non-standard "checksum" field to the zstd
-        # compressor that tensorstore's strict parser rejects. Fetch the .zarray,
-        # drop it, and open with assume_metadata so tensorstore skips re-parsing.
+        if self.zarr_v3:
+            # tensorstore's zarr3 driver reads the level's own `zarr.json` (codecs,
+            # sharding, etc.) directly — no manual metadata massaging needed.
+            return ts.open({
+                "driver": "zarr3",
+                "kvstore": {"driver": "http", "base_url": base},
+                "open": True,
+            }).result()
+        # Zarr v2: some cellmap arrays add a non-standard "checksum" field to the
+        # zstd compressor that tensorstore's strict parser rejects. Fetch the
+        # .zarray, drop it, and open with assume_metadata to skip re-parsing.
         with urllib.request.urlopen(f"{base}.zarray", timeout=30) as r:
             meta = json.load(r)
         comp = meta.get("compressor")
