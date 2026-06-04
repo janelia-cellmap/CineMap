@@ -33,6 +33,23 @@ class SliceResult:
     scale_level: int
 
 
+@lru_cache(maxsize=32)
+def _cached_volume(zarr_url: str) -> "EMVolume":
+    return EMVolume(zarr_url)
+
+
+def get_volume(zarr_url: str) -> "EMVolume":
+    """Cached EMVolume per URL. Constructing one does a blocking `.zattrs` HTTP
+    fetch (and each level opens with a `.zarray` fetch), so reusing the instance
+    across keyframe/preset/mesh operations avoids redundant network round-trips
+    within a session. Volume metadata is immutable, so sharing is safe. The URL is
+    normalized first so trailing-slash variants hit the same cache entry."""
+    return _cached_volume(zarr_url.rstrip("/"))
+
+
+get_volume.cache_clear = _cached_volume.cache_clear  # expose for tests/refresh
+
+
 class EMVolume:
     """Multiscale OME-Zarr EM volume; opens levels lazily and reads planes."""
 

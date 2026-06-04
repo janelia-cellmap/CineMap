@@ -58,6 +58,11 @@ def fetch_state(url: str) -> dict:
         return json.loads(ref)
     if ref.startswith("gs://"):
         ref = "https://storage.googleapis.com/" + ref[len("gs://") :]
+    # Only fetch over http(s): the input is user-supplied, and urlopen otherwise
+    # honors file://, ftp://, … (an SSRF / local-file-read vector).
+    scheme = urllib.parse.urlparse(ref).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"unsupported state URL scheme: {scheme or '(none)'!r}")
     with urllib.request.urlopen(ref, timeout=30) as r:
         return json.load(r)
 

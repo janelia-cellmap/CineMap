@@ -39,13 +39,15 @@ def cmd_count(a) -> None:
 
 def cmd_render(a) -> None:
     project = _load(a.project)
-    settings = RenderSettings(width=a.width, height=a.height, fps=a.fps, samples=a.samples)
+    settings = RenderSettings(width=a.width, height=a.height, fps=a.fps, samples=a.samples,
+                              export_blend=a.export_blend)
     worker = RenderWorker(project, RenderJob(id="cli", settings=settings))
     worker._cb = None  # not using run()'s progress callback
     out = Path(a.out)
     worker.workdir = out
     worker.frames_dir = out / "frames"
     worker.assets_dir = out / f"assets_{a.start}_{a.end}"
+    worker.blend_path = out / "scene.blend"
     worker.frames_dir.mkdir(parents=True, exist_ok=True)
     worker.assets_dir.mkdir(parents=True, exist_ok=True)
 
@@ -64,8 +66,11 @@ def cmd_render(a) -> None:
     )
     if proc.returncode != 0:
         sys.exit(f"blender exited {proc.returncode}")
-    have = len(list(worker.frames_dir.glob("frame_*.png")))
-    print(f"[cli] done; frames on disk: {have}", flush=True)
+    if a.export_blend:
+        print(f"[cli] done; WROTE {worker.blend_path}", flush=True)
+    else:
+        have = len(list(worker.frames_dir.glob("frame_*.png")))
+        print(f"[cli] done; frames on disk: {have}", flush=True)
 
 
 def cmd_combine(a) -> None:
@@ -74,11 +79,15 @@ def cmd_combine(a) -> None:
     pngs = sorted(frames_dir.glob("frame_*.png"))
     if not pngs:
         sys.exit("no frames to combine")
-    # detect gaps (a failed split job) before encoding
+    # detect gaps (a failed split job) before encoding. ffmpeg's image2 demuxer
+    # stops at the FIRST missing index, so a single failed split job would yield a
+    # silently truncated video. Fail hard by default; --allow-gaps recovers what's
+    # present (via a glob input that skips the holes) instead of truncating.
     idxs = [int(p.stem.split("_")[1]) for p in pngs]
     missing = sorted(set(range(idxs[0], idxs[-1] + 1)) - set(idxs))
-    if missing:
-        print(f"[cli] WARNING: {len(missing)} missing frames, e.g. {missing[:5]}", flush=True)
+    if missing and not getattr(a, "allow_gaps", False):
+        sys.exit(f"[cli] ERROR: {len(missing)} missing frames (e.g. {missing[:5]}); "
+                 f"re-run the failed render range, or pass --allow-gaps to encode anyway")
     try:
         import imageio_ffmpeg
 
@@ -86,11 +95,14 @@ def cmd_combine(a) -> None:
     except Exception:  # noqa: BLE001
         ffmpeg = "ffmpeg"
     output = a.output or str(out / "output.mp4")
-    print(f"[cli] combining {len(pngs)} frames @ {a.fps}fps -> {output}", flush=True)
+    print(f"[cli] combining {len(pngs)} frames @ {a.fps}fps -> {output}"
+          + (f"  ({len(missing)} gaps skipped)" if missing else ""), flush=True)
+    if missing:  # glob includes every present frame in order, ignoring the holes
+        in_args = ["-pattern_type", "glob", "-i", str(frames_dir / "frame_*.png")]
+    else:        # contiguous: the cheap sequential reader from the first index
+        in_args = ["-start_number", str(idxs[0]), "-i", str(frames_dir / "frame_%05d.png")]
     subprocess.run(
-        [ffmpeg, "-y", "-framerate", str(a.fps),
-         "-start_number", str(idxs[0]),
-         "-i", str(frames_dir / "frame_%05d.png"),
+        [ffmpeg, "-y", "-framerate", str(a.fps), *in_args,
          "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", output],
         check=True,
     )
@@ -110,11 +122,15 @@ def main() -> None:
     r.add_argument("--height", type=int, default=720)
     r.add_argument("--start", type=int)
     r.add_argument("--end", type=int)
+    r.add_argument("--export-blend", action="store_true",
+                   help="write a self-contained animated .blend instead of rendering frames")
 
     c = sub.add_parser("combine"); c.set_defaults(fn=cmd_combine)
     c.add_argument("--out", required=True)
     c.add_argument("--fps", type=int, default=30)
     c.add_argument("--output")
+    c.add_argument("--allow-gaps", action="store_true",
+                   help="encode whatever frames exist instead of failing on missing ones")
 
     n = sub.add_parser("count"); n.set_defaults(fn=cmd_count)
     n.add_argument("--project", required=True)

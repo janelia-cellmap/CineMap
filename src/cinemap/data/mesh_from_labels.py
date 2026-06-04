@@ -12,7 +12,7 @@ import numpy as np
 import trimesh
 from skimage import measure
 
-from .slice_loader import EMVolume
+from .slice_loader import get_volume
 
 
 def _layer_offset(layer: str) -> float:
@@ -80,7 +80,7 @@ def generate(
     bbox_xyz_nm = ((x0,y0,z0), (x1,y1,z1)). The bbox typically comes from the
     precomputed mesh (its global placement is correct); geometry comes from labels.
     """
-    vol = EMVolume(label_zarr_url)
+    vol = get_volume(label_zarr_url)
     level = vol.pick_level_for_box(bbox_xyz_nm, target_voxels)
     sub, (z0, y0, x0), sc, tr = vol.read_box(bbox_xyz_nm, level, pad=2)
 
@@ -117,7 +117,7 @@ def generate_union(
     read + marching cubes on the union mask. Cheap for hundreds/thousands of
     segments (e.g. "show every nucleus") vs. per-segment reads.
     """
-    vol = EMVolume(label_zarr_url)
+    vol = get_volume(label_zarr_url)
     # finest whole-volume level whose total voxels fit the budget
     level = len(vol.level_scale_nm) - 1
     for lvl in range(len(vol.level_scale_nm)):
@@ -145,7 +145,7 @@ def generate_union(
 def selected_region(label_zarr_url: str, seg_ids, target_voxels: int = 12_000_000):
     """Robust center + radius (xyz nm) of where the selected segments actually are,
     ignoring sparse outliers — so framing/slicing land on the dense cluster."""
-    vol = EMVolume(label_zarr_url)
+    vol = get_volume(label_zarr_url)
     level = len(vol.level_scale_nm) - 1
     for lvl in range(len(vol.level_scale_nm)):
         shp = vol.level_shape_zyx(lvl)

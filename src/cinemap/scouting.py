@@ -71,22 +71,36 @@ def current_visible_segments(project: Project) -> dict[str, list[int]]:
     return out
 
 
-def current_layer_colors(project: Project) -> dict:
-    """{layer_name: LayerColors} captured from the current neuroglancer state."""
+def current_layer_colors(project: Project, st: dict | None = None) -> dict:
+    """{layer_name: LayerColors} captured from the current neuroglancer state.
+    Pass an already-serialized `st` to avoid a redundant full-state to_json()."""
     from .data import colors as _colors
 
-    st = get_viewer().state.to_json()
+    if st is None:
+        st = get_viewer().state.to_json()
     return {l.get("name"): _colors.from_layer_dict(l)
             for l in st.get("layers", []) if l.get("type") == "segmentation"}
 
 
-def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = None) -> list[MeshInstance]:
+def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = None,
+                         st: dict | None = None) -> list[MeshInstance]:
     """Build mesh instances from the current NG visible segments. A layer renders
     a 3D mesh only if it has a precomputed-mesh source (like neuroglancer);
     label-only segmentation layers are shown on the EM slice only. Also captures
-    the layer's neuroglancer coloring (seed / fixed colors)."""
+    the layer's neuroglancer coloring (seed / fixed colors).
+
+    `st` (a pre-serialized viewer state) lets the caller serialize once and reuse
+    it here for colors + per-layer 3D state instead of re-serializing per call —
+    each to_json() scales with the selected-segment count.
+    """
+    from .data import colors as _colors
+
+    if st is None:
+        st = get_viewer().state.to_json()
     has_mesh = {m.name: bool(m.mesh_url) for m in project.manifest.meshes}
-    lcolors = current_layer_colors(project)
+    lcolors = current_layer_colors(project, st)
+    # per-layer 3D render state (Opacity/Silhouette) from the serialized state
+    layers = {l.get("name"): l for l in st.get("layers", [])}
     meshes: list[MeshInstance] = []
     for name, ids in current_visible_segments(project).items():
         lc = lcolors.get(name)
@@ -94,6 +108,8 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
         if lc is not None:
             fields.update(color_seed=lc.seed, default_color=lc.default,
                           segment_colors={str(k): v for k, v in lc.overrides.items()})
+        if name in layers:
+            fields.update(_colors.render3d_from_layer(layers[name]))  # Opacity/Silhouette (3d)
         meshes.append(MeshInstance(mesh_name=name, **fields))
     return meshes
 
@@ -104,13 +120,13 @@ def _scene_from_view(project: Project):
     the visible segmentation layers/segments."""
     from .data.ng_camera import ng_to_camera
 
-    st = get_viewer().state.to_json()
+    st = get_viewer().state.to_json()  # serialize the viewer state ONCE; reuse below
     cam = ng_to_camera(st, project.manifest.voxel_size_nm)
     em_name = project.manifest.em.name if project.manifest.em else "em"
     vis = current_layer_visibility(project)
     slices = ([SlicePlane(em_name=em_name, axis="z", position_nm=cam.look_at_nm[2])]
               if vis.get(em_name, True) else [])
-    meshes = _meshes_from_visible(project)
+    meshes = _meshes_from_visible(project, st=st)
     return cam, slices, meshes, st
 
 
@@ -145,8 +161,9 @@ def sync_segments(project: Project, keyframe_id: str) -> Keyframe | None:
     kf = next((k for k in project.keyframes if k.id == keyframe_id), None)
     if kf is None:
         return None
+    st = get_viewer().state.to_json()  # serialize once; reuse for meshes
     vis = current_layer_visibility(project)
-    meshes = _meshes_from_visible(project, kf.meshes)
+    meshes = _meshes_from_visible(project, kf.meshes, st=st)
 
     # slice on/off follows the EM image layer; keep its axis/position
     em_name = project.manifest.em.name if project.manifest.em else "em"
@@ -193,6 +210,8 @@ def _state_from_keyframe(project: Project, kf: Keyframe, base: dict) -> dict:
             if getattr(m, "segment_colors", None):
                 layer["segmentColors"] = {str(k): _rgb_to_hex(v)
                                           for k, v in m.segment_colors.items()}
+            layer["objectAlpha"] = float(getattr(m, "object_alpha", 1.0))      # Opacity (3d)
+            layer["meshSilhouetteRendering"] = float(getattr(m, "silhouette", 0.0))  # Silhouette (3d)
         elif em_name and name == em_name:                   # EM image layer
             layer["visible"] = name in shown_em
     return state

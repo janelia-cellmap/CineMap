@@ -55,3 +55,12 @@ def from_layer_dict(layer: dict) -> LayerColors:
         except Exception:  # noqa: BLE001
             pass
     return LayerColors(seed=seed, default=default, overrides=overrides)
+
+
+def render3d_from_layer(layer: dict) -> dict:
+    """The neuroglancer 3D mesh render-tab settings from a layer JSON dict:
+    'Opacity (3d)' (objectAlpha) and 'Silhouette (3d)' (meshSilhouetteRendering)."""
+    return {
+        "object_alpha": float(layer.get("objectAlpha", 1.0) or 1.0),
+        "silhouette": float(layer.get("meshSilhouetteRendering", 0.0) or 0.0),
+    }

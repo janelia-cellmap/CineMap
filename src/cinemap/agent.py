@@ -141,8 +141,14 @@ def _dispatch(name: str, args: dict, p: Project, render_fn: Callable | None) -> 
         kf = p.keyframes[args["index"]]
         from .models import MeshInstance
 
+        # preserve the layer's existing render state (color, render_3d, NG 3D
+        # opacity/silhouette) — only the segment set changes.
+        existing = next((m for m in kf.meshes if m.mesh_name == args["mesh_name"]), None)
         meshes = [m for m in kf.meshes if m.mesh_name != args["mesh_name"]]
-        meshes.append(MeshInstance(mesh_name=args["mesh_name"], segment_ids=args["segment_ids"]))
+        if existing is not None:
+            meshes.append(existing.model_copy(update={"segment_ids": args["segment_ids"]}))
+        else:
+            meshes.append(MeshInstance(mesh_name=args["mesh_name"], segment_ids=args["segment_ids"]))
         ops.update_keyframe(p, kf.id, meshes=meshes)
         return {"ok": True, "n_segments": len(args["segment_ids"])}
     if name == "set_mesh_opacity":

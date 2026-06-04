@@ -41,6 +41,8 @@ class FrameMesh:
     color_seed: int = 0
     default_color: list[float] | None = None
     segment_colors: dict = field(default_factory=dict)
+    object_alpha: float = 1.0   # NG "Opacity (3d)"
+    silhouette: float = 0.0     # NG "Silhouette (3d)"
 
 
 @dataclass
@@ -92,12 +94,16 @@ def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
                   segment_colors=src.segment_colors)
         if ma and mb:
             op = (ma.opacity if ma.visible else 0.0) * (1 - t) + (mb.opacity if mb.visible else 0.0) * t
-            fs.meshes.append(FrameMesh(name, ids, mb.color, op, mb.render_3d, **cc))
+            oa = ma.object_alpha * (1 - t) + mb.object_alpha * t       # Opacity (3d) lerps
+            si = ma.silhouette * (1 - t) + mb.silhouette * t           # Silhouette (3d) lerps
+            fs.meshes.append(FrameMesh(name, ids, mb.color, op, mb.render_3d,
+                                       object_alpha=oa, silhouette=si, **cc))
         else:
             m = ma or mb
             base = (m.opacity if m.visible else 0.0)
             op = base * (1 - t) if ma else base * t   # ma-only fades out; mb-only fades in
-            fs.meshes.append(FrameMesh(name, ids, m.color, op, m.render_3d, **cc))
+            fs.meshes.append(FrameMesh(name, ids, m.color, op, m.render_3d,
+                                       object_alpha=m.object_alpha, silhouette=m.silhouette, **cc))
     return fs
 
 

@@ -11,7 +11,7 @@ import uuid
 
 from . import store
 from .data.manifest import analyze_state
-from .data.slice_loader import EMVolume
+from .data.slice_loader import get_volume
 from .models import (
     Camera,
     Keyframe,
@@ -33,7 +33,7 @@ def volume_extent_nm(project: Project) -> tuple[list[float], list[float]]:
     em = project.manifest.em
     if not em:
         return [0, 0, 0], [10000, 10000, 10000]
-    vol = EMVolume(em.zarr_url)
+    vol = get_volume(em.zarr_url)
     shp = vol.level_shape_zyx(0)  # z,y,x
     sc = vol.level_scale_nm[0]  # z,y,x nm
     size_zyx = [shp[i] * sc[i] for i in range(3)]
@@ -75,63 +75,14 @@ def frame_camera(center, radius_nm, fov_deg=40.0, azimuth_deg=35.0, elevation_de
 
 # ----------------------------- project lifecycle -----------------------------
 def create_project(name: str, data_path: str) -> Project:
-    from .data.manifest import fetch_state
+    """Create a project with NO keyframes — the user bakes the first one from the
+    scouting view (the empty timeline says "Bake one from the scouting view").
 
+    We only resolve the data manifest here. Camera framing and which segments/
+    layers are captured happen at bake time from the live neuroglancer state, so
+    there's no need (and no expensive whole-volume read) at creation."""
     manifest = analyze_state(data_path)
     project = Project(id=_uid("proj"), name=name, data_path=data_path, manifest=manifest)
-    em_name = manifest.em.name if manifest.em else "em"
-
-    # which layers are visible in the state, their selected segments, and colors
-    from .data import colors as _colors
-
-    state = fetch_state(data_path)
-    visible, segs_by, colors_by = {}, {}, {}
-    for layer in state.get("layers", []):
-        nm = layer.get("name")
-        visible[nm] = layer.get("visible", True) is not False
-        segs_by[nm] = [int(s) for s in (layer.get("segments") or []) if str(s).isdigit()]
-        if layer.get("type") == "segmentation":
-            colors_by[nm] = _colors.from_layer_dict(layer)
-    by_name = {m.name: m for m in manifest.meshes}
-
-    # Opening keyframe: each VISIBLE segmentation layer. A layer with a mesh source
-    # renders in 3D; a label-only layer shows on the EM slice only (like neuroglancer).
-    meshes = []
-    for m in manifest.meshes:
-        if not visible.get(m.name, True):
-            continue
-        ids = segs_by.get(m.name) or m.segment_ids
-        if not ids:
-            continue
-        lc = colors_by.get(m.name)
-        cf = {} if lc is None else dict(color_seed=lc.seed, default_color=lc.default,
-                                        segment_colors={str(k): v for k, v in lc.overrides.items()})
-        meshes.append(MeshInstance(mesh_name=m.name, segment_ids=ids,
-                                   render_3d=bool(m.mesh_url), **cf))
-
-    # frame on the visible content: a single 3D hero mesh -> close-up; otherwise
-    # the dense cluster of whatever's shown (mesh or label layer).
-    center, size = volume_extent_nm(project)
-    target, radius = center, 0.5 * max(size)
-    hero = next((mi for mi in meshes), None)
-    if hero is not None:
-        src = by_name[hero.mesh_name]
-        if len(hero.segment_ids) == 1 and src.mesh_url:
-            bbox = mesh_bbox_nm(src.mesh_url, hero.segment_ids)
-            if bbox:
-                target, radius = bbox[0], bbox[1] * 2.2
-        elif src.label_zarr:
-            from .data.mesh_from_labels import selected_region
-
-            try:
-                target, radius = selected_region(src.label_zarr, hero.segment_ids)
-                radius *= 1.6
-            except Exception:  # noqa: BLE001
-                pass
-    slices = [SlicePlane(em_name=em_name, axis="z", position_nm=target[2])]
-    kf = Keyframe(id=_uid("kf"), label="establish",
-                  camera=frame_camera(target, radius), slices=slices, meshes=meshes)
-    project.keyframes.append(kf)
     store.save(project)
     return project
 
@@ -191,9 +142,17 @@ def make_orbit(project: Project, degrees: float = 360.0, n: int = 12,
                elevation_deg: float = 22.0, target=None, radius_nm=None,
                duration_per_kf_s: float = 0.6) -> list[Keyframe]:
     base, target, radius = _base_framing(project, target, radius_nm)
+    # start the orbit at the current camera's azimuth so the first keyframe doesn't
+    # swing away from the framing the user/agent set (fall back to 35°).
+    az0 = 35.0
+    if base is not None:
+        dx = base.camera.position_nm[0] - target[0]
+        dy = base.camera.position_nm[1] - target[1]
+        if dx or dy:
+            az0 = math.degrees(math.atan2(dy, dx))
     new = []
     for i in range(n):
-        az = 35.0 + degrees * i / max(1, n - 1)
+        az = az0 + degrees * i / max(1, n - 1)
         kf = Keyframe(
             id=_uid("kf"), label=f"orbit {int(az)}°",
             camera=frame_camera(target, radius, azimuth_deg=az, elevation_deg=elevation_deg),

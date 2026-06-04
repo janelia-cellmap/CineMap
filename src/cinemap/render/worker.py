@@ -19,7 +19,7 @@ from typing import Callable
 from ..config import NM_PER_BU, PROJECTS_DIR
 from ..models import Manifest, Project, RenderJob
 from ..data.mesh_loader import MeshLoader
-from ..data.slice_loader import EMVolume
+from ..data.slice_loader import EMVolume, get_volume
 from .interpolate import FrameState, build_frames
 
 Progress = Callable[[float, str], None]
@@ -42,22 +42,31 @@ class RenderWorker:
         self.workdir = PROJECTS_DIR / project.id / "renders" / job.id
         self.frames_dir = self.workdir / "frames"
         self.assets_dir = self.workdir / "assets"
+        self.blend_path = self.workdir / "scene.blend"
         self.cancel = threading.Event()   # set to request cancellation
         self._proc: subprocess.Popen | None = None
         self._em: EMVolume | None = None
         self._label_vols: dict[str, EMVolume] = {}
         self._slice_cache: dict[tuple, dict] = {}
+        # Resolution budgets. Draft (bake/update/preview thumbnails) trades detail
+        # for speed: a coarse EM level and low-voxel meshes. The final video uses
+        # full resolution. EM level is chosen by target px across the on-screen
+        # crop; meshes by marching-cubes voxel budget (per-segment / union).
+        draft = bool(getattr(job.settings, "draft", False))
+        self._em_target_px = 768 if draft else 1600
+        self._mesh_voxels_single = 1_500_000 if draft else 8_000_000
+        self._mesh_voxels_union = 3_000_000 if draft else 20_000_000
 
     # ---- asset preparation ----
     def _em_vol(self) -> EMVolume:
         if self._em is None:
             assert self.manifest.em, "no EM source in manifest"
-            self._em = EMVolume(self.manifest.em.zarr_url)
+            self._em = get_volume(self.manifest.em.zarr_url)
         return self._em
 
     def _label_vol(self, url: str) -> EMVolume:
         if url not in self._label_vols:
-            self._label_vols[url] = EMVolume(url)
+            self._label_vols[url] = get_volume(url)
         return self._label_vols[url]
 
     def _slice_png(self, sl, region, seg_overlays) -> dict:
@@ -69,19 +78,21 @@ class RenderWorker:
 
         center, half = region
         key = (sl.em_name, sl.axis, round(sl.position_nm),
-               tuple(round(c) for c in center), round(half),
+               tuple(round(c) for c in center), round(half), self._em_target_px,
                tuple((u, tuple(sorted(ids)), lc.cache_key()) for u, ids, lc in seg_overlays))
         if key in self._slice_cache:
             return self._slice_cache[key]
 
-        res = self._em_vol().read_slice(sl.axis, sl.position_nm, level=sl.scale_level, region=region)
+        res = self._em_vol().read_slice(sl.axis, sl.position_nm, level=sl.scale_level,
+                                        target_px=self._em_target_px, region=region)
         rgb = np.repeat(res.image[:, :, None].astype(np.float64), 3, axis=2)  # grayscale EM
         H, W = rgb.shape[:2]
 
         for label_zarr, ids, lc in seg_overlays:
             if not ids:
                 continue
-            lres = self._label_vol(label_zarr).read_slice(sl.axis, sl.position_nm, region=region)
+            lres = self._label_vol(label_zarr).read_slice(sl.axis, sl.position_nm,
+                                                          target_px=self._em_target_px, region=region)
             lab = np.asarray(lres.image)
             yi = (np.arange(H) * lab.shape[0] / H).astype(int).clip(0, lab.shape[0] - 1)
             xi = (np.arange(W) * lab.shape[1] / W).astype(int).clip(0, lab.shape[1] - 1)
@@ -140,7 +151,9 @@ class RenderWorker:
             return str(out)
         loader = MeshLoader(src.mesh_url, src.label_zarr)
         try:
-            combined = loader.load_many(ids, colorize=lc.rgb)
+            combined = loader.load_many(ids, colorize=lc.rgb,
+                                        target_voxels_single=self._mesh_voxels_single,
+                                        target_voxels_union=self._mesh_voxels_union)
         except Exception as e:  # noqa: BLE001
             print(f"[worker] mesh {mesh_name} ({len(ids)} segs) failed: {e}")
             return None
@@ -182,13 +195,24 @@ class RenderWorker:
             for sl in fr.slices:
                 if sl.opacity <= 0.001:
                     continue
-                s = {**self._slice_png(sl, region, seg_overlays), "opacity": sl.opacity}
+                # slot is stable across frames (matches interpolate's slice identity)
+                # so the blend exporter can group a slice's per-frame images into one
+                # animated image-sequence plane.
+                s = {**self._slice_png(sl, region, seg_overlays),
+                     "opacity": sl.opacity, "slot": f"{sl.em_name}:{sl.axis}"}
                 slices.append(s)
             overrides = {}
             for m in fr.meshes:
                 uid = self._mesh_uid(m.mesh_name, m.segment_ids, self._frame_colors(m).cache_key())
                 if uid in mesh_specs:
-                    overrides[uid] = {"opacity": m.opacity, "visible": m.opacity > 0.001}
+                    # effective 3D alpha = cinematic fade (opacity) * NG "Opacity (3d)"
+                    oa = getattr(m, "object_alpha", 1.0)
+                    eff = m.opacity * oa
+                    overrides[uid] = {
+                        "opacity": eff,
+                        "visible": eff > 0.001,
+                        "silhouette": getattr(m, "silhouette", 0.0),
+                    }
             frame_specs.append({
                 "camera": {
                     "position_bu": _bu(fr.position_nm, self.nm_per_bu),
@@ -209,6 +233,8 @@ class RenderWorker:
             "meshes": list(mesh_specs.values()),
             "frames": frame_specs,
             "output_dir": str(self.frames_dir),
+            "fps": self.job.settings.fps,
+            "export_blend": str(self.blend_path) if self.job.settings.export_blend else None,
         }
 
     # ---- run ----
@@ -247,7 +273,9 @@ class RenderWorker:
         scene_path = self.workdir / "scene.json"
         scene_path.write_text(json.dumps(spec, indent=2))
 
-        self._progress(0.6, f"rendering {len(frames)} frames in Blender")
+        exporting = self.job.settings.export_blend
+        self._progress(0.6, f"{'baking .blend' if exporting else 'rendering'} "
+                            f"({len(frames)} frames) in Blender")
         py = sys.executable
         self._proc = subprocess.Popen(
             [py, "-m", "cinemap.render.blender_script", str(scene_path)],
@@ -271,7 +299,13 @@ class RenderWorker:
             self.job.status = "error"
             raise RuntimeError(f"blender exited {proc.returncode}")
 
-        out = self._encode(len(frames))
+        if exporting:
+            if not self.blend_path.exists():
+                self.job.status = "error"
+                raise RuntimeError("blender finished but no .blend was written")
+            out = str(self.blend_path)
+        else:
+            out = self._encode(len(frames))
         self.job.status = "done"
         self.job.output_path = out
         self._progress(1.0, "done")

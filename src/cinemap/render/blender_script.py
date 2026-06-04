@@ -115,6 +115,26 @@ def _import_meshes(scene_spec: dict) -> dict:
                 bsdf.inputs["Emission Color"].default_value = (col[0], col[1], col[2], 1.0)
         if "Emission Strength" in bsdf.inputs:
             bsdf.inputs["Emission Strength"].default_value = 0.15
+
+        # neuroglancer 3D render state: Alpha = object_alpha * (1 - facing)^silhouette.
+        # facing=1 head-on, 0 at grazing -> with silhouette>0 the head-on faces go
+        # transparent and only the rim/silhouette stays (NG's meshSilhouetteRendering);
+        # silhouette=0 -> (…)^0 = 1 -> plain object_alpha everywhere. Driven per frame
+        # by the cm_alpha / cm_silh value nodes.
+        lw = nt.nodes.new("ShaderNodeLayerWeight")
+        sub = nt.nodes.new("ShaderNodeMath"); sub.operation = "SUBTRACT"; sub.inputs[0].default_value = 1.0
+        powr = nt.nodes.new("ShaderNodeMath"); powr.operation = "POWER"
+        mul = nt.nodes.new("ShaderNodeMath"); mul.operation = "MULTIPLY"; mul.use_clamp = True
+        alpha_v = nt.nodes.new("ShaderNodeValue"); alpha_v.name = "cm_alpha"; alpha_v.outputs[0].default_value = 1.0
+        silh_v = nt.nodes.new("ShaderNodeValue"); silh_v.name = "cm_silh"; silh_v.outputs[0].default_value = 0.0
+        nt.links.new(lw.outputs["Facing"], sub.inputs[1])
+        nt.links.new(sub.outputs[0], powr.inputs[0])
+        nt.links.new(silh_v.outputs[0], powr.inputs[1])
+        nt.links.new(alpha_v.outputs[0], mul.inputs[0])
+        nt.links.new(powr.outputs[0], mul.inputs[1])
+        if "Alpha" in bsdf.inputs:
+            nt.links.new(mul.outputs[0], bsdf.inputs["Alpha"])
+
         mat.blend_method = "BLEND"
         obj.data.materials.clear()
         obj.data.materials.append(mat)
@@ -128,15 +148,66 @@ def _set_mesh_state(meshes: dict, overrides: dict) -> None:
         if ov is None:  # not referenced this frame -> hidden (belongs to another keyframe)
             obj.hide_render = True
             continue
-        opacity = ov.get("opacity", 1.0)
+        opacity = ov.get("opacity", 1.0)            # effective alpha = fade * Opacity(3d)
         visible = ov.get("visible", True) and opacity > 0.001
         obj.hide_render = not visible
-        bsdf = mat.node_tree.nodes["Principled BSDF"]
-        if "Alpha" in bsdf.inputs:
-            bsdf.inputs["Alpha"].default_value = opacity
+        nt = mat.node_tree
+        av, sv = nt.nodes.get("cm_alpha"), nt.nodes.get("cm_silh")
+        if av is not None:
+            av.outputs[0].default_value = opacity
+        if sv is not None:
+            sv.outputs[0].default_value = ov.get("silhouette", 0.0)   # Silhouette (3d)
+        if av is None and "Alpha" in nt.nodes["Principled BSDF"].inputs:
+            nt.nodes["Principled BSDF"].inputs["Alpha"].default_value = opacity
 
 
 _slice_objs: list = []
+
+
+def _make_slice(sl: dict, name: str):
+    """Build one textured EM-slice quad at its world placement. Used both by the
+    per-frame still renderer and the .blend exporter (one quad per frame there)."""
+    origin = Vector(sl["origin_bu"])
+    u = Vector(sl["u_bu"])
+    v = Vector(sl["v_bu"])
+    # build a quad from origin, +u, +u+v, +v
+    verts = [origin, origin + u, origin + u + v, origin + v]
+    mesh = bpy.data.meshes.new(f"slice_{name}")
+    mesh.from_pydata([list(p) for p in verts], [], [[0, 1, 2, 3]])
+    mesh.update()
+    # UVs. The slice image has row 0 at the smallest-v world coord (the
+    # `origin` corner), but Blender samples image row 0 at UV v=1 — so the v
+    # axis must be flipped here, or the EM/seg texture renders mirrored along
+    # v relative to the meshes (visible as a vertical misalignment).
+    mesh.uv_layers.new(name="UVMap")
+    uvs = [(0, 1), (1, 1), (1, 0), (0, 0)]  # origin->(0,1): row 0 maps to origin corner
+    for li, _loop in enumerate(mesh.loops):
+        mesh.uv_layers.active.data[li].uv = uvs[li % 4]
+    obj = bpy.data.objects.new(f"slice_{name}", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    obj.visible_shadow = False  # don't shadow meshes that sit below the plane
+
+    mat = bpy.data.materials.new(f"slice_mat_{name}")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    tex = nt.nodes.new("ShaderNodeTexImage")
+    img = bpy.data.images.load(sl["image_path"], check_existing=True)
+    img.colorspace_settings.name = "Non-Color"
+    tex.image = img
+    emit = nt.nodes.new("ShaderNodeEmission")
+    emit.inputs["Strength"].default_value = 0.9  # slightly tame the bright EM plane
+    transp = nt.nodes.new("ShaderNodeBsdfTransparent")
+    mix = nt.nodes.new("ShaderNodeMixShader")
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    nt.links.new(tex.outputs["Color"], emit.inputs["Color"])
+    mix.inputs[0].default_value = sl.get("opacity", 1.0)
+    nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
+    nt.links.new(emit.outputs["Emission"], mix.inputs[2])
+    nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+    mat.blend_method = "BLEND"
+    obj.data.materials.append(mat)
+    return obj
 
 
 def _build_slices(frame: dict) -> None:
@@ -148,44 +219,7 @@ def _build_slices(frame: dict) -> None:
     for i, sl in enumerate(frame.get("slices", [])):
         if sl.get("opacity", 1.0) <= 0.001:
             continue
-        origin = Vector(sl["origin_bu"])
-        u = Vector(sl["u_bu"])
-        v = Vector(sl["v_bu"])
-        # build a quad from origin, +u, +u+v, +v
-        verts = [origin, origin + u, origin + u + v, origin + v]
-        mesh = bpy.data.meshes.new(f"slice_{i}")
-        mesh.from_pydata([list(p) for p in verts], [], [[0, 1, 2, 3]])
-        mesh.update()
-        # UVs
-        mesh.uv_layers.new(name="UVMap")
-        uvs = [(0, 0), (1, 0), (1, 1), (0, 1)]
-        for li, loop in enumerate(mesh.loops):
-            mesh.uv_layers.active.data[li].uv = uvs[li % 4]
-        obj = bpy.data.objects.new(f"slice_{i}", mesh)
-        bpy.context.scene.collection.objects.link(obj)
-        obj.visible_shadow = False  # don't shadow meshes that sit below the plane
-
-        mat = bpy.data.materials.new(f"slice_mat_{i}")
-        mat.use_nodes = True
-        nt = mat.node_tree
-        nt.nodes.clear()
-        tex = nt.nodes.new("ShaderNodeTexImage")
-        img = bpy.data.images.load(sl["image_path"], check_existing=True)
-        img.colorspace_settings.name = "Non-Color"
-        tex.image = img
-        emit = nt.nodes.new("ShaderNodeEmission")
-        emit.inputs["Strength"].default_value = 0.9  # slightly tame the bright EM plane
-        transp = nt.nodes.new("ShaderNodeBsdfTransparent")
-        mix = nt.nodes.new("ShaderNodeMixShader")
-        out = nt.nodes.new("ShaderNodeOutputMaterial")
-        nt.links.new(tex.outputs["Color"], emit.inputs["Color"])
-        mix.inputs[0].default_value = sl.get("opacity", 1.0)
-        nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
-        nt.links.new(emit.outputs["Emission"], mix.inputs[2])
-        nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
-        mat.blend_method = "BLEND"
-        obj.data.materials.append(mat)
-        _slice_objs.append(obj)
+        _slice_objs.append(_make_slice(sl, str(i)))
 
 
 def _set_camera(frame: dict) -> None:
@@ -197,8 +231,13 @@ def _set_camera(frame: dict) -> None:
         scene.collection.objects.link(cam)
         scene.camera = cam
     cam.location = Vector(frame["camera"]["position_bu"])
-    cam.data.angle_y = frame["camera"]["fov_rad"]
-    cam.data.lens_unit = "FOV"
+    if frame["camera"].get("type") == "ORTHO":  # straight-down validation views
+        cam.data.type = "ORTHO"
+        cam.data.ortho_scale = frame["camera"].get("ortho_scale", 4.0)
+    else:
+        cam.data.type = "PERSP"
+        cam.data.angle_y = frame["camera"]["fov_rad"]
+        cam.data.lens_unit = "FOV"
     direction = Vector(frame["camera"]["look_at_bu"]) - cam.location
     up = frame["camera"].get("up", [0, 0, 1])
     cam.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
@@ -208,6 +247,9 @@ def _set_camera(frame: dict) -> None:
 def main(scene_path: str) -> None:
     with open(scene_path) as f:
         spec = json.load(f)
+    if spec.get("export_blend"):
+        export_blend(spec)
+        return
     _clear()
     _setup_render(spec)
     _add_light(spec)
@@ -222,6 +264,103 @@ def main(scene_path: str) -> None:
         scene.render.filepath = f"{out_dir}/frame_{idx:05d}.png"
         print(f"[blender] frame {fi + 1}/{len(spec['frames'])}", flush=True)
         bpy.ops.render.render(write_still=True)
+
+
+# --------------------------------------------------------------------------
+# .blend export: same scene, but per-frame state is baked to F-curves so the
+# saved file plays/renders the whole shot. EM slices, textures and mesh geometry
+# are all packed/embedded, so the result is self-contained — open it anywhere,
+# scrub the timeline, hit F12.
+# --------------------------------------------------------------------------
+
+
+def _build_export_slices(spec: dict) -> None:
+    """One textured quad per (frame, slice), each shown only on its own timeline
+    frame via keyframed visibility. This reproduces the changing EM cross-section
+    as the timeline plays — and, unlike an image SEQUENCE, single-image textures
+    CAN be packed into the .blend (pack_all refuses sequences/movies), so the file
+    stays self-contained."""
+    frames = spec["frames"]
+    n = len(frames)
+    planes: list[tuple] = []  # (object, scene_frame)
+    for fi, fr in enumerate(frames):
+        f = fi + 1
+        for si, sl in enumerate(fr.get("slices", [])):
+            if sl.get("opacity", 1.0) <= 0.001:
+                continue
+            planes.append((_make_slice(sl, f"f{f:05d}_{si}"), f))
+    # Boolean F-curves interpolate as constant, so three keyframes per quad
+    # (hidden / shown / hidden) make it visible on exactly its own frame; Blender
+    # holds the first/last keyframe value beyond the ends.
+    for obj, f in planes:
+        for kf, hidden in ((f - 1, True), (f, False), (f + 1, True)):
+            if kf < 1 or kf > n:
+                continue
+            obj.hide_render = obj.hide_viewport = hidden
+            obj.keyframe_insert("hide_render", frame=kf)
+            obj.keyframe_insert("hide_viewport", frame=kf)
+
+
+def _keyframe_camera(frame: dict, f: int) -> None:
+    _set_camera(frame)  # positions/orients exactly as the still renderer does
+    cam = bpy.context.scene.camera
+    cam.keyframe_insert("location", frame=f)
+    cam.keyframe_insert("rotation_euler", frame=f)
+    if cam.data.type == "ORTHO":
+        cam.data.keyframe_insert("ortho_scale", frame=f)
+    else:
+        cam.data.keyframe_insert("lens", frame=f)  # lens_unit=FOV -> lens tracks fov
+
+
+def _keyframe_meshes(meshes: dict, overrides: dict, f: int) -> None:
+    for _mid, (obj, mat) in meshes.items():
+        ov = overrides.get(_mid)
+        opacity = ov.get("opacity", 1.0) if ov else 0.0
+        silh = ov.get("silhouette", 0.0) if ov else 0.0
+        visible = bool(ov) and ov.get("visible", True) and opacity > 0.001
+        obj.hide_render = not visible
+        obj.hide_viewport = not visible
+        obj.keyframe_insert("hide_render", frame=f)
+        obj.keyframe_insert("hide_viewport", frame=f)
+        nt = mat.node_tree
+        av, sv = nt.nodes.get("cm_alpha"), nt.nodes.get("cm_silh")
+        if av is not None:
+            av.outputs[0].default_value = opacity
+            av.outputs[0].keyframe_insert("default_value", frame=f)
+        if sv is not None:
+            sv.outputs[0].default_value = silh
+            sv.outputs[0].keyframe_insert("default_value", frame=f)
+
+
+def export_blend(spec: dict) -> None:
+    blend_path = spec["export_blend"]
+    _clear()
+    _setup_render(spec)
+    _add_light(spec)
+    meshes = _import_meshes(spec)
+    scene = bpy.context.scene
+    frames = spec["frames"]
+    n = len(frames)
+    scene.frame_start = 1
+    scene.frame_end = max(1, n)
+    scene.render.fps = int(spec.get("fps", 30))
+
+    _build_export_slices(spec)  # per-frame slice quads + visibility keyframes
+
+    for fi, frame in enumerate(frames):
+        f = fi + 1
+        scene.frame_set(f)
+        _keyframe_camera(frame, f)
+        _keyframe_meshes(meshes, frame.get("mesh_overrides", {}), f)
+        print(f"[blender] frame {fi + 1}/{n}", flush=True)
+
+    scene.frame_set(1)
+    try:
+        bpy.ops.file.pack_all()  # embed all textures + EM slice images into the .blend
+    except Exception as e:  # noqa: BLE001
+        print(f"[blender] pack_all warning: {e}", flush=True)
+    bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+    print(f"[blender] saved {blend_path}", flush=True)
 
 
 if __name__ == "__main__":

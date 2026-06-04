@@ -72,6 +72,8 @@ class RenderReq(BaseModel):
     fps: int = 30
     samples: int = 48
     kf_range: list[int] | None = None
+    export_blend: bool = False  # produce a self-contained .blend instead of a video
+    draft: bool = False         # fast low-res preview (coarse EM + low-voxel meshes)
 
 
 class ChatReq(BaseModel):
@@ -149,8 +151,11 @@ def export_project(pid: str):
         raise HTTPException(404, "no such project")
     p = store.load(pid)
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in (p.name or pid))
-    return FileResponse(str(store.project_file(pid)), media_type="application/json",
-                        filename=f"{safe}.cinemap.json")
+    # Serialize the in-memory project (ng_state rehydrated from sidecars) rather
+    # than streaming project.json — on disk ng_state lives in sidecars, so the
+    # raw file alone would export an incomplete (non-round-tripping) state.
+    return Response(content=p.model_dump_json(), media_type="application/json",
+                    headers={"Content-Disposition": f'attachment; filename="{safe}.cinemap.json"'})
 
 
 @app.post("/api/projects/import")
@@ -218,7 +223,7 @@ def render_thumbnail(pid: str, kid: str):
     idx = next((i for i, k in enumerate(p.keyframes) if k.id == kid), None)
     if idx is None:
         raise HTTPException(404, "no such keyframe")
-    settings = RenderSettings(width=640, height=480, samples=24, fps=1)
+    settings = RenderSettings(width=640, height=480, samples=24, fps=1, draft=True)
     job_id = _start_render(pid, settings, kf_range=[idx, idx], thumbnail_for=kid)
     return {"job_id": job_id}
 
@@ -229,7 +234,9 @@ def get_thumbnail(pid: str, kid: str):
     kf = next((k for k in p.keyframes if k.id == kid), None)
     if not kf or not kf.thumbnail_path or not os.path.exists(kf.thumbnail_path):
         raise HTTPException(404, "no thumbnail yet")
-    return _image_response(kf.thumbnail_path, cacheable=True)  # URL is versioned (?v=)
+    # tolerate old .png thumbnails alongside new compressed .jpg ones
+    media = "image/jpeg" if kf.thumbnail_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
+    return _image_response(kf.thumbnail_path, media=media, cacheable=True)  # URL is versioned (?v=)
 
 
 @app.post("/api/projects/{pid}/keyframes/{kid}/update_from_ng")
@@ -308,18 +315,32 @@ def _run_render(pid: str, job_id: str, worker: RenderWorker, thumbnail_for: str 
         status = "cancelling" if cur == "cancelling" else "running"
         _render_state[job_id] = {"progress": pr, "message": msg, "status": status}
 
+    # A full video render mutates the job (status/output) in project.renders, so it
+    # must be persisted. A thumbnail job is NOT in project.renders — it only ever
+    # touches the project if it sets a keyframe's thumbnail_path. Track that so we
+    # don't rewrite the whole project.json over NFS when nothing changed
+    # (cancelled/failed thumbnails, or thumbnails where the keyframe is gone).
+    dirty = thumbnail_for is None
     try:
         out = worker.run(progress=cb)
         if thumbnail_for and out:  # keep a per-keyframe thumbnail and point the kf at it
+            from PIL import Image
+
             tdir = config.PROJECTS_DIR / pid / "thumbnails"
             tdir.mkdir(parents=True, exist_ok=True)
-            dst = tdir / f"{thumbnail_for}.png"
-            tmp = tdir / f".{thumbnail_for}.png.tmp"
-            shutil.copy(out, tmp)
+            dst = tdir / f"{thumbnail_for}.jpg"
+            tmp = tdir / f".{thumbnail_for}.jpg.tmp"
+            # Re-encode the lossless render PNG to a compressed JPEG: it's shown at
+            # 150px in the timeline card and ~medium in the preview pane, so the
+            # full PNG (hundreds of KB) is wasteful. JPEG q82 keeps it sharp at a
+            # fraction of the bytes (no alpha needed — the render has an opaque bg).
+            with Image.open(out) as im:
+                im.convert("RGB").save(tmp, "JPEG", quality=82, optimize=True)
             os.replace(tmp, dst)  # atomic swap so a concurrent GET never reads a half-written file
             for k in worker.project.keyframes:
                 if k.id == thumbnail_for:
                     k.thumbnail_path = str(dst)
+                    dirty = True
             out = str(dst)
         _render_state[job_id] = {"progress": 1.0, "message": "done", "status": "done", "output": out}
     except RenderCancelled:
@@ -327,7 +348,8 @@ def _run_render(pid: str, job_id: str, worker: RenderWorker, thumbnail_for: str 
     except Exception as e:  # noqa: BLE001
         _render_state[job_id] = {"progress": 0.0, "message": str(e), "status": "error"}
     finally:
-        store.save(worker.project)
+        if dirty:
+            store.save(worker.project)
         _workers.pop(job_id, None)
 
 
@@ -339,14 +361,27 @@ def _start_render(pid: str, settings: RenderSettings, kf_range=None, thumbnail_f
         job = ops.create_render_job(p, settings, kf_range=kf_range)
     worker = RenderWorker(p, job)
     _workers[job.id] = worker
+    _evict_finished_states()  # keep the in-memory job table from growing forever
     _render_state[job.id] = {"progress": 0.0, "message": "queued", "status": "pending"}
     threading.Thread(target=_run_render, args=(pid, job.id, worker, thumbnail_for), daemon=True).start()
     return job.id
 
 
+def _evict_finished_states(keep: int = 200) -> None:
+    """Drop the oldest finished entries from `_render_state` once it exceeds `keep`
+    (every render + thumbnail leaves a record; nothing else removes them)."""
+    if len(_render_state) <= keep:
+        return
+    finished = [k for k, v in _render_state.items()
+                if v.get("status") in ("done", "error", "cancelled")]
+    for k in finished[: len(_render_state) - keep]:
+        _render_state.pop(k, None)
+
+
 @app.post("/api/projects/{pid}/render")
 def render(pid: str, req: RenderReq):
-    settings = RenderSettings(width=req.width, height=req.height, fps=req.fps, samples=req.samples)
+    settings = RenderSettings(width=req.width, height=req.height, fps=req.fps,
+                              samples=req.samples, export_blend=req.export_blend, draft=req.draft)
     return {"job_id": _start_render(pid, settings, kf_range=req.kf_range)}
 
 
@@ -392,6 +427,9 @@ def render_output(pid: str, job_id: str):
         raise HTTPException(404, "no output yet")
     if out.endswith(".mp4"):
         return FileResponse(out, media_type="video/mp4")  # large, not overwritten
+    if out.endswith(".blend"):
+        return FileResponse(out, media_type="application/octet-stream",
+                            filename=f"{pid}.blend")  # Content-Disposition -> download
     return _image_response(out)  # PNG output may be overwritten by a re-render
 
 

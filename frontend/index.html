@@ -126,6 +126,7 @@
     <input id="meshOp" type="range" min="0" max="1" step="0.05" value="1" style="width:90px"
       onchange="setMeshOpacity()" title="3D mesh opacity (0 = show only the segmented EM slice)" />
     <button id="exportBtn" class="primary" onclick="startRender('export')">⬇ Export video</button>
+    <button id="blendBtn" onclick="startRender('blend')" title="bake the whole shot to a self-contained animated .blend (camera, meshes, EM slices; textures packed in)">⬇ Export .blend</button>
   </div>
   <div id="timeline"></div>
 </footer>
@@ -306,12 +307,38 @@ let JOB = null;
 function renderingUI(on, mode) {
   $('previewBtn').style.display = on ? 'none' : '';
   $('exportBtn').style.display  = on ? 'none' : '';
+  $('blendBtn').style.display   = on ? 'none' : '';
   $('cancelBtn').style.display  = on ? '' : 'none';
   $('cancelBtn').textContent = '■ Cancel' + (on && mode ? ' ' + mode : '');
 }
 
 // Preview = fast (fps ÷ ratio); Export = full-quality final video. Both stream
 // the latest rendered frame into the preview pane, then loop the finished mp4.
+// Live preview while a render runs. Show a text placeholder (NOT an empty <img>,
+// which browsers draw as a broken-image icon) and only swap in the frame once it
+// has actually loaded — so an early 404 (frame not written yet) shows nothing broken.
+function liveRenderPlaceholder() { $('preview').innerHTML = '<span class="msg">rendering…</span>'; }
+function showLiveFrame(job_id) {
+  const img = new Image();
+  img.onload = () => { const p = $('preview'); p.innerHTML = ''; p.appendChild(img); };
+  // onerror: frame not on disk yet -> keep the placeholder, try again next tick
+  img.src = `/api/renders/${job_id}/latest_frame?t=${Date.now()}`;
+}
+
+// Render-socket watchdog. The server heartbeats a status every ~0.4s, so a few
+// seconds of silence means the connection is dead even if onclose never fired
+// (backgrounded/suspended tab, half-open socket) — fire `onStall` so the UI can
+// never stay trapped with Preview/Export hidden. Long Blender frames keep the
+// heartbeat alive, so this won't false-fire mid-render.
+const HEARTBEAT_MS = 6000;
+function heartbeat(onStall) {
+  let t;
+  return {
+    kick: () => { clearTimeout(t); t = setTimeout(onStall, HEARTBEAT_MS); },
+    stop: () => clearTimeout(t),
+  };
+}
+
 async function startRender(mode) {
   if (!PID) { setStatus('create/open a project first'); return; }
   let fps = +$('fps').value;
@@ -319,39 +346,68 @@ async function startRender(mode) {
     const r = Math.max(1, +$('ratio').value || 1);
     fps = Math.max(1, Math.floor(fps / r));
   }
-  const body = { width:+$('w').value, height:+$('h').value, fps, samples:+$('samples').value };
-  const { job_id } = await api('POST', `/api/projects/${PID}/render`, body);
+  // Preview is a fast, low-res look (coarse EM + low-voxel meshes); Export/blend
+  // use full resolution for the final output.
+  const body = { width:+$('w').value, height:+$('h').value, fps, samples:+$('samples').value,
+                 draft: mode === 'preview' };
+  if (mode === 'blend') body.export_blend = true;   // bake an animated .blend, no video
+  let job_id;
+  try { ({ job_id } = await api('POST', `/api/projects/${PID}/render`, body)); }
+  catch (e) { setStatus('render failed to start: ' + e.message); return; }
   JOB = job_id; renderingUI(true, mode);
-  $('preview').innerHTML = '<img id="liveFrame" alt="rendering…" />';
+  liveRenderPlaceholder();
 
-  const ws = new WebSocket(`ws://${location.host}/api/renders/${job_id}/ws`);
+  let ended = false, ws;
+  const finish = (msg) => {                 // single exit: always frees the controls
+    if (ended) return; ended = true; hb.stop();
+    if (JOB === job_id) { renderingUI(false); JOB = null; }
+    if (msg) setStatus(msg);
+    try { ws && ws.close(); } catch (e) {}
+  };
+  const hb = heartbeat(() => finish('render connection lost — controls restored (it may still be running)'));
+
+  ws = new WebSocket(`ws://${location.host}/api/renders/${job_id}/ws`);
   ws.onmessage = (ev) => {
+    hb.kick();
     const s = JSON.parse(ev.data);
     $('barFill').style.width = Math.round((s.progress||0)*100) + '%';
     $('renderMsg').textContent = `${s.status}: ${s.message||''}`;
     // live-update the preview with the most recent rendered frame
     if (s.status === 'running' && (s.message||'').includes('blender] frame')) {
-      const img = $('liveFrame');
-      if (img) img.src = `/api/renders/${job_id}/latest_frame?t=${Date.now()}`;
+      showLiveFrame(job_id);
     }
-    if (['done','error','cancelled'].includes(s.status)) {
-      renderingUI(false); JOB = null;
+    if (['done','error','cancelled','unknown'].includes(s.status)) {
       if (s.status === 'done') showOutput(job_id, s.output);  // loops automatically
+      finish();
     }
   };
-  ws.onclose = () => { if (JOB === job_id) { renderingUI(false); JOB = null; } };
+  ws.onerror = () => finish();
+  ws.onclose = () => finish();
+  hb.kick();   // arm the watchdog even if the socket never opens
 }
 
 async function cancelRender() {
   if (!JOB) return;
-  $('cancelBtn').disabled = true;
-  try { await api('POST', `/api/renders/${JOB}/cancel`); }
-  finally { $('cancelBtn').disabled = false; }
+  const job = JOB;
+  setStatus('cancelling…');
+  api('POST', `/api/renders/${job}/cancel`).catch(() => {});  // don't block the button on a slow request
+  // guaranteed escape: free the controls even if the backend wedges and never
+  // reports a terminal status (the render may keep finishing in the background)
+  setTimeout(() => {
+    if (JOB === job) {
+      renderingUI(false); JOB = null;
+      setStatus('render abandoned — controls restored (it may still finish in the background)');
+    }
+  }, 8000);
 }
 
 function showOutput(job_id, out) {
   const prev = $('preview');
   const url = `/api/projects/${PID}/renders/${job_id}/output?t=${Date.now()}`;
+  if (out && out.endsWith('.blend')) {            // not previewable — offer the download
+    prev.innerHTML = `<span class="msg">.blend ready — <a href="${url}" download style="color:var(--accent)">download scene.blend</a></span>`;
+    return;
+  }
   prev.innerHTML = (out && out.endsWith('.mp4'))
     ? `<video src="${url}" controls autoplay loop></video>`
     : `<img src="${url}" />`;
@@ -455,28 +511,31 @@ async function sendChat() {
 // the UI stays fully clickable. The socket always restores state on close/error.
 function attachRender(job_id, afterDone, light) {
   if (!light) { JOB = job_id; renderingUI(true, 'render'); }
-  $('preview').innerHTML = '<img id="liveFrame" alt="rendering…" />';
+  liveRenderPlaceholder();
   let finished = false;
   const finish = (status, output) => {
-    if (finished) return; finished = true;
+    if (finished) return; finished = true; hb.stop();
     if (!light) { renderingUI(false); if (JOB === job_id) JOB = null; }
     if (status === 'done') showOutput(job_id, output);
     if (afterDone) afterDone();
   };
+  const hb = heartbeat(() => finish('error'));  // free the UI if the socket goes silent
   let ws;
   try { ws = new WebSocket(`ws://${location.host}/api/renders/${job_id}/ws`); }
   catch (e) { finish('error'); return; }
   ws.onmessage = (ev) => {
+    hb.kick();
     const s = JSON.parse(ev.data);
     $('barFill').style.width = Math.round((s.progress || 0) * 100) + '%';
     $('renderMsg').textContent = `${s.status}: ${s.message || ''}`;
     if (s.status === 'running' && (s.message || '').includes('blender] frame')) {
-      const img = $('liveFrame'); if (img) img.src = `/api/renders/${job_id}/latest_frame?t=${Date.now()}`;
+      showLiveFrame(job_id);
     }
-    if (['done', 'error', 'cancelled'].includes(s.status)) { finish(s.status, s.output); try { ws.close(); } catch (e) {} }
+    if (['done', 'error', 'cancelled', 'unknown'].includes(s.status)) { finish(s.status, s.output); try { ws.close(); } catch (e) {} }
   };
   ws.onerror = () => finish('error');
   ws.onclose = () => finish('error');   // never leave the UI stuck if the socket drops
+  hb.kick();   // arm the watchdog even if the socket never opens
 }
 
 refreshProjects();

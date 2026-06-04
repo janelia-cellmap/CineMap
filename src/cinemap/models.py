@@ -75,6 +75,9 @@ class MeshInstance(BaseModel):
     color_seed: int = 0
     default_color: Optional[list[float]] = None
     segment_colors: dict[str, list[float]] = Field(default_factory=dict)
+    # neuroglancer 3D mesh render state (per keyframe -> can change frame to frame)
+    object_alpha: float = 1.0   # NG "Opacity (3d)"  (objectAlpha)
+    silhouette: float = 0.0     # NG "Silhouette (3d)" (meshSilhouetteRendering)
 
 
 class Lighting(BaseModel):
@@ -101,6 +104,12 @@ class RenderSettings(BaseModel):
     fps: int = 30
     samples: int = 64
     engine: Literal["CYCLES", "BLENDER_EEVEE_NEXT"] = "CYCLES"
+    # when set, the job produces a self-contained .blend (camera, mesh and slice
+    # animation baked to F-curves; textures packed in) instead of rendering frames.
+    export_blend: bool = False
+    # draft = fast preview/thumbnail quality: coarse EM slice level + low-voxel
+    # meshes (see RenderWorker). Off = full resolution for the final video.
+    draft: bool = False
 
 
 class RenderJob(BaseModel):

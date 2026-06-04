@@ -67,33 +67,37 @@ class MeshLoader:
             process=False,
         )
 
-    def load(self, seg_id: int, colorize=None) -> trimesh.Trimesh:
+    def load(self, seg_id: int, colorize=None, target_voxels: int = 8_000_000) -> trimesh.Trimesh:
         """Clean mesh for a segment.
 
         Prefers marching cubes on the label volume (gap-free, watertight); uses
         the precomputed draco mesh only for the bounding box, or as a fallback
-        when no label volume is available.
-        """
+        when no label volume is available. `target_voxels` caps the marching-cubes
+        resolution (lower = faster/coarser, e.g. for draft previews)."""
         if self.label_zarr:
             from .mesh_from_labels import generate
 
             bbox = self._draco(seg_id).bounds if self.mesh_url else self._label_bbox(seg_id)
-            return generate(self.label_zarr, seg_id, (tuple(bbox[0]), tuple(bbox[1])), colorize=colorize)
+            return generate(self.label_zarr, seg_id, (tuple(bbox[0]), tuple(bbox[1])),
+                            target_voxels=target_voxels, colorize=colorize)
         return self._draco(seg_id)
 
-    def load_many(self, seg_ids, colorize=None) -> trimesh.Trimesh:
+    def load_many(self, seg_ids, colorize=None, target_voxels_single: int = 8_000_000,
+                  target_voxels_union: int = 20_000_000) -> trimesh.Trimesh:
         """One mesh for a set of segments. A single segment gets the fine
         per-segment surface; many segments use the cheap whole-volume union.
-        `colorize(seg_id)->rgb` provides the (neuroglancer-matched) colors."""
+        `colorize(seg_id)->rgb` provides the (neuroglancer-matched) colors. The
+        `target_voxels_*` budgets cap resolution (lower = faster draft meshes)."""
         seg_ids = list(seg_ids)
         if not seg_ids:
             raise ValueError("no segment ids")
         if len(seg_ids) == 1:
-            return self.load(seg_ids[0], colorize=colorize)
+            return self.load(seg_ids[0], colorize=colorize, target_voxels=target_voxels_single)
         if self.label_zarr:
             from .mesh_from_labels import generate_union
 
-            return generate_union(self.label_zarr, seg_ids, colorize=colorize)
+            return generate_union(self.label_zarr, seg_ids, target_voxels=target_voxels_union,
+                                  colorize=colorize)
         parts = []
         for s in seg_ids:
             try:
@@ -104,9 +108,9 @@ class MeshLoader:
 
     def _label_bbox(self, seg_id: int):
         """Bounding box (xyz nm) of a segment found by scanning a coarse label level."""
-        from .slice_loader import EMVolume
+        from .slice_loader import get_volume
 
-        vol = EMVolume(self.label_zarr)
+        vol = get_volume(self.label_zarr)
         level = max(0, len(vol.level_scale_nm) - 4)  # a coarse-but-not-tiny level
         arr = np.asarray(vol._open_level(level)[:, :, :].read().result())
         zz, yy, xx = np.where(arr == seg_id)

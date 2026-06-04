@@ -33,11 +33,11 @@ def load_saved_key() -> str | None:
 
 def save_key(key: str) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    _KEY_FILE.write_text(key.strip())
-    try:
-        os.chmod(_KEY_FILE, 0o600)
-    except OSError:
-        pass
+    # Create the file already restricted (0600) rather than write-then-chmod, which
+    # leaves a window where the secret is world-readable under a 0022 umask.
+    fd = os.open(_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(key.strip())
 
 
 def clear_key() -> None:
