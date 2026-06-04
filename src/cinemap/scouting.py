@@ -12,7 +12,7 @@ import neuroglancer
 
 from . import operations as ops
 from .data.manifest import fetch_state
-from .models import Camera, Keyframe, MeshInstance, Project, SlicePlane
+from .models import AnnotationInstance, Camera, Keyframe, MeshInstance, Project, SlicePlane
 
 _viewer: neuroglancer.Viewer | None = None
 
@@ -129,16 +129,47 @@ def _scene_from_view(project: Project):
     slices = ([SlicePlane(em_name=em_name, axis="z", position_nm=cam.look_at_nm[2])]
               if vis.get(em_name, True) else [])
     meshes = _meshes_from_visible(project, st=st)
-    return cam, slices, meshes, st
+    annotations = _annotations_from_view(project, st)
+    return cam, slices, meshes, annotations, st
+
+
+def _hex_to_rgb(h: str) -> list[float]:
+    h = (h or "").lstrip("#")
+    if len(h) != 6:
+        return [1.0, 0.95, 0.30]
+    return [int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
+
+
+def _annotations_from_view(project: Project, st: dict) -> list[AnnotationInstance]:
+    """Capture visible annotation layers (inline points/lines/boxes/ellipsoids) from
+    the serialized state. Layers backed only by a precomputed source (no inline
+    `annotations`) are skipped for now."""
+    from .data import annotations as _ann
+
+    vox = project.manifest.voxel_size_nm
+    out: list[AnnotationInstance] = []
+    for layer in st.get("layers", []):
+        if layer.get("type") != "annotation":
+            continue
+        prims = _ann.parse_inline(layer, vox)
+        if not _ann.has_geometry(prims):
+            continue
+        out.append(AnnotationInstance(
+            name=layer.get("name", "annotations"),
+            color=_hex_to_rgb(layer.get("annotationColor", "#ffff4d")),
+            visible=layer.get("visible", True) is not False,
+            points=prims["points"], lines=prims["lines"],
+            boxes=prims["boxes"], ellipsoids=prims["ellipsoids"]))
+    return out
 
 
 def bake_keyframe(project: Project, label: str = "scouted") -> Keyframe:
     """Build a NEW keyframe from the current scouting view."""
-    cam, slices, meshes, st = _scene_from_view(project)
+    cam, slices, meshes, annotations, st = _scene_from_view(project)
     if not meshes and not slices and project.keyframes:  # nothing on -> keep previous meshes
         meshes = [m.model_copy() for m in project.keyframes[-1].meshes]
     kf = Keyframe(id=ops._uid("kf"), label=label, camera=cam, slices=slices,
-                  meshes=meshes, ng_state=st)
+                  meshes=meshes, annotations=annotations, ng_state=st)
     return ops.add_keyframe(project, kf)
 
 
@@ -148,9 +179,9 @@ def update_keyframe_from_view(project: Project, keyframe_id: str) -> Keyframe | 
     kf = next((k for k in project.keyframes if k.id == keyframe_id), None)
     if kf is None:
         return None
-    cam, slices, meshes, st = _scene_from_view(project)
-    updated = kf.model_copy(update={"camera": cam, "slices": slices,
-                                    "meshes": meshes, "ng_state": st})
+    cam, slices, meshes, annotations, st = _scene_from_view(project)
+    updated = kf.model_copy(update={"camera": cam, "slices": slices, "meshes": meshes,
+                                    "annotations": annotations, "ng_state": st})
     project.keyframes = [updated if k.id == keyframe_id else k for k in project.keyframes]
     ops.store.save(project)
     return updated

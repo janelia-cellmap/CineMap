@@ -81,6 +81,23 @@ class MeshInstance(BaseModel):
     silhouette: float = 0.0     # NG "Silhouette (3d)" (meshSilhouetteRendering)
 
 
+class AnnotationInstance(BaseModel):
+    """A neuroglancer annotation layer captured for a keyframe. Geometry is stored
+    normalized in nm (x/y/z) so the render path is source-agnostic (inline now;
+    precomputed later)."""
+
+    name: str
+    color: list[float] = Field(default_factory=lambda: [1.0, 0.95, 0.30])
+    visible: bool = True
+    opacity: float = 1.0
+    points: list[list[float]] = Field(default_factory=list)         # [[x,y,z], ...]
+    lines: list[list[list[float]]] = Field(default_factory=list)    # [[[x,y,z],[x,y,z]], ...]
+    boxes: list[list[list[float]]] = Field(default_factory=list)    # [[[lo],[hi]], ...]
+    ellipsoids: list[dict] = Field(default_factory=list)            # [{center, radii}, ...]
+    point_radius_nm: float = 80.0
+    line_radius_nm: float = 40.0
+
+
 class Lighting(BaseModel):
     key_energy: float = 3000.0
     background: list[float] = Field(default_factory=lambda: [0.02, 0.02, 0.03])
@@ -92,6 +109,7 @@ class Keyframe(BaseModel):
     camera: Camera
     slices: list[SlicePlane] = Field(default_factory=list)
     meshes: list[MeshInstance] = Field(default_factory=list)
+    annotations: list[AnnotationInstance] = Field(default_factory=list)
     lighting: Lighting = Field(default_factory=Lighting)
     duration_in_s: float = 2.0  # transition duration INTO this keyframe
     easing: Literal["linear", "ease-in-out"] = "ease-in-out"

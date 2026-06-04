@@ -46,6 +46,19 @@ class FrameMesh:
 
 
 @dataclass
+class FrameAnnotation:
+    name: str
+    color: list[float]
+    opacity: float
+    points: list = field(default_factory=list)
+    lines: list = field(default_factory=list)
+    boxes: list = field(default_factory=list)
+    ellipsoids: list = field(default_factory=list)
+    point_radius_nm: float = 80.0
+    line_radius_nm: float = 40.0
+
+
+@dataclass
 class FrameState:
     position_nm: list[float]
     look_at_nm: list[float]
@@ -53,6 +66,7 @@ class FrameState:
     up: list[float]
     slices: list[FrameSlice] = field(default_factory=list)
     meshes: list[FrameMesh] = field(default_factory=list)
+    annotations: list[FrameAnnotation] = field(default_factory=list)
 
 
 def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
@@ -104,6 +118,21 @@ def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
             op = base * (1 - t) if ma else base * t   # ma-only fades out; mb-only fades in
             fs.meshes.append(FrameMesh(name, ids, m.color, op, m.render_3d,
                                        object_alpha=m.object_alpha, silhouette=m.silhouette, **cc))
+    # annotations matched by layer name; geometry is identical frame-to-frame, so
+    # only opacity fades (appearing/disappearing layers fade in/out).
+    a_an = {an.name: an for an in a.annotations}
+    b_an = {an.name: an for an in b.annotations}
+    for key in dict.fromkeys(list(a_an) + list(b_an)):
+        aa, ab = a_an.get(key), b_an.get(key)
+        src = ab or aa  # geometry/color from the transition's target keyframe
+        if aa and ab:
+            op = (aa.opacity if aa.visible else 0.0) * (1 - t) + (ab.opacity if ab.visible else 0.0) * t
+        else:
+            base = (src.opacity if src.visible else 0.0)
+            op = base * (1 - t) if aa else base * t
+        fs.annotations.append(FrameAnnotation(
+            src.name, src.color, op, src.points, src.lines, src.boxes, src.ellipsoids,
+            src.point_radius_nm, src.line_radius_nm))
     return fs
 
 

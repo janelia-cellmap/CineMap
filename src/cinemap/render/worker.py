@@ -167,6 +167,32 @@ class RenderWorker:
         combined.export(str(out))
         return str(out)
 
+    @staticmethod
+    def _ann_uid(an) -> str:
+        """Stable id per (layer, geometry, color) so an edited annotation layer
+        becomes a distinct asset."""
+        import hashlib
+
+        sig = json.dumps([an.name, an.color, an.points, an.lines, an.boxes, an.ellipsoids,
+                          an.point_radius_nm, an.line_radius_nm], sort_keys=True)
+        return f"ann_{hashlib.md5(sig.encode()).hexdigest()[:10]}"
+
+    def _ann_obj(self, an) -> str | None:
+        from ..data.annotations import annotations_to_mesh
+
+        uid = self._ann_uid(an)
+        out = self.assets_dir / f"{uid}.ply"
+        if out.exists():
+            return str(out)
+        prims = {"points": an.points, "lines": an.lines, "boxes": an.boxes,
+                 "ellipsoids": an.ellipsoids}
+        mesh = annotations_to_mesh(prims, an.color, an.point_radius_nm, an.line_radius_nm)
+        if mesh is None:
+            return None
+        os.makedirs(out.parent, exist_ok=True)
+        mesh.export(str(out))
+        return str(out)
+
     # ---- scene spec ----
     def _build_scene_spec(self, frames: list[FrameState], index_offset: int = 0) -> dict:
         # one Blender object per distinct (layer, segment set) across all frames
@@ -181,6 +207,13 @@ class RenderWorker:
                     obj = self._mesh_obj(m.mesh_name, m.segment_ids, lc)
                     if obj:
                         mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": m.color}
+            # annotation layers -> geometry assets via the same import path
+            for an in fr.annotations:
+                uid = self._ann_uid(an)
+                if uid not in mesh_specs:
+                    obj = self._ann_obj(an)
+                    if obj:
+                        mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": an.color}
         frame_specs = []
         for fi, fr in enumerate(frames):
             if self.cancel.is_set():
@@ -219,6 +252,11 @@ class RenderWorker:
                         "visible": eff > 0.001,
                         "silhouette": getattr(m, "silhouette", 0.0),
                     }
+            for an in fr.annotations:
+                uid = self._ann_uid(an)
+                if uid in mesh_specs:
+                    overrides[uid] = {"opacity": an.opacity, "visible": an.opacity > 0.001,
+                                      "silhouette": 0.0}
             frame_specs.append({
                 "camera": {
                     "position_bu": _bu(fr.position_nm, self.nm_per_bu),
