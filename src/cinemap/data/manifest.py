@@ -67,6 +67,50 @@ def fetch_state(url: str) -> dict:
         return json.load(r)
 
 
+def parse_state_links(text: str) -> list[tuple[str, str]]:
+    """Parse a pasted/uploaded list of neuroglancer states into [(label, link)].
+
+    Accepts either form (whichever the user has on hand):
+      - one state per line (the robust default — neuroglancer links are full of
+        commas, so we never split a bare line on commas)
+      - a CSV *with a header* naming a state column (state/url/link/ngl) and an
+        optional label column (label/name/title); links with commas must then be
+        quoted, as any spreadsheet export does.
+    Lines that are blank or a lone header word are skipped.
+    """
+    import csv
+    import io
+
+    text = (text or "").strip()
+    if not text:
+        return []
+    lines = text.splitlines()
+    header = lines[0].lower()
+    state_keys = ("state", "url", "link", "ngl", "neuroglancer")
+    label_keys = ("label", "name", "title")
+    is_csv_header = "," in header and any(k in header for k in state_keys)
+
+    out: list[tuple[str, str]] = []
+    if is_csv_header:
+        reader = csv.DictReader(io.StringIO(text))
+        fields = reader.fieldnames or []
+        scol = next((c for c in fields if c.strip().lower() in state_keys), fields[-1])
+        lcol = next((c for c in fields if c.strip().lower() in label_keys), None)
+        for i, row in enumerate(reader):
+            link = (row.get(scol) or "").strip()
+            if not link:
+                continue
+            label = (row.get(lcol) or "").strip() if lcol else ""
+            out.append((label or f"state {i + 1}", link))
+    else:
+        for line in lines:
+            s = line.strip().strip('"').strip("'")
+            if not s or s.lower() in (*state_keys, "states"):
+                continue
+            out.append((f"state {len(out) + 1}", s))
+    return out
+
+
 def analyze_state(url: str) -> Manifest:
     state = fetch_state(url)
     dim = state.get("dimensions", {})

@@ -173,6 +173,34 @@ def bake_keyframe(project: Project, label: str = "scouted") -> Keyframe:
     return ops.add_keyframe(project, kf)
 
 
+def bake_keyframe_from_state(project: Project, state: dict, label: str = "imported") -> Keyframe:
+    """Bake a keyframe from an arbitrary neuroglancer state (not the live view).
+
+    Drives the scouting viewer to `state`, then bakes exactly as if the user had
+    loaded that view and clicked Bake — so an imported keyframe is identical to a
+    hand-baked one (visible layers/segments, colors, 3D style, camera). Used by the
+    "import states" feature to turn a list of saved views into a keyframe timeline.
+    """
+    get_viewer().set_state(state)
+    return bake_keyframe(project, label=label)
+
+
+def import_states(project: Project, links: list[tuple[str, str]]) -> tuple[list[Keyframe], list[str]]:
+    """Bake one keyframe per (label, state-link). Returns (keyframes, errors);
+    a link that fails to fetch/parse is reported and skipped, not fatal."""
+    from .data.manifest import fetch_state
+
+    created: list[Keyframe] = []
+    errors: list[str] = []
+    for label, link in links:
+        try:
+            state = fetch_state(link)
+            created.append(bake_keyframe_from_state(project, state, label=label))
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{label}: {e}")
+    return created, errors
+
+
 def update_keyframe_from_view(project: Project, keyframe_id: str) -> Keyframe | None:
     """Overwrite an existing keyframe with the current Neuroglancer state (camera +
     layers + segments), keeping its timing (duration/easing) and label."""

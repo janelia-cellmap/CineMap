@@ -207,6 +207,21 @@ def bake(pid: str):
     return kf.model_dump()
 
 
+@app.post("/api/projects/{pid}/keyframes/import_states")
+def import_states(pid: str, body: dict):
+    """Bake a keyframe per state in an uploaded list. `body.text` is the raw file
+    content: one neuroglancer state link per line, or a CSV with a state column
+    (and optional label). Each becomes a keyframe just like a hand-baked view."""
+    from .data.manifest import parse_state_links
+
+    p = store.load(pid)
+    links = parse_state_links(body.get("text", ""))
+    if not links:
+        raise HTTPException(400, "no states found in the uploaded file")
+    created, errors = scouting.import_states(p, links)
+    return {"created": [k.id for k in created], "count": len(created), "errors": errors}
+
+
 @app.post("/api/projects/{pid}/keyframes/{kid}/goto")
 def goto_keyframe(pid: str, kid: str):
     p = store.load(pid)

@@ -81,6 +81,8 @@
       <button class="accent" onclick="bake()">★ Bake keyframe</button>
       <button onclick="updateFrame()" title="overwrite the selected keyframe with the current Neuroglancer view (camera + layers + segments)">⟳ Update current frame</button>
       <button onclick="addKeyframe()">+ Duplicate last</button>
+      <button onclick="document.getElementById('statesFile').click()" title="upload a list of neuroglancer states (one link per line, or a CSV with a state column) — each becomes a keyframe">⭱ Import states</button>
+      <input type="file" id="statesFile" accept=".csv,.txt,text/csv,text/plain" style="display:none" onchange="importStates(event)" />
     </div>
     <div id="ngWrap"><iframe id="ng"></iframe></div>
   </div>
@@ -175,6 +177,22 @@ async function importProject(e) {
     await loadNg(); renderKeyframes(p);
     setStatus('imported: ' + (p.name || p.id));
   } catch (err) { setStatus('import failed: ' + err.message); }
+  e.target.value = '';
+}
+
+async function importStates(e) {
+  const file = e.target.files[0];
+  if (!file) { return; }
+  if (!PID) { setStatus('open or create a project first'); e.target.value = ''; return; }
+  setStatus('importing states…');
+  try {
+    const text = await file.text();
+    const r = await api('POST', `/api/projects/${PID}/keyframes/import_states`, { text });
+    await reload();
+    let msg = `imported ${r.count} keyframe${r.count === 1 ? '' : 's'}`;
+    if (r.errors && r.errors.length) { msg += ` (${r.errors.length} skipped)`; }
+    setStatus(msg);
+  } catch (err) { setStatus('import states failed: ' + err.message); }
   e.target.value = '';
 }
 
