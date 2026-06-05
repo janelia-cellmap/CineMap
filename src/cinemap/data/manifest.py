@@ -142,7 +142,11 @@ def analyze_state(url: str) -> Manifest:
         ltype = layer.get("type")
         srcs = _sources(layer)
         if ltype == "image" and em is None:
-            vol = next((u for u, _, role in srcs if role == "volume"), None)
+            # only OME-Zarr (zarr/n5) images can be sliced by the tensorstore slice
+            # loader; a precomputed image (e.g. flyem JPEG) isn't sliceable here, so
+            # we skip it rather than crash later trying to read its `.zattrs`.
+            vol = next((u for u, fmt, role in srcs
+                        if role == "volume" and fmt in (None, "zarr", "zarr2", "n5")), None)
             if vol:
                 em = EMSource(name=name, zarr_url=vol, voxel_size_nm=voxel_nm)
         elif ltype == "segmentation":

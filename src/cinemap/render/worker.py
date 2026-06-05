@@ -53,9 +53,15 @@ class RenderWorker:
         # full resolution. EM level is chosen by target px across the on-screen
         # crop; meshes by marching-cubes voxel budget (per-segment / union).
         draft = bool(getattr(job.settings, "draft", False))
+        self._draft = draft
         self._em_target_px = 768 if draft else 1600
         self._mesh_voxels_single = 1_500_000 if draft else 8_000_000
         self._mesh_voxels_union = 3_000_000 if draft else 20_000_000
+        # mesh sourcing: precomputed (LOD-adaptive) by default; opt in to watertight
+        # marching-cubes-from-labels via the render setting.
+        self._prefer_labels = bool(getattr(job.settings, "mesh_from_labels", False))
+        self._nm_per_px = None  # finest on-screen scale across frames (set per build)
+        self._lod_tag = ""      # cache-key component so re-framing rebuilds LOD assets
 
     # ---- asset preparation ----
     def _em_vol(self) -> EMVolume:
@@ -118,13 +124,13 @@ class RenderWorker:
         self._slice_cache[key] = out
         return out
 
-    @staticmethod
-    def _mesh_uid(mesh_name, ids, color_key=()) -> str:
-        """Stable id per (layer, exact segment set, coloring) so a different segment
-        set OR a different color (seed/fixed) becomes a distinct object/asset."""
+    def _mesh_uid(self, mesh_name, ids, color_key=()) -> str:
+        """Stable id per (layer, exact segment set, coloring, LOD scale) so a
+        different segment set, color, OR on-screen resolution becomes a distinct
+        cached asset."""
         import hashlib
 
-        sig = ",".join(map(str, sorted(ids))) + "|" + str(color_key)
+        sig = ",".join(map(str, sorted(ids))) + "|" + str(color_key) + "|" + self._lod_tag
         return f"{mesh_name}_{hashlib.md5(sig.encode()).hexdigest()[:8]}"
 
     @staticmethod
@@ -160,7 +166,9 @@ class RenderWorker:
                 combined = MeshLoader(src.mesh_url, src.label_zarr).load_many(
                     ids, colorize=lc.rgb,
                     target_voxels_single=self._mesh_voxels_single,
-                    target_voxels_union=self._mesh_voxels_union)
+                    target_voxels_union=self._mesh_voxels_union,
+                    nm_per_px=self._nm_per_px, draft=self._draft,
+                    prefer_labels=self._prefer_labels)
         except Exception as e:  # noqa: BLE001
             print(f"[worker] mesh {mesh_name} ({len(ids)} segs) failed: {e}")
             return None
@@ -196,6 +204,20 @@ class RenderWorker:
 
     # ---- scene spec ----
     def _build_scene_spec(self, frames: list[FrameState], index_offset: int = 0) -> dict:
+        # On-screen scale (nm per pixel) for picking precomputed-mesh LOD, like
+        # neuroglancer: take the FINEST requirement across frames (the closest the
+        # camera ever gets) so the cached mesh is sharp enough for every shot.
+        height = max(1, self.job.settings.height)
+
+        def _nmpp(fr):
+            d = math.dist(fr.position_nm, fr.look_at_nm)
+            return 2.0 * d * math.tan(math.radians(fr.fov_deg) / 2) / height
+
+        self._nm_per_px = min((_nmpp(fr) for fr in frames), default=None)
+        self._lod_tag = (f"npp{self._nm_per_px:.3g}|{'draft' if self._draft else 'full'}"
+                         f"|{'lab' if self._prefer_labels else 'pre'}"
+                         if self._nm_per_px else "")
+
         # one Blender object per distinct (layer, segment set) across all frames
         mesh_specs: dict[str, dict] = {}
         for fr in frames:
@@ -237,10 +259,14 @@ class RenderWorker:
                     continue
                 # slot is stable across frames (matches interpolate's slice identity)
                 # so the blend exporter can group a slice's per-frame images into one
-                # animated image-sequence plane.
-                s = {**self._slice_png(sl, region, seg_overlays),
-                     "opacity": sl.opacity, "slot": f"{sl.em_name}:{sl.axis}"}
-                slices.append(s)
+                # animated image-sequence plane. A slice that can't be read (e.g. a
+                # non-OME-Zarr EM source) is skipped, not fatal to the whole render.
+                try:
+                    png = self._slice_png(sl, region, seg_overlays)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[worker] slice {sl.em_name}:{sl.axis} failed: {e}")
+                    continue
+                slices.append({**png, "opacity": sl.opacity, "slot": f"{sl.em_name}:{sl.axis}"})
             overrides = {}
             for m in fr.meshes:
                 uid = self._mesh_uid(m.mesh_name, m.segment_ids, self._frame_colors(m).cache_key())
