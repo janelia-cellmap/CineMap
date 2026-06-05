@@ -93,7 +93,11 @@ def parse_state_links(text: str) -> list[tuple[str, str, float | None]]:
     header = lines[0].lower()
     state_keys = ("state", "url", "link", "ngl", "neuroglancer")
     label_keys = ("label", "name", "title")
-    is_csv_header = "," in header and any(k in header for k in state_keys)
+    # A real CSV header has no link in it; an inline neuroglancer state link
+    # contains commas and "url", so guard against misdetecting it as a CSV header.
+    looks_like_link = "://" in header or "#!" in header
+    is_csv_header = (not looks_like_link and "," in header
+                     and any(k in header for k in state_keys))
 
     out: list[tuple[str, str, float | None]] = []
     if is_csv_header:

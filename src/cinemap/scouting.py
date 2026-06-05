@@ -218,10 +218,10 @@ def import_states(project: Project, links: list[tuple]) -> tuple[list[Keyframe],
             # CineMap's normal 2.0s — so the total runtime matches NG exactly.
             kf.easing = "linear"
             kf.duration_in_s = float(duration) if duration is not None else 1.0
-            ops.store.save(project)
             created.append(kf)
         except Exception as e:  # noqa: BLE001
             errors.append(f"{label}: {e}")
+    ops.store.save(project)  # persist the easing/duration overrides once for the batch
     return created, errors
 
 

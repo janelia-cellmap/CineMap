@@ -75,6 +75,7 @@ class RenderReq(BaseModel):
     export_blend: bool = False  # produce a self-contained .blend instead of a video
     draft: bool = False         # fast low-res preview (coarse EM + low-voxel meshes)
     mesh_detail: float = 1.0    # per-layer vertex-budget multiplier (hard-capped)
+    mesh_from_labels: bool = False  # regenerate watertight meshes from labels vs precomputed
 
 
 class ChatReq(BaseModel):
@@ -166,7 +167,7 @@ def import_project(body: dict):
         p = Project.model_validate(body)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"invalid project file: {e}") from e
-    p.id = ops._uid("proj")     # fresh id so import never clobbers an existing project
+    p.id = ops.project_id(p.name)  # fresh id so import never clobbers an existing project
     p.renders = []              # drop render history (output files won't exist)
     store.save(p)
     try:
@@ -392,7 +393,7 @@ def _run_render(pid: str, job_id: str, worker: RenderWorker, thumbnail_for: str 
 def _start_render(pid: str, settings: RenderSettings, kf_range=None, thumbnail_for=None) -> str:
     p = store.load(pid)
     if thumbnail_for:  # don't clutter the render history with thumbnail jobs
-        job = RenderJob(id=ops._uid("thumb"), kf_range=kf_range, settings=settings)
+        job = RenderJob(id=ops.render_id(p, "thumb"), kf_range=kf_range, settings=settings)
     else:
         job = ops.create_render_job(p, settings, kf_range=kf_range)
     worker = RenderWorker(p, job)
@@ -418,7 +419,7 @@ def _evict_finished_states(keep: int = 200) -> None:
 def render(pid: str, req: RenderReq):
     settings = RenderSettings(width=req.width, height=req.height, fps=req.fps,
                               samples=req.samples, export_blend=req.export_blend, draft=req.draft,
-                              mesh_detail=req.mesh_detail)
+                              mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels)
     return {"job_id": _start_render(pid, settings, kf_range=req.kf_range)}
 
 

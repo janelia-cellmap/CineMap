@@ -225,8 +225,8 @@ class RenderWorker:
             return 2.0 * d * math.tan(math.radians(fr.fov_deg) / 2) / height
 
         self._nm_per_px = min((_nmpp(fr) for fr in frames), default=None)
-        # the trailing tag ('cap2') is a cache version: bump it whenever the LOD/budget
-        # math changes so stale oversized assets from a prior version aren't reused.
+        # Asset cache key: nm/px (framing), draft/full, label/precomputed source, and
+        # the vertex budget — so re-framing or a lower OOM-retry budget rebuilds LODs.
         self._lod_tag = (f"npp{self._nm_per_px:.3g}|{'draft' if self._draft else 'full'}"
                          f"|{'lab' if self._prefer_labels else 'pre'}|b{self._mesh_budget}"
                          if self._nm_per_px else f"b{self._mesh_budget}")
@@ -400,10 +400,10 @@ class RenderWorker:
                 raise RenderCancelled()
             if not oom:
                 break
-            if attempt == 2 or self._mesh_budget <= 500_000:
+            if attempt == 2:  # 3 tries (full -> half -> quarter budget) exhausted
                 self.job.status = "error"
                 raise RuntimeError("GPU out of memory even at reduced mesh detail")
-            self._mesh_budget = max(500_000, self._mesh_budget // 2)
+            self._mesh_budget = max(300_000, self._mesh_budget // 2)
 
         if exporting:
             if not self.blend_path.exists():

@@ -23,10 +23,6 @@ def _ease(t: float, mode: str) -> float:
     return t
 
 
-def _lerp(a, b, t):
-    return [ai + (bi - ai) * t for ai, bi in zip(a, b)]
-
-
 def _cam_basis(cam):
     """(center, world<-view Rotation, eye->center distance) for a Camera. The
     rotation R maps view axes to world: forward = R@[0,0,-1], up = R@[0,1,0], the

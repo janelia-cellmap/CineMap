@@ -41,8 +41,8 @@ class MeshLoader:
     def __init__(self, mesh_url: str = "", label_zarr: str = ""):
         self.mesh_url = (mesh_url or "").rstrip("/")
         self.label_zarr = (label_zarr or "").rstrip("/")
-        if self.mesh_url:
-            self.parent, self.subdir = self.mesh_url.rsplit("/", 1)
+        self.parent, self.subdir = (
+            self.mesh_url.rsplit("/", 1) if "/" in self.mesh_url else ("", self.mesh_url))
         self._cv = None
 
     @property
@@ -240,12 +240,14 @@ class MeshLoader:
         # default: precomputed meshes (LOD-adaptive, total vertex budget per layer so
         # a many-segment layer can't balloon when one frame zooms in)
         if self.mesh_url:
-            budget = total_budget or (1_200_000 if draft else 5_000_000)
+            budget = total_budget if total_budget is not None else (1_200_000 if draft else 5_000_000)
             combined = self._draco_concat(seg_ids, colorize=colorize, nm_per_px=nm_per_px,
                                           draft=draft, total_budget=budget)
             if combined is not None:
                 return combined
         # fallback: no precomputed source -> generate from labels
+        if not self.label_zarr:
+            raise ValueError(f"no mesh source for segments {seg_ids}")
         from .mesh_from_labels import generate_union
 
         return generate_union(self.label_zarr, seg_ids, target_voxels=target_voxels_union,
