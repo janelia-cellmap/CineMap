@@ -135,6 +135,10 @@ class RenderSettings(BaseModel):
     # matches neuroglancer). Set this to instead regenerate watertight meshes from
     # the OME-Zarr label volume via marching cubes when one is available.
     mesh_from_labels: bool = False
+    # Mesh detail multiplier on the per-layer vertex budget (1.0 = default 5M full /
+    # 1.2M draft). Higher = crisper meshes but more VRAM; the worker hard-caps the
+    # budget and auto-retries at lower detail if the GPU runs out of memory.
+    mesh_detail: float = 1.0
 
 
 class RenderJob(BaseModel):

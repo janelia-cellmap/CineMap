@@ -34,6 +34,10 @@ def _bu(p, nm_per_bu):
 
 
 class RenderWorker:
+    # Hard ceiling on a layer's combined vertex count, regardless of mesh_detail —
+    # keeps the worst case well under the GPUs' VRAM (~9 GB free on an 11 GB card).
+    MESH_BUDGET_CEILING = 20_000_000
+
     def __init__(self, project: Project, job: RenderJob, nm_per_bu: float = NM_PER_BU):
         self.project = project
         self.job = job
@@ -60,6 +64,12 @@ class RenderWorker:
         # mesh sourcing: precomputed (LOD-adaptive) by default; opt in to watertight
         # marching-cubes-from-labels via the render setting.
         self._prefer_labels = bool(getattr(job.settings, "mesh_from_labels", False))
+        # Per-layer vertex budget = base * mesh_detail, hard-capped so a too-high
+        # setting can't recreate the multi-GB mesh that stalled asset prep / OOM'd the
+        # GPU. The OOM-retry loop in run() halves this and rebuilds if Cycles runs out.
+        detail = max(0.25, min(float(getattr(job.settings, "mesh_detail", 1.0) or 1.0), 8.0))
+        base_budget = 1_200_000 if draft else 5_000_000
+        self._mesh_budget = min(int(base_budget * detail), self.MESH_BUDGET_CEILING)
         self._nm_per_px = None  # finest on-screen scale across frames (set per build)
         self._lod_tag = ""      # cache-key component so re-framing rebuilds LOD assets
 
@@ -169,7 +179,7 @@ class RenderWorker:
                     target_voxels_single=self._mesh_voxels_single,
                     target_voxels_union=self._mesh_voxels_union,
                     nm_per_px=self._nm_per_px, draft=self._draft,
-                    prefer_labels=self._prefer_labels)
+                    prefer_labels=self._prefer_labels, total_budget=self._mesh_budget)
         except Exception as e:  # noqa: BLE001
             print(f"[worker] mesh {mesh_name} ({len(ids)} segs) failed: {e}")
             return None
@@ -218,8 +228,8 @@ class RenderWorker:
         # the trailing tag ('cap2') is a cache version: bump it whenever the LOD/budget
         # math changes so stale oversized assets from a prior version aren't reused.
         self._lod_tag = (f"npp{self._nm_per_px:.3g}|{'draft' if self._draft else 'full'}"
-                         f"|{'lab' if self._prefer_labels else 'pre'}|cap2"
-                         if self._nm_per_px else "")
+                         f"|{'lab' if self._prefer_labels else 'pre'}|b{self._mesh_budget}"
+                         if self._nm_per_px else f"b{self._mesh_budget}")
 
         # one Blender object per distinct (layer, segment set) across all frames
         mesh_specs: dict[str, dict] = {}
@@ -325,6 +335,36 @@ class RenderWorker:
         if proc is not None and proc.poll() is None:
             proc.terminate()
 
+    def _run_blender(self, scene_path, nframes: int) -> bool:
+        """Launch the Blender render subprocess and stream progress. Returns True if it
+        failed specifically with a GPU out-of-memory error (so the caller can retry at
+        lower mesh detail); raises RuntimeError on any other non-zero exit."""
+        self._proc = subprocess.Popen(
+            [sys.executable, "-m", "cinemap.render.blender_script", str(scene_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        proc = self._proc
+        done, oom = 0, False
+        for line in proc.stdout:  # type: ignore
+            if self.cancel.is_set():
+                proc.terminate()
+                break
+            low = line.lower()
+            if ("out of memory" in low or "out of gpu memory" in low
+                    or "cuda_error_out_of_memory" in low or "failed to allocate" in low):
+                oom = True
+            if line.startswith("[blender] frame"):
+                done += 1
+                self._progress(0.6 + 0.3 * done / nframes, line.strip())
+        proc.wait()
+        if self.cancel.is_set():
+            return False
+        if proc.returncode != 0 and not oom:
+            self.job.status = "error"
+            raise RuntimeError(f"blender exited {proc.returncode}")
+        return oom
+
     def run(self, progress: Progress | None = None) -> str:
         self._cb = progress
         self.job.status = "running"
@@ -340,38 +380,30 @@ class RenderWorker:
         if not frames:
             raise ValueError("no keyframes to render")
 
-        self._progress(0.1, "preparing assets")
-        spec = self._build_scene_spec(frames)  # raises RenderCancelled if cancelled
-        if self.cancel.is_set():
-            raise RenderCancelled()
-        scene_path = self.workdir / "scene.json"
-        scene_path.write_text(json.dumps(spec, indent=2))
-
         exporting = self.job.settings.export_blend
-        self._progress(0.6, f"{'baking .blend' if exporting else 'rendering'} "
-                            f"({len(frames)} frames) in Blender")
-        py = sys.executable
-        self._proc = subprocess.Popen(
-            [py, "-m", "cinemap.render.blender_script", str(scene_path)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-        proc = self._proc
-        done = 0
-        for line in proc.stdout:  # type: ignore
+        scene_path = self.workdir / "scene.json"
+        # Build assets + render, retrying at half the mesh budget if Cycles runs out
+        # of GPU memory (a too-high mesh_detail, or many dense layers in one frame).
+        for attempt in range(3):
+            self._progress(0.1, "preparing assets" if attempt == 0 else
+                           f"GPU out of memory — retrying at lower detail "
+                           f"({self._mesh_budget // 1000}k verts/layer)")
+            spec = self._build_scene_spec(frames)  # raises RenderCancelled if cancelled
             if self.cancel.is_set():
-                proc.terminate()
+                raise RenderCancelled()
+            scene_path.write_text(json.dumps(spec, indent=2))
+            self._progress(0.6, f"{'baking .blend' if exporting else 'rendering'} "
+                                f"({len(frames)} frames) in Blender")
+            oom = self._run_blender(scene_path, len(frames))
+            if self.cancel.is_set():
+                self.job.status = "cancelled"
+                raise RenderCancelled()
+            if not oom:
                 break
-            if line.startswith("[blender] frame"):
-                done += 1
-                self._progress(0.6 + 0.3 * done / len(frames), line.strip())
-        proc.wait()
-        if self.cancel.is_set():
-            self.job.status = "cancelled"
-            raise RenderCancelled()
-        if proc.returncode != 0:
-            self.job.status = "error"
-            raise RuntimeError(f"blender exited {proc.returncode}")
+            if attempt == 2 or self._mesh_budget <= 500_000:
+                self.job.status = "error"
+                raise RuntimeError("GPU out of memory even at reduced mesh detail")
+            self._mesh_budget = max(500_000, self._mesh_budget // 2)
 
         if exporting:
             if not self.blend_path.exists():

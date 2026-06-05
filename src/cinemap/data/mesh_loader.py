@@ -217,7 +217,8 @@ class MeshLoader:
 
     def load_many(self, seg_ids, colorize=None, target_voxels_single: int = 8_000_000,
                   target_voxels_union: int = 20_000_000, nm_per_px: float | None = None,
-                  draft: bool = False, prefer_labels: bool = False) -> trimesh.Trimesh:
+                  draft: bool = False, prefer_labels: bool = False,
+                  total_budget: int | None = None) -> trimesh.Trimesh:
         """One mesh for a set of segments. By default downloads the precomputed
         meshes (LOD picked from on-screen scale `nm_per_px`); with `prefer_labels`
         it regenerates watertight meshes from the label volume (a cheap whole-volume
@@ -239,9 +240,9 @@ class MeshLoader:
         # default: precomputed meshes (LOD-adaptive, total vertex budget per layer so
         # a many-segment layer can't balloon when one frame zooms in)
         if self.mesh_url:
-            total_budget = 1_200_000 if draft else 5_000_000
+            budget = total_budget or (1_200_000 if draft else 5_000_000)
             combined = self._draco_concat(seg_ids, colorize=colorize, nm_per_px=nm_per_px,
-                                          draft=draft, total_budget=total_budget)
+                                          draft=draft, total_budget=budget)
             if combined is not None:
                 return combined
         # fallback: no precomputed source -> generate from labels
