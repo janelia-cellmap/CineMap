@@ -174,7 +174,10 @@ def parse_state_links(text: str) -> list[tuple[str, str, float | None]]:
 
 
 def analyze_state(url: str) -> Manifest:
-    state = fetch_state(url)
+    return analyze_state_dict(fetch_state(url))
+
+
+def analyze_state_dict(state: dict) -> Manifest:
     dim = state.get("dimensions", {})
     # dimensions are {axis: [resolution_m, unit]} in x,y,z order
     voxel_nm = [dim.get(a, [8e-9, "m"])[0] * 1e9 for a in ("x", "y", "z")]

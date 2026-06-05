@@ -50,6 +50,22 @@ def current_layer_visibility(project: Project) -> dict[str, bool]:
     return {m.name: getattr(m, "visible", True) is not False for m in v.state.layers}
 
 
+def _visible_segments_from_state(st: dict) -> dict[str, list[int]]:
+    """{layer_name: [visible segment ids]} parsed straight from a neuroglancer state
+    dict — no live-viewer round-trip, so no async race (the viewer may not have
+    applied a just-set state yet). '!'-prefixed segments are selected-but-hidden and
+    excluded, matching what the 3D view shows."""
+    out: dict[str, list[int]] = {}
+    for layer in st.get("layers", []):
+        if layer.get("type") != "segmentation" or layer.get("visible", True) is False:
+            continue
+        ids = [int(s) for s in (str(x) for x in (layer.get("segments") or []))
+               if not s.startswith("!") and s.lstrip("-").isdigit()]
+        if ids:
+            out[layer.get("name", "")] = sorted(ids)
+    return out
+
+
 def current_visible_segments(project: Project) -> dict[str, list[int]]:
     """{layer_name: [visible segment ids]} from the scouting viewer right now.
 
@@ -103,7 +119,7 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
     lcolors = current_layer_colors(project, st)
     # per-layer 3D render state (Opacity/Silhouette) from the serialized state
     layers = {l.get("name"): l for l in st.get("layers", [])}
-    vis = current_visible_segments(project)
+    vis = _visible_segments_from_state(st)
     # Resolve linkedSegmentationGroup: a visible segmentation layer with no segments
     # of its own but linked to another layer shows that layer's segments (e.g.
     # mito-objects-grouped, keyed by neuron id, linked to the neuron layer). Fetch
@@ -128,18 +144,22 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
     return meshes
 
 
-def _scene_from_view(project: Project):
-    """Capture the current scouting view as (camera, slices, meshes, ng_state):
-    the 3D-view camera, the EM slice (if the image layer is shown), and meshes for
-    the visible segmentation layers/segments."""
+def _scene_from_view(project: Project, st: dict | None = None):
+    """Capture a scene as (camera, slices, meshes, annotations, ng_state) from a
+    neuroglancer state dict. `st` defaults to the live scouting viewer; importing
+    passes the saved state directly so capture never races the viewer's async load."""
     from .data.ng_camera import ng_to_camera
 
-    st = get_viewer().state.to_json()  # serialize the viewer state ONCE; reuse below
+    if st is None:
+        st = get_viewer().state.to_json()  # serialize the live viewer ONCE; reuse below
     cam = ng_to_camera(st, project.manifest.voxel_size_nm)
     em_name = project.manifest.em.name if project.manifest.em else "em"
-    vis = current_layer_visibility(project)
+    layer_vis = {l.get("name"): l.get("visible", True) is not False
+                 for l in st.get("layers", [])}
+    # a "3d" layout shows no cross-section in neuroglancer, so bake no EM slice
+    show_slice = layer_vis.get(em_name, True) and st.get("layout") != "3d"
     slices = ([SlicePlane(em_name=em_name, axis="z", position_nm=cam.look_at_nm[2])]
-              if vis.get(em_name, True) else [])
+              if show_slice else [])
     meshes = _meshes_from_visible(project, st=st)
     annotations = _annotations_from_view(project, st)
     return cam, slices, meshes, annotations, st
@@ -175,9 +195,9 @@ def _annotations_from_view(project: Project, st: dict) -> list[AnnotationInstanc
     return out
 
 
-def bake_keyframe(project: Project, label: str = "scouted") -> Keyframe:
-    """Build a NEW keyframe from the current scouting view."""
-    cam, slices, meshes, annotations, st = _scene_from_view(project)
+def bake_keyframe(project: Project, label: str = "scouted", st: dict | None = None) -> Keyframe:
+    """Build a NEW keyframe from a neuroglancer state (the live view by default)."""
+    cam, slices, meshes, annotations, st = _scene_from_view(project, st)
     if not meshes and not slices and project.keyframes:  # nothing on -> keep previous meshes
         meshes = [m.model_copy() for m in project.keyframes[-1].meshes]
     kf = Keyframe(id=ops._uid("kf"), label=label, camera=cam, slices=slices,
@@ -193,8 +213,24 @@ def bake_keyframe_from_state(project: Project, state: dict, label: str = "import
     hand-baked one (visible layers/segments, colors, 3D style, camera). Used by the
     "import states" feature to turn a list of saved views into a keyframe timeline.
     """
-    get_viewer().set_state(state)
-    return bake_keyframe(project, label=label)
+    get_viewer().set_state(state)            # update the iframe so the user sees it…
+    return bake_keyframe(project, label=label, st=state)  # …but capture from the dict
+
+
+def _merge_manifest(project: Project, state: dict) -> None:
+    """Union one imported state's mesh/EM sources into the project manifest, so a
+    layer that appears only in a later state (e.g. a skeleton layer not present in
+    state 1) is known to the renderer. Matches by layer name; first one wins."""
+    from .data.manifest import analyze_state_dict
+
+    m = analyze_state_dict(state)
+    have = {x.name for x in project.manifest.meshes}
+    for ms in m.meshes:
+        if ms.name not in have:
+            project.manifest.meshes.append(ms)
+            have.add(ms.name)
+    if project.manifest.em is None and m.em is not None:
+        project.manifest.em = m.em
 
 
 def import_states(project: Project, links: list[tuple]) -> tuple[list[Keyframe], list[str]]:
@@ -211,6 +247,7 @@ def import_states(project: Project, links: list[tuple]) -> tuple[list[Keyframe],
         duration = entry[2] if len(entry) > 2 else None
         try:
             state = fetch_state(link)
+            _merge_manifest(project, state)  # register layers new to this state
             kf = bake_keyframe_from_state(project, state, label=label)
             # match neuroglancer's video_tool: linear interpolation between states,
             # the script's number is the transition duration into this keyframe, and
