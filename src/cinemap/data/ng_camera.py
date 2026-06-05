@@ -19,18 +19,21 @@ from scipy.spatial.transform import Rotation
 
 from ..models import Camera
 
-# neuroglancer's projectionScale maps to a visible extent this much smaller than
-# scale*voxel for our camera; calibrated by matching rendered framing to its
-# video_tool output (frame-0 content fraction). The camera uses VERTICAL sensor fit
-# so framing is aspect-independent (no top/bottom cropping on wide frames).
-NG_SCALE_CAL = 1.05
+# neuroglancer's perspective view, taken from its source (perspective_panel):
+#   fovy = Math.PI/4 = 45deg (VERTICAL field of view), and camera distance =
+#   (projectionScale/2)/tan(fovy/2) in voxels, so the visible extent at the focus is
+#   exactly projectionScale*voxel. We render at this FOV/distance with a VERTICAL
+#   sensor fit, reproducing neuroglancer's framing exactly — and, like neuroglancer,
+#   the vertical framing is independent of the window aspect (a wider frame just
+#   shows more on the sides). No empirical calibration.
+NG_FOV_DEG = 45.0
 
 
 def _vox(voxel_nm):
     return np.array(voxel_nm, dtype=float)
 
 
-def ng_to_camera(state: dict, voxel_nm, fov_deg: float = 40.0) -> Camera:
+def ng_to_camera(state: dict, voxel_nm, fov_deg: float = NG_FOV_DEG) -> Camera:
     pos_vox = np.array(state.get("position") or [0, 0, 0], dtype=float)
     look_at = pos_vox * _vox(voxel_nm)
     q = state.get("projectionOrientation") or [0.0, 0.0, 0.0, 1.0]
@@ -44,7 +47,9 @@ def ng_to_camera(state: dict, voxel_nm, fov_deg: float = 40.0) -> Camera:
     fwd = rot.apply([0.0, 0.0, 1.0])
     up = rot.apply([0.0, -1.0, 0.0])
 
-    visible_nm = scale * float(np.mean(_vox(voxel_nm))) / NG_SCALE_CAL
+    # NG: visible extent at the focus = projectionScale*voxel; dist back-computed from
+    # the vertical FOV. (Exactly NG's (projectionScale/2)/tan(fovy/2) * voxel.)
+    visible_nm = scale * float(np.mean(_vox(voxel_nm)))
     dist = visible_nm / (2.0 * math.tan(math.radians(fov_deg) / 2.0))
     cam_pos = look_at - fwd * dist
     return Camera(position_nm=cam_pos.tolist(), look_at_nm=look_at.tolist(),
@@ -74,5 +79,5 @@ def camera_to_ng(camera: Camera, voxel_nm, base_state: dict | None = None) -> di
     state["projectionOrientation"] = [float(v) for v in q]
 
     visible_nm = 2.0 * dist * math.tan(math.radians(camera.fov_deg) / 2.0)
-    state["projectionScale"] = visible_nm * NG_SCALE_CAL / float(np.mean(_vox(voxel_nm)))
+    state["projectionScale"] = visible_nm / float(np.mean(_vox(voxel_nm)))
     return state
