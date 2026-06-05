@@ -214,8 +214,10 @@ class RenderWorker:
             return 2.0 * d * math.tan(math.radians(fr.fov_deg) / 2) / height
 
         self._nm_per_px = min((_nmpp(fr) for fr in frames), default=None)
+        # the trailing tag ('cap2') is a cache version: bump it whenever the LOD/budget
+        # math changes so stale oversized assets from a prior version aren't reused.
         self._lod_tag = (f"npp{self._nm_per_px:.3g}|{'draft' if self._draft else 'full'}"
-                         f"|{'lab' if self._prefer_labels else 'pre'}"
+                         f"|{'lab' if self._prefer_labels else 'pre'}|cap2"
                          if self._nm_per_px else "")
 
         # one Blender object per distinct (layer, segment set) across all frames

@@ -111,7 +111,8 @@ class MeshLoader:
             m = re.search(r"-?\d+\s*-\s*(\d+)\)", str(e))
             return int(m.group(1)) if m else 0
 
-    def _draco_lod_for_screen(self, seg_id: int, nm_per_px: float, draft: bool) -> trimesh.Trimesh | None:
+    def _draco_lod_for_screen(self, seg_id: int, nm_per_px: float, draft: bool,
+                              max_verts: float | None = None) -> trimesh.Trimesh | None:
         """Fetch the precomputed mesh at the coarsest LOD that still looks sharp at
         the given on-screen scale (`nm_per_px`). Like neuroglancer: a mesh that's
         small on screen loads coarse, a close-up loads fine. Fetches coarse->fine and
@@ -124,24 +125,28 @@ class MeshLoader:
         spacing_nm = max(px_spacing * nm_per_px, 1e-6)
         target = None
         chosen = None
-        for lod in range(self._max_lod(seg_id), -1, -1):
+        for lod in range(self._max_lod(seg_id), -1, -1):  # coarse -> fine
             try:
                 mesh = self._draco(seg_id, lod=lod)
             except Exception as e:  # noqa: BLE001
                 print(f"[mesh] {seg_id} lod{lod} failed: {e}")
                 continue
-            if target is None:  # size the budget from the (cheap) coarsest mesh
+            if target is None:  # size the screen budget from the (cheap) coarsest mesh
                 extent = float(np.max(mesh.bounds[1] - mesh.bounds[0]))
                 target = (extent / spacing_nm) ** 2  # ~verts for a surface at that spacing
+            # hard budget ceiling: if going this fine would exceed max_verts, keep the
+            # previous (coarser, in-budget) LOD instead.
+            if max_verts is not None and len(mesh.vertices) > max_verts and chosen is not None:
+                break
             chosen = mesh
-            if len(mesh.vertices) >= target:
+            if len(mesh.vertices) >= target:  # enough on-screen detail
                 break
         return chosen
 
-    def _precomputed(self, seg_id, colorize, nm_per_px, draft) -> trimesh.Trimesh | None:
-        """A single segment's precomputed mesh (LOD-adaptive when `nm_per_px` set),
-        tinted with its neuroglancer color."""
-        mesh = (self._draco_lod_for_screen(seg_id, nm_per_px, draft)
+    def _precomputed(self, seg_id, colorize, nm_per_px, draft, max_verts=None) -> trimesh.Trimesh | None:
+        """A single segment's precomputed mesh (LOD-adaptive when `nm_per_px` set,
+        capped at `max_verts`), tinted with its neuroglancer color."""
+        mesh = (self._draco_lod_for_screen(seg_id, nm_per_px, draft, max_verts=max_verts)
                 if nm_per_px else self._draco(seg_id))
         if mesh is None:
             return None
@@ -195,10 +200,16 @@ class MeshLoader:
             for (s0, s1, s2) in (vol.level_shape_zyx(l) for l in range(len(vol.level_scale_nm)))
         )
 
-    def _draco_concat(self, seg_ids, colorize=None, nm_per_px=None, draft=False) -> trimesh.Trimesh | None:
+    def _draco_concat(self, seg_ids, colorize=None, nm_per_px=None, draft=False,
+                      total_budget=None) -> trimesh.Trimesh | None:
         """Combine the precomputed meshes for `seg_ids` (LOD-adaptive when `nm_per_px`
-        is set), each tinted with its neuroglancer color. Fast and memory-bounded."""
-        parts = [self._precomputed(s, colorize, nm_per_px, draft) for s in seg_ids]
+        is set), each tinted with its neuroglancer color. `total_budget` caps the
+        combined vertex count — split evenly across segments — so a layer with many
+        segments (e.g. 50 neurons) stays bounded even when the camera zooms in on one
+        frame; a single segment can still use the whole budget for a sharp close-up."""
+        per_seg = (total_budget / max(1, len(seg_ids))) if total_budget else None
+        parts = [self._precomputed(s, colorize, nm_per_px, draft, max_verts=per_seg)
+                 for s in seg_ids]
         parts = [p for p in parts if p is not None]
         if not parts:
             return None
@@ -225,10 +236,12 @@ class MeshLoader:
             parts = [self.load(s, colorize=colorize, target_voxels=target_voxels_single,
                                prefer_labels=True) for s in seg_ids]
             return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
-        # default: precomputed meshes (LOD-adaptive)
+        # default: precomputed meshes (LOD-adaptive, total vertex budget per layer so
+        # a many-segment layer can't balloon when one frame zooms in)
         if self.mesh_url:
+            total_budget = 1_200_000 if draft else 5_000_000
             combined = self._draco_concat(seg_ids, colorize=colorize, nm_per_px=nm_per_px,
-                                          draft=draft)
+                                          draft=draft, total_budget=total_budget)
             if combined is not None:
                 return combined
         # fallback: no precomputed source -> generate from labels
