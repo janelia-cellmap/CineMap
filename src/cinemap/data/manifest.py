@@ -12,6 +12,45 @@ import urllib.request
 from ..models import EMSource, Manifest, MeshSource
 
 _MESH_PREFIXES = ("zarr://", "zarr2://", "n5://", "precomputed://")
+_VOLUME_FMTS = (None, "zarr", "zarr2", "zarr3", "n5")  # sliceable label/EM volumes
+_pre_role_cache: dict[str, str] = {}
+
+
+def _to_http(u: str) -> str:
+    if u.startswith("gs://"):
+        return "https://storage.googleapis.com/" + u[len("gs://"):]
+    if u.startswith("s3://"):
+        return "https://s3.amazonaws.com/" + u[len("s3://"):]
+    return u
+
+
+def _precomputed_role(url: str) -> str:
+    """mesh / skeleton / volume for a precomputed source, by its `info` `@type`
+    (how neuroglancer itself classifies it) — dir names like 'multires' or
+    'simplified' aren't reliable. Falls back to a path heuristic if info is
+    unreachable."""
+    key = url.rstrip("/")
+    if key in _pre_role_cache:
+        return _pre_role_cache[key]
+    role = None
+    http = _to_http(key)
+    if urllib.parse.urlparse(http).scheme in ("http", "https"):
+        try:
+            with urllib.request.urlopen(http + "/info", timeout=10) as r:
+                t = json.load(r).get("@type", "")
+            role = {"neuroglancer_skeletons": "skeleton",
+                    "neuroglancer_multilod_draco": "mesh",
+                    "neuroglancer_legacy_mesh": "mesh",
+                    "neuroglancer_multiscale_volume": "volume"}.get(t)
+        except Exception:  # noqa: BLE001  (network/format issues -> path fallback)
+            role = None
+    if role is None:
+        low = key.lower()
+        role = ("skeleton" if "skeleton" in low
+                else "mesh" if ("/mesh" in low or low.endswith("multires") or "multilod" in low)
+                else "volume")
+    _pre_role_cache[key] = role
+    return role
 
 
 def _clean_url(u: str) -> tuple[str, str | None, str]:
@@ -27,7 +66,8 @@ def _clean_url(u: str) -> tuple[str, str | None, str]:
         tail = tail.rstrip(":")
         if tail:
             fmt = tail
-    role = "mesh" if "/mesh/" in u else "skeleton" if "/skeleton/" in u else "volume"
+    # zarr/n5 sources are volumes; precomputed sources are classified by their info.
+    role = "volume" if fmt in _VOLUME_FMTS else _precomputed_role(u)
     return u, fmt, role
 
 
@@ -150,7 +190,7 @@ def analyze_state(url: str) -> Manifest:
             # loader; a precomputed image (e.g. flyem JPEG) isn't sliceable here, so
             # we skip it rather than crash later trying to read its `.zattrs`.
             vol = next((u for u, fmt, role in srcs
-                        if role == "volume" and fmt in (None, "zarr", "zarr2", "n5")), None)
+                        if role == "volume" and fmt in _VOLUME_FMTS), None)
             if vol:
                 em = EMSource(name=name, zarr_url=vol, voxel_size_nm=voxel_nm)
         elif ltype == "segmentation":
@@ -161,8 +201,8 @@ def analyze_state(url: str) -> Manifest:
             # (e.g. flyem hemibrain -> meshes read directly by cloud-volume).
             vol_url, vol_fmt = next(((u, f) for u, f, role in srcs if role == "volume"),
                                     (None, None))
-            label_zarr = vol_url if vol_fmt in (None, "zarr", "zarr2", "n5") else None
-            if vol_fmt == "precomputed" and not mesh_url:
+            label_zarr = vol_url if vol_fmt in _VOLUME_FMTS else None
+            if vol_fmt in ("precomputed", "neuroglancer-precomputed") and not mesh_url:
                 mesh_url = vol_url
             if mesh_url or label_zarr or skel_url:
                 seg_ids = [int(s) for s in (layer.get("segments") or []) if str(s).isdigit()]
