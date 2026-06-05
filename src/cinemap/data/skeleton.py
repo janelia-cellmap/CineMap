@@ -12,6 +12,8 @@ for a whole layer's selected segments) to stay fast across thousands of segments
 """
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import trimesh
 from cloudvolume import CloudVolume
@@ -21,6 +23,64 @@ from cloudvolume import CloudVolume
 DEFAULT_RADIUS_NM = 60.0
 # Sides per tube cross-section. 6 is a clean low-poly tube; bump for hero closeups.
 _SIDES = 6
+
+
+class ShaderColormap:
+    """A piecewise-smoothstep colormap recovered from a neuroglancer skeleton
+    `skeletonRendering.shader`. Matches the common cellmap pattern:
+
+        emitRGB(<map>(min(1.0, <attr>/<norm>)))
+
+    where <map> is built from `const float eN = ...; const vec3 vN = vec3(...)`
+    control points and consecutive stops are blended with `smoothstep`. So skeleton
+    tubes get the same per-vertex coloring the user sees in neuroglancer instead of
+    a flat segment color."""
+
+    def __init__(self, attr: str, norm: float, edges: list[float], colors: list[list[float]]):
+        self.attr = attr
+        self.norm = norm or 1.0
+        self.edges = np.asarray(edges, dtype=np.float64)
+        self.colors = np.asarray(colors, dtype=np.float64)  # (S,3) in 0..1
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        """Map normalized values `x` (already divided by norm) to (N,3) rgb."""
+        x = np.clip(np.asarray(x, dtype=np.float64), self.edges[0], self.edges[-1])
+        out = np.tile(self.colors[0], (len(x), 1))
+        for i in range(len(self.edges) - 1):
+            e0, e1 = self.edges[i], self.edges[i + 1]
+            seg = (x >= e0) & (x <= e1)
+            if not seg.any():
+                continue
+            t = np.clip((x[seg] - e0) / (e1 - e0 + 1e-12), 0.0, 1.0)
+            a = t * t * (3 - 2 * t)  # smoothstep
+            out[seg] = self.colors[i] * (1 - a)[:, None] + self.colors[i + 1] * a[:, None]
+        return out
+
+
+def parse_shader_colormap(shader: str) -> ShaderColormap | None:
+    """Recover a ShaderColormap from a skeleton shader, or None if it doesn't match
+    the recognized colormap pattern (then we fall back to flat segment colors)."""
+    if not shader:
+        return None
+    floats = dict(re.findall(r"float\s+(\w+)\s*=\s*([\d.eE+f-]+)", shader))
+    edges, colors = [], []
+    i = 0
+    while f"e{i}" in floats:
+        m = re.search(rf"vec3\s+v{i}\s*=\s*vec3\(([^)]+)\)", shader)
+        if not m:
+            break
+        edges.append(float(floats[f"e{i}"].rstrip("f")))
+        colors.append([float(c) for c in m.group(1).split(",")[:3]])
+        i += 1
+    if len(edges) < 2:
+        return None
+    # attribute and its normalization, from e.g. `lsp_nm/norm` with `float norm = 50000.0f`
+    m = re.search(r"(\w+)\s*/\s*(\w+|[\d.eE+f-]+)", shader)
+    if not m:
+        return None
+    attr, denom = m.group(1), m.group(2)
+    norm = float(floats.get(denom, denom).rstrip("f")) if denom else 1.0
+    return ShaderColormap(attr, norm, edges, colors)
 
 
 def _perp_frame(d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -79,10 +139,12 @@ def edges_to_tubes(verts: np.ndarray, edges: np.ndarray, radius: float,
 
 
 class SkeletonLoader:
-    def __init__(self, skeleton_url: str = "", radius_nm: float = DEFAULT_RADIUS_NM):
+    def __init__(self, skeleton_url: str = "", radius_nm: float = DEFAULT_RADIUS_NM,
+                 shader: str = ""):
         self.skeleton_url = (skeleton_url or "").rstrip("/")
         self.radius_nm = radius_nm
         self.parent, self.subdir = self.skeleton_url.rsplit("/", 1) if self.skeleton_url else ("", "")
+        self.colormap = parse_shader_colormap(shader)  # None if shader has no colormap
         self._cv = None
 
     @property
@@ -104,9 +166,28 @@ class SkeletonLoader:
             )
         return self._cv
 
+    def _edge_colors(self, skel, edges, seg_id, colorize) -> np.ndarray | None:
+        """Per-edge rgba (E,4 uint8). Uses the shader colormap on the skeleton's
+        scalar attribute when available (matching neuroglancer); otherwise the flat
+        per-segment color from `colorize`."""
+        cm = self.colormap
+        if cm is not None and hasattr(skel, cm.attr):
+            attr = np.asarray(getattr(skel, cm.attr), dtype=np.float64).reshape(-1)
+            ev = (attr[edges[:, 0]] + attr[edges[:, 1]]) * 0.5 / cm.norm  # per-edge, normalized
+            rgb = cm(ev)
+            rgba = np.empty((len(edges), 4), dtype=np.uint8)
+            rgba[:, :3] = np.clip(rgb * 255, 0, 255).astype(np.uint8)
+            rgba[:, 3] = 255
+            return rgba
+        if colorize is not None:
+            r, g, b = colorize(int(seg_id))
+            return np.tile((np.array([r, g, b, 1.0]) * 255).astype(np.uint8), (len(edges), 1))
+        return None
+
     def load_many(self, seg_ids, colorize=None, radius_nm: float | None = None) -> trimesh.Trimesh:
-        """One combined tube mesh for all `seg_ids`. `colorize(seg_id)->rgb` tints
-        each segment's tubes (neuroglancer-matched). Skips segments with no skeleton."""
+        """One combined tube mesh for all `seg_ids`. Colors each segment via the
+        shader colormap (per-vertex attribute) when the layer has one, else the flat
+        `colorize(seg_id)->rgb`. Skips segments with no skeleton."""
         seg_ids = list(seg_ids)
         if not seg_ids:
             raise ValueError("no segment ids")
@@ -122,10 +203,7 @@ class SkeletonLoader:
             edges = np.asarray(skel.edges, dtype=np.int64)
             if len(verts) == 0 or len(edges) == 0:
                 continue
-            rgba = None
-            if colorize is not None:
-                r, g, b = colorize(int(s))
-                rgba = np.tile((np.array([r, g, b, 1.0]) * 255).astype(np.uint8), (len(edges), 1))
+            rgba = self._edge_colors(skel, edges, s, colorize)
             tube = edges_to_tubes(verts, edges, radius, rgba=rgba)
             if tube is not None:
                 parts.append(tube)

@@ -154,7 +154,8 @@ class RenderWorker:
                 # skeleton-only layer -> sweep skeletons into tubes
                 from ..data.skeleton import SkeletonLoader
 
-                combined = SkeletonLoader(src.skeleton_url).load_many(ids, colorize=lc.rgb)
+                combined = SkeletonLoader(src.skeleton_url, shader=src.skeleton_shader).load_many(
+                    ids, colorize=lc.rgb)
             else:
                 combined = MeshLoader(src.mesh_url, src.label_zarr).load_many(
                     ids, colorize=lc.rgb,
