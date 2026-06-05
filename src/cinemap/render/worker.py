@@ -142,6 +142,7 @@ class RenderWorker:
             seed=getattr(m, "color_seed", 0),
             default=getattr(m, "default_color", None),
             overrides={int(k): v for k, v in (getattr(m, "segment_colors", {}) or {}).items()},
+            saturation=getattr(m, "saturation", 1.0),
         )
 
     def _mesh_obj(self, mesh_name, segment_ids, lc) -> str | None:

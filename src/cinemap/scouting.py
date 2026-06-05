@@ -120,7 +120,8 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
         fields = {"segment_ids": ids, "render_3d": has_mesh.get(name, True)}
         if lc is not None:
             fields.update(color_seed=lc.seed, default_color=lc.default,
-                          segment_colors={str(k): v for k, v in lc.overrides.items()})
+                          segment_colors={str(k): v for k, v in lc.overrides.items()},
+                          saturation=lc.saturation)
         if name in layers:
             fields.update(_colors.render3d_from_layer(layers[name]))  # Opacity/Silhouette (3d)
         meshes.append(MeshInstance(mesh_name=name, **fields))

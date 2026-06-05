@@ -41,6 +41,7 @@ class FrameMesh:
     color_seed: int = 0
     default_color: list[float] | None = None
     segment_colors: dict = field(default_factory=dict)
+    saturation: float = 1.0     # NG layer saturation (0 = grayscale)
     object_alpha: float = 1.0   # NG "Opacity (3d)"
     silhouette: float = 0.0     # NG "Silhouette (3d)"
 
@@ -105,7 +106,7 @@ def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
         name, ids = key[0], list(key[1])
         src = mb or ma  # color config from the target keyframe of the transition
         cc = dict(color_seed=src.color_seed, default_color=src.default_color,
-                  segment_colors=src.segment_colors)
+                  segment_colors=src.segment_colors, saturation=src.saturation)
         if ma and mb:
             op = (ma.opacity if ma.visible else 0.0) * (1 - t) + (mb.opacity if mb.visible else 0.0) * t
             oa = ma.object_alpha * (1 - t) + mb.object_alpha * t       # Opacity (3d) lerps

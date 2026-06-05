@@ -77,6 +77,7 @@ class MeshInstance(BaseModel):
     color_seed: int = 0
     default_color: Optional[list[float]] = None
     segment_colors: dict[str, list[float]] = Field(default_factory=dict)
+    saturation: float = 1.0     # NG layer saturation (0 = grayscale meshes)
     # neuroglancer 3D mesh render state (per keyframe -> can change frame to frame)
     object_alpha: float = 1.0   # NG "Opacity (3d)"  (objectAlpha)
     silhouette: float = 0.0     # NG "Silhouette (3d)" (meshSilhouetteRendering)
