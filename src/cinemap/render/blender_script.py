@@ -16,7 +16,7 @@ import json
 import sys
 
 import bpy
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 
 def _clear() -> None:
@@ -237,10 +237,20 @@ def _set_camera(frame: dict) -> None:
         cam.data.type = "PERSP"
         cam.data.angle_y = frame["camera"]["fov_rad"]
         cam.data.lens_unit = "FOV"
-    direction = Vector(frame["camera"]["look_at_bu"]) - cam.location
-    up = frame["camera"].get("up", [0, 0, 1])
-    cam.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
-    _ = up
+    # Orient from BOTH the look direction AND the camera up vector. Previously `up`
+    # was ignored and the camera just tracked world +Y, which dropped all camera roll
+    # and flipped the view vs neuroglancer. The up is negated because neuroglancer's
+    # 3D view is Y-DOWN (screen up = -Y in view space), so its baked up vector points
+    # opposite Blender's +Y-up camera; flipping it makes the render match neuroglancer
+    # (a 180deg roll, a proper rotation — no mirroring). Blender camera looks along -Z
+    # with +Y up, so we build the world rotation from right/up/back columns.
+    direction = (Vector(frame["camera"]["look_at_bu"]) - cam.location).normalized()
+    up = -Vector(frame["camera"].get("up", [0.0, 0.0, 1.0]))
+    z = -direction                                  # camera local +Z (points back)
+    y = up - up.dot(z) * z                           # up, orthogonalized to z
+    y = y.normalized() if y.length > 1e-9 else Vector((0.0, 0.0, 1.0))
+    x = y.cross(z)                                    # right (right-handed: x = y × z)
+    cam.rotation_euler = Matrix((x, y, z)).transposed().to_euler()
 
 
 def main(scene_path: str) -> None:
