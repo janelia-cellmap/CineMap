@@ -19,6 +19,11 @@ from scipy.spatial.transform import Rotation
 
 from ..models import Camera
 
+# neuroglancer's projectionScale maps to a visible extent ~this much smaller than
+# scale*voxel for our camera; calibrated by matching rendered framing to its
+# video_tool output (frame-0 content width matched exactly at 1.7).
+NG_SCALE_CAL = 1.7
+
 
 def _vox(voxel_nm):
     return np.array(voxel_nm, dtype=float)
@@ -37,7 +42,7 @@ def ng_to_camera(state: dict, voxel_nm, fov_deg: float = 40.0) -> Camera:
     fwd = rot.apply([0.0, 0.0, -1.0])
     up = rot.apply([0.0, -1.0, 0.0])
 
-    visible_nm = scale * float(np.mean(_vox(voxel_nm)))
+    visible_nm = scale * float(np.mean(_vox(voxel_nm))) / NG_SCALE_CAL
     dist = visible_nm / (2.0 * math.tan(math.radians(fov_deg) / 2.0))
     cam_pos = look_at - fwd * dist
     return Camera(position_nm=cam_pos.tolist(), look_at_nm=look_at.tolist(),
@@ -67,5 +72,5 @@ def camera_to_ng(camera: Camera, voxel_nm, base_state: dict | None = None) -> di
     state["projectionOrientation"] = [float(v) for v in q]
 
     visible_nm = 2.0 * dist * math.tan(math.radians(camera.fov_deg) / 2.0)
-    state["projectionScale"] = visible_nm / float(np.mean(_vox(voxel_nm)))
+    state["projectionScale"] = visible_nm * NG_SCALE_CAL / float(np.mean(_vox(voxel_nm)))
     return state
