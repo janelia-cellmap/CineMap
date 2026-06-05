@@ -70,8 +70,12 @@ def from_layer_dict(layer: dict) -> LayerColors:
 
 def render3d_from_layer(layer: dict) -> dict:
     """The neuroglancer 3D mesh render-tab settings from a layer JSON dict:
-    'Opacity (3d)' (objectAlpha) and 'Silhouette (3d)' (meshSilhouetteRendering)."""
+    'Opacity (3d)' (objectAlpha) and 'Silhouette (3d)' (meshSilhouetteRendering).
+    Note: objectAlpha=0 is how neuroglancer HIDES a layer, so we must NOT fold 0
+    into the default with `or` (0 is falsy) — only None falls back to the default."""
+    oa = layer.get("objectAlpha", 1.0)
+    sil = layer.get("meshSilhouetteRendering", 0.0)
     return {
-        "object_alpha": float(layer.get("objectAlpha", 1.0) or 1.0),
-        "silhouette": float(layer.get("meshSilhouetteRendering", 0.0) or 0.0),
+        "object_alpha": float(oa) if oa is not None else 1.0,
+        "silhouette": float(sil) if sil is not None else 0.0,
     }

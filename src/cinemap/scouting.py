@@ -212,9 +212,12 @@ def import_states(project: Project, links: list[tuple]) -> tuple[list[Keyframe],
         try:
             state = fetch_state(link)
             kf = bake_keyframe_from_state(project, state, label=label)
+            # match neuroglancer's video_tool: linear interpolation between states,
+            # and the script's number is the transition duration into this keyframe.
+            kf.easing = "linear"
             if duration is not None:
                 kf.duration_in_s = float(duration)
-                ops.store.save(project)
+            ops.store.save(project)
             created.append(kf)
         except Exception as e:  # noqa: BLE001
             errors.append(f"{label}: {e}")

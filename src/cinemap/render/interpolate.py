@@ -1,13 +1,18 @@
 """Interpolate a keyframe list into a flat list of per-frame scene states.
 
-Camera is stored as position + look_at (+ fov), so interpolation is a lerp of
-both points (no quaternion bookkeeping needed for v1). Slices are matched by
-(em_name, axis) and their position + opacity lerped; meshes matched by name and
-their opacity lerped. Easing is applied to the [0,1] transition parameter.
+Camera interpolation matches neuroglancer's video_tool exactly: the look-at center
+is interpolated linearly, the view ORIENTATION via spherical-linear interpolation
+(slerp), and the zoom (eye->center distance) exponentially. So an orbit/rotation
+(same center, changing orientation) actually arcs the camera around the target the
+way neuroglancer does, instead of cutting a straight chord. Slices/meshes/annotations
+are matched by identity and their opacity lerped.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+import numpy as np
+from scipy.spatial.transform import Rotation, Slerp
 
 from ..models import Keyframe
 
@@ -20,6 +25,38 @@ def _ease(t: float, mode: str) -> float:
 
 def _lerp(a, b, t):
     return [ai + (bi - ai) * t for ai, bi in zip(a, b)]
+
+
+def _cam_basis(cam):
+    """(center, world<-view Rotation, eye->center distance) for a Camera. The
+    rotation R maps view axes to world: forward = R@[0,0,-1], up = R@[0,1,0], the
+    inverse of neuroglancer's projectionOrientation convention (see ng_camera)."""
+    center = np.array(cam.look_at_nm, dtype=float)
+    eye = np.array(cam.position_nm, dtype=float)
+    d = center - eye
+    dist = float(np.linalg.norm(d)) or 1.0
+    fwd = d / dist
+    up = np.array(cam.up, dtype=float)
+    z = -fwd
+    y = up - np.dot(up, z) * z
+    n = np.linalg.norm(y)
+    y = y / n if n > 1e-9 else np.array([0.0, 1.0, 0.0])
+    x = np.cross(y, z)
+    return center, Rotation.from_matrix(np.column_stack([x, y, z])), dist
+
+
+def _interp_camera(a, b, t):
+    """Neuroglancer-style camera interpolation -> (position_nm, look_at_nm, up, fov)."""
+    ca, ra, da = _cam_basis(a)
+    cb, rb, db = _cam_basis(b)
+    center = ca + (cb - ca) * t
+    rot = Slerp([0.0, 1.0], Rotation.concatenate([ra, rb]))([t])[0]  # slerp orientation
+    dist = da * (db / da) ** t                                       # exponential zoom
+    fov = a.fov_deg + (b.fov_deg - a.fov_deg) * t
+    fwd = rot.apply([0.0, 0.0, -1.0])
+    up = rot.apply([0.0, 1.0, 0.0])
+    eye = center - fwd * dist
+    return eye.tolist(), center.tolist(), up.tolist(), fov
 
 
 @dataclass
@@ -71,12 +108,8 @@ class FrameState:
 
 
 def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
-    fs = FrameState(
-        position_nm=_lerp(a.camera.position_nm, b.camera.position_nm, t),
-        look_at_nm=_lerp(a.camera.look_at_nm, b.camera.look_at_nm, t),
-        fov_deg=a.camera.fov_deg + (b.camera.fov_deg - a.camera.fov_deg) * t,
-        up=a.camera.up,
-    )
+    pos, look_at, up, fov = _interp_camera(a.camera, b.camera, t)
+    fs = FrameState(position_nm=pos, look_at_nm=look_at, fov_deg=fov, up=up)
     # slices matched by (em_name, axis)
     a_sl = {(s.em_name, s.axis): s for s in a.slices}
     b_sl = {(s.em_name, s.axis): s for s in b.slices}
@@ -138,16 +171,19 @@ def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
 
 
 def build_frames(keyframes: list[Keyframe], fps: int) -> list[FrameState]:
-    """Flatten keyframes to per-frame states. One frame for a lone keyframe."""
+    """Flatten keyframes to per-frame states, matching neuroglancer's video_tool
+    exactly: for each transition i->i+1 emit round(duration*fps) frames at t = k/n
+    for k in [0, n) (so keyframe i is shown at the START of its outgoing transition),
+    then one final frame holding the last keyframe. `duration_in_s` is stored on the
+    DESTINATION keyframe (the transition into it). A duration of 0 emits no transition
+    frames (an instant cut)."""
     if not keyframes:
         return []
-    if len(keyframes) == 1:
-        return [_state_at(keyframes[0], keyframes[0], 0.0)]
-    frames: list[FrameState] = [_state_at(keyframes[0], keyframes[0], 0.0)]
-    for i in range(1, len(keyframes)):
-        a, b = keyframes[i - 1], keyframes[i]
-        n = max(1, int(round(b.duration_in_s * fps)))
-        for k in range(1, n + 1):
-            t = _ease(k / n, b.easing)
-            frames.append(_state_at(a, b, t))
+    frames: list[FrameState] = []
+    for i in range(len(keyframes) - 1):
+        a, b = keyframes[i], keyframes[i + 1]
+        n = 0 if b.duration_in_s <= 0 else max(1, int(round(b.duration_in_s * fps)))
+        for k in range(n):
+            frames.append(_state_at(a, b, _ease(k / n, b.easing)))
+    frames.append(_state_at(keyframes[-1], keyframes[-1], 0.0))  # final keyframe, 1 frame
     return frames
