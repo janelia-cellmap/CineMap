@@ -36,10 +36,11 @@ def ng_to_camera(state: dict, voxel_nm, fov_deg: float = 40.0) -> Camera:
     scale = float(state.get("projectionScale", 10000.0))
 
     rot = Rotation.from_quat(q)  # neuroglancer & scipy both use [x,y,z,w]
-    # neuroglancer maps view directions to world by `rot` directly (NOT its inverse),
-    # and its 3D view is Y-DOWN: screen up is -Y in view space. Camera looks along -Z.
-    # (Verified by matching rendered frames to neuroglancer's video_tool output.)
-    fwd = rot.apply([0.0, 0.0, -1.0])
+    # neuroglancer maps view directions to world by `rot` directly (NOT its inverse).
+    # Its 3D view is Y-DOWN (screen up = -Y) and the camera looks along +Z in view
+    # space (so depth ordering matches: closer objects sit in front). Verified by
+    # matching rendered frames — including depth — to neuroglancer's video_tool output.
+    fwd = rot.apply([0.0, 0.0, 1.0])
     up = rot.apply([0.0, -1.0, 0.0])
 
     visible_nm = scale * float(np.mean(_vox(voxel_nm))) / NG_SCALE_CAL
@@ -59,12 +60,12 @@ def camera_to_ng(camera: Camera, voxel_nm, base_state: dict | None = None) -> di
     fwd = fwd / dist
     up = np.array(camera.up, dtype=float)
 
-    # Inverse of ng_to_camera (which maps view->world by `rot` directly, Y-down):
-    # rot maps view +Z->-fwd, view +Y->-up, so its columns are [up×fwd, -up, -fwd].
+    # Inverse of ng_to_camera (which maps view->world by `rot` directly, Y-down,
+    # looking +Z): rot maps view +Z->fwd, view +Y->-up, columns are [(-up)×fwd, -up, fwd].
     up = up - np.dot(up, fwd) * fwd
     nu = np.linalg.norm(up)
     up = up / nu if nu > 1e-9 else np.array([0.0, -1.0, 0.0])
-    c2 = -fwd
+    c2 = fwd
     c1 = -up
     c0 = np.cross(c1, c2)
     rot = np.column_stack([c0, c1, c2])  # view->world rotation
