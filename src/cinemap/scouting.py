@@ -103,8 +103,19 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
     lcolors = current_layer_colors(project, st)
     # per-layer 3D render state (Opacity/Silhouette) from the serialized state
     layers = {l.get("name"): l for l in st.get("layers", [])}
+    vis = current_visible_segments(project)
+    # Resolve linkedSegmentationGroup: a visible segmentation layer with no segments
+    # of its own but linked to another layer shows that layer's segments (e.g.
+    # mito-objects-grouped, keyed by neuron id, linked to the neuron layer). Fetch
+    # the linked layer's segments for it so the linked meshes render too.
+    by_name = {m.name for m in project.manifest.meshes}
+    for name, ldict in layers.items():
+        link = ldict.get("linkedSegmentationGroup")
+        if (link and name in by_name and ldict.get("visible", True) is not False
+                and not vis.get(name) and vis.get(link)):
+            vis[name] = list(vis[link])
     meshes: list[MeshInstance] = []
-    for name, ids in current_visible_segments(project).items():
+    for name, ids in vis.items():
         lc = lcolors.get(name)
         fields = {"segment_ids": ids, "render_3d": has_mesh.get(name, True)}
         if lc is not None:
