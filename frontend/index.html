@@ -183,12 +183,19 @@ async function importProject(e) {
 async function importStates(e) {
   const file = e.target.files[0];
   if (!file) { return; }
-  if (!PID) { setStatus('open or create a project first'); e.target.value = ''; return; }
   setStatus('importing states…');
   try {
     const text = await file.text();
-    const r = await api('POST', `/api/projects/${PID}/keyframes/import_states`, { text });
-    await reload();
+    let r;
+    if (!PID) {
+      // no project open -> create one from the first state in the script
+      r = await api('POST', '/api/projects/import_states', { text, name: file.name.replace(/\.[^.]+$/, '') });
+      PID = r.project.id; await refreshProjects(); $('projectSel').value = PID;
+      await loadNg(); renderKeyframes(r.project);
+    } else {
+      r = await api('POST', `/api/projects/${PID}/keyframes/import_states`, { text });
+      await reload();
+    }
     let msg = `imported ${r.count} keyframe${r.count === 1 ? '' : 's'}`;
     if (r.errors && r.errors.length) { msg += ` (${r.errors.length} skipped)`; }
     setStatus(msg);

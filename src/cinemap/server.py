@@ -207,11 +207,31 @@ def bake(pid: str):
     return kf.model_dump()
 
 
+@app.post("/api/projects/import_states")
+def import_states_new_project(body: dict):
+    """Create a project from an uploaded states list and bake a keyframe per state.
+    The project's dataset is taken from the FIRST state, so meshes/segments resolve
+    against the same data the states use (no project needs to exist first)."""
+    from .data.manifest import parse_state_links
+
+    links = parse_state_links(body.get("text", ""))
+    if not links:
+        raise HTTPException(400, "no states found in the uploaded file")
+    try:
+        project = ops.create_project(body.get("name") or "imported states", links[0][1])
+        scouting.load_dataset(links[0][1])
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"could not analyze the first state: {e}") from e
+    created, errors = scouting.import_states(project, links)
+    return {"project": _light_project(store.load(project.id)),
+            "count": len(created), "errors": errors}
+
+
 @app.post("/api/projects/{pid}/keyframes/import_states")
 def import_states(pid: str, body: dict):
     """Bake a keyframe per state in an uploaded list. `body.text` is the raw file
-    content: one neuroglancer state link per line, or a CSV with a state column
-    (and optional label). Each becomes a keyframe just like a hand-baked view."""
+    content: one neuroglancer state link per line, a neuroglancer video_tool script,
+    or a CSV with a state column. Each becomes a keyframe just like a hand-baked view."""
     from .data.manifest import parse_state_links
 
     p = store.load(pid)
