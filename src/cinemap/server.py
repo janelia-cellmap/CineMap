@@ -74,6 +74,7 @@ class RenderReq(BaseModel):
     kf_range: list[int] | None = None
     export_blend: bool = False  # produce a self-contained .blend instead of a video
     draft: bool = False         # fast low-res preview (coarse EM + low-voxel meshes)
+    mesh_detail: float = 1.0    # per-layer vertex-budget multiplier (hard-capped)
 
 
 class ChatReq(BaseModel):
@@ -416,7 +417,8 @@ def _evict_finished_states(keep: int = 200) -> None:
 @app.post("/api/projects/{pid}/render")
 def render(pid: str, req: RenderReq):
     settings = RenderSettings(width=req.width, height=req.height, fps=req.fps,
-                              samples=req.samples, export_blend=req.export_blend, draft=req.draft)
+                              samples=req.samples, export_blend=req.export_blend, draft=req.draft,
+                              mesh_detail=req.mesh_detail)
     return {"job_id": _start_render(pid, settings, kf_range=req.kf_range)}
 
 
