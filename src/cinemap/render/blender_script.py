@@ -116,20 +116,19 @@ def _import_meshes(scene_spec: dict) -> dict:
         if "Emission Strength" in bsdf.inputs:
             bsdf.inputs["Emission Strength"].default_value = 0.15
 
-        # neuroglancer 3D render state: Alpha = object_alpha * (1 - facing)^silhouette.
-        # facing=1 head-on, 0 at grazing -> with silhouette>0 the head-on faces go
-        # transparent and only the rim/silhouette stays (NG's meshSilhouetteRendering);
-        # silhouette=0 -> (…)^0 = 1 -> plain object_alpha everywhere. Driven per frame
-        # by the cm_alpha / cm_silh value nodes.
+        # neuroglancer 3D render state: Alpha = object_alpha * facing^silhouette, where
+        # `facing` is Blender's LayerWeight Facing output = 0 head-on, 1 at grazing
+        # (== neuroglancer's 1 - |normal·view|). So with silhouette>0 the head-on faces
+        # go transparent and only the rim stays opaque (NG's meshSilhouetteRendering, a
+        # glassy shell); silhouette=0 -> facing^0 = 1 -> plain object_alpha everywhere.
+        # Driven per frame by the cm_alpha / cm_silh value nodes.
         lw = nt.nodes.new("ShaderNodeLayerWeight")
-        sub = nt.nodes.new("ShaderNodeMath"); sub.operation = "SUBTRACT"; sub.inputs[0].default_value = 1.0
         powr = nt.nodes.new("ShaderNodeMath"); powr.operation = "POWER"
         mul = nt.nodes.new("ShaderNodeMath"); mul.operation = "MULTIPLY"; mul.use_clamp = True
         alpha_v = nt.nodes.new("ShaderNodeValue"); alpha_v.name = "cm_alpha"; alpha_v.outputs[0].default_value = 1.0
         silh_v = nt.nodes.new("ShaderNodeValue"); silh_v.name = "cm_silh"; silh_v.outputs[0].default_value = 0.0
-        nt.links.new(lw.outputs["Facing"], sub.inputs[1])
-        nt.links.new(sub.outputs[0], powr.inputs[0])
-        nt.links.new(silh_v.outputs[0], powr.inputs[1])
+        nt.links.new(lw.outputs["Facing"], powr.inputs[0])   # base = facing (0 head-on, 1 grazing)
+        nt.links.new(silh_v.outputs[0], powr.inputs[1])      # exponent = silhouette power
         nt.links.new(alpha_v.outputs[0], mul.inputs[0])
         nt.links.new(powr.outputs[0], mul.inputs[1])
         if "Alpha" in bsdf.inputs:
