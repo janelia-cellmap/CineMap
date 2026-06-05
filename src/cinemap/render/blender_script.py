@@ -235,8 +235,14 @@ def _set_camera(frame: dict) -> None:
         cam.data.ortho_scale = frame["camera"].get("ortho_scale", 4.0)
     else:
         cam.data.type = "PERSP"
-        cam.data.angle_y = frame["camera"]["fov_rad"]
+        # Pin the FOV to the VERTICAL axis so the vertical framing is constant across
+        # aspect ratios. With Blender's default AUTO sensor fit, a wide (16:9) frame
+        # applies the FOV to the horizontal axis, shrinking the vertical FOV and
+        # cropping tall content top/bottom. The zoom is calibrated on vertical extent,
+        # so vertical fit keeps the framing right (a wider frame just shows more sides).
+        cam.data.sensor_fit = "VERTICAL"
         cam.data.lens_unit = "FOV"
+        cam.data.angle = frame["camera"]["fov_rad"]  # FOV on the fit (vertical) axis
     # Orient from BOTH the look direction AND the camera up vector. Previously `up`
     # was ignored and the camera just tracked world +Y, which dropped all camera roll
     # and oriented the scene inconsistently with neuroglancer. The up vector is already

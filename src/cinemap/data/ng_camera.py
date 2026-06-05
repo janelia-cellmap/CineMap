@@ -19,10 +19,11 @@ from scipy.spatial.transform import Rotation
 
 from ..models import Camera
 
-# neuroglancer's projectionScale maps to a visible extent ~this much smaller than
+# neuroglancer's projectionScale maps to a visible extent this much smaller than
 # scale*voxel for our camera; calibrated by matching rendered framing to its
-# video_tool output (frame-0 content width matched exactly at 1.7).
-NG_SCALE_CAL = 1.7
+# video_tool output (frame-0 content fraction). The camera uses VERTICAL sensor fit
+# so framing is aspect-independent (no top/bottom cropping on wide frames).
+NG_SCALE_CAL = 1.05
 
 
 def _vox(voxel_nm):
