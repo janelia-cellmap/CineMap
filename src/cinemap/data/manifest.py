@@ -67,19 +67,24 @@ def fetch_state(url: str) -> dict:
         return json.load(r)
 
 
-def parse_state_links(text: str) -> list[tuple[str, str]]:
-    """Parse a pasted/uploaded list of neuroglancer states into [(label, link)].
+def parse_state_links(text: str) -> list[tuple[str, str, float | None]]:
+    """Parse a pasted/uploaded list of neuroglancer states into
+    [(label, link, duration_s|None)].
 
-    Accepts either form (whichever the user has on hand):
+    Accepts whichever form the user has on hand:
       - one state per line (the robust default — neuroglancer links are full of
         commas, so we never split a bare line on commas)
+      - a neuroglancer `video_tool` keypoint script: `#` comment lines are skipped
+        (a comment right before a state becomes that keyframe's label), and a line
+        that is just a number is the transition DURATION (seconds) into the next
+        state — exactly the format `python -m neuroglancer.tool.video_tool` consumes
       - a CSV *with a header* naming a state column (state/url/link/ngl) and an
-        optional label column (label/name/title); links with commas must then be
-        quoted, as any spreadsheet export does.
+        optional label column (label/name/title); commas in links must be quoted.
     Lines that are blank or a lone header word are skipped.
     """
     import csv
     import io
+    import re
 
     text = (text or "").strip()
     if not text:
@@ -90,7 +95,7 @@ def parse_state_links(text: str) -> list[tuple[str, str]]:
     label_keys = ("label", "name", "title")
     is_csv_header = "," in header and any(k in header for k in state_keys)
 
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, float | None]] = []
     if is_csv_header:
         reader = csv.DictReader(io.StringIO(text))
         fields = reader.fieldnames or []
@@ -101,13 +106,26 @@ def parse_state_links(text: str) -> list[tuple[str, str]]:
             if not link:
                 continue
             label = (row.get(lcol) or "").strip() if lcol else ""
-            out.append((label or f"state {i + 1}", link))
+            out.append((label or f"state {i + 1}", link, None))
     else:
+        last_comment: str | None = None
+        pending_duration: float | None = None
         for line in lines:
-            s = line.strip().strip('"').strip("'")
-            if not s or s.lower() in (*state_keys, "states"):
+            s = line.strip()
+            if not s:
                 continue
-            out.append((f"state {len(out) + 1}", s))
+            if s.startswith("#"):  # comment -> potential label for the next state
+                last_comment = s.lstrip("#").strip() or last_comment
+                continue
+            if re.fullmatch(r"[+-]?\d+(\.\d+)?", s):  # bare number -> transition duration
+                pending_duration = float(s)
+                continue
+            s = s.strip('"').strip("'")
+            if s.lower() in (*state_keys, "states"):
+                continue
+            out.append((last_comment or f"state {len(out) + 1}", s, pending_duration))
+            last_comment = None
+            pending_duration = None
     return out
 
 

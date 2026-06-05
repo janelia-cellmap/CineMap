@@ -185,17 +185,25 @@ def bake_keyframe_from_state(project: Project, state: dict, label: str = "import
     return bake_keyframe(project, label=label)
 
 
-def import_states(project: Project, links: list[tuple[str, str]]) -> tuple[list[Keyframe], list[str]]:
-    """Bake one keyframe per (label, state-link). Returns (keyframes, errors);
-    a link that fails to fetch/parse is reported and skipped, not fatal."""
+def import_states(project: Project, links: list[tuple]) -> tuple[list[Keyframe], list[str]]:
+    """Bake one keyframe per (label, state-link[, duration]). A per-entry duration
+    (from a neuroglancer video_tool script) sets the transition INTO that keyframe.
+    Returns (keyframes, errors); a link that fails to fetch/parse is reported and
+    skipped, not fatal."""
     from .data.manifest import fetch_state
 
     created: list[Keyframe] = []
     errors: list[str] = []
-    for label, link in links:
+    for entry in links:
+        label, link = entry[0], entry[1]
+        duration = entry[2] if len(entry) > 2 else None
         try:
             state = fetch_state(link)
-            created.append(bake_keyframe_from_state(project, state, label=label))
+            kf = bake_keyframe_from_state(project, state, label=label)
+            if duration is not None:
+                kf.duration_in_s = float(duration)
+                ops.store.save(project)
+            created.append(kf)
         except Exception as e:  # noqa: BLE001
             errors.append(f"{label}: {e}")
     return created, errors
