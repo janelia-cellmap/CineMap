@@ -31,9 +31,11 @@ def ng_to_camera(state: dict, voxel_nm, fov_deg: float = 40.0) -> Camera:
     scale = float(state.get("projectionScale", 10000.0))
 
     rot = Rotation.from_quat(q)  # neuroglancer & scipy both use [x,y,z,w]
-    # neuroglancer view space: camera looks along -Z, up is +Y. World directions:
-    fwd = rot.apply([0.0, 0.0, -1.0], inverse=True)
-    up = rot.apply([0.0, 1.0, 0.0], inverse=True)
+    # neuroglancer maps view directions to world by `rot` directly (NOT its inverse),
+    # and its 3D view is Y-DOWN: screen up is -Y in view space. Camera looks along -Z.
+    # (Verified by matching rendered frames to neuroglancer's video_tool output.)
+    fwd = rot.apply([0.0, 0.0, -1.0])
+    up = rot.apply([0.0, -1.0, 0.0])
 
     visible_nm = scale * float(np.mean(_vox(voxel_nm)))
     dist = visible_nm / (2.0 * math.tan(math.radians(fov_deg) / 2.0))
@@ -52,14 +54,16 @@ def camera_to_ng(camera: Camera, voxel_nm, base_state: dict | None = None) -> di
     fwd = fwd / dist
     up = np.array(camera.up, dtype=float)
 
-    # build the view frame (inverse of ng_to_camera): view -Z = fwd, view +Y = up
-    z = -fwd
-    y = up - np.dot(up, z) * z
-    ny = np.linalg.norm(y)
-    y = y / ny if ny > 1e-9 else np.array([0.0, 1.0, 0.0])
-    x = np.cross(y, z)
-    world_from_view = np.column_stack([x, y, z])
-    q = Rotation.from_matrix(world_from_view.T).as_quat()  # view-from-world
+    # Inverse of ng_to_camera (which maps view->world by `rot` directly, Y-down):
+    # rot maps view +Z->-fwd, view +Y->-up, so its columns are [up×fwd, -up, -fwd].
+    up = up - np.dot(up, fwd) * fwd
+    nu = np.linalg.norm(up)
+    up = up / nu if nu > 1e-9 else np.array([0.0, -1.0, 0.0])
+    c2 = -fwd
+    c1 = -up
+    c0 = np.cross(c1, c2)
+    rot = np.column_stack([c0, c1, c2])  # view->world rotation
+    q = Rotation.from_matrix(rot).as_quat()
     state["projectionOrientation"] = [float(v) for v in q]
 
     visible_nm = 2.0 * dist * math.tan(math.radians(camera.fov_deg) / 2.0)

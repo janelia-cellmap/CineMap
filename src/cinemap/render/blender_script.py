@@ -239,13 +239,12 @@ def _set_camera(frame: dict) -> None:
         cam.data.lens_unit = "FOV"
     # Orient from BOTH the look direction AND the camera up vector. Previously `up`
     # was ignored and the camera just tracked world +Y, which dropped all camera roll
-    # and flipped the view vs neuroglancer. The up is negated because neuroglancer's
-    # 3D view is Y-DOWN (screen up = -Y in view space), so its baked up vector points
-    # opposite Blender's +Y-up camera; flipping it makes the render match neuroglancer
-    # (a 180deg roll, a proper rotation — no mirroring). Blender camera looks along -Z
-    # with +Y up, so we build the world rotation from right/up/back columns.
+    # and oriented the scene inconsistently with neuroglancer. The up vector is already
+    # in the correct (neuroglancer Y-down) convention from ng_to_camera, so we use it
+    # directly. Blender camera looks along -Z with +Y up, so we build the world
+    # rotation from right/up/back columns.
     direction = (Vector(frame["camera"]["look_at_bu"]) - cam.location).normalized()
-    up = -Vector(frame["camera"].get("up", [0.0, 0.0, 1.0]))
+    up = Vector(frame["camera"].get("up", [0.0, 0.0, 1.0]))
     z = -direction                                  # camera local +Z (points back)
     y = up - up.dot(z) * z                           # up, orthogonalized to z
     y = y.normalized() if y.length > 1e-9 else Vector((0.0, 0.0, 1.0))
