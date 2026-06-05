@@ -147,8 +147,15 @@ def analyze_state(url: str) -> Manifest:
                 em = EMSource(name=name, zarr_url=vol, voxel_size_nm=voxel_nm)
         elif ltype == "segmentation":
             mesh_url = next((u for u, _, role in srcs if role == "mesh"), None)
-            label_zarr = next((u for u, _, role in srcs if role == "volume"), None)
             skel_url = next((u for u, _, role in srcs if role == "skeleton"), None)
+            # a "volume" source is either an OME-Zarr label volume (zarr/n5 -> sliced +
+            # marching cubes) or a precomputed segmentation that carries its own meshes
+            # (e.g. flyem hemibrain -> meshes read directly by cloud-volume).
+            vol_url, vol_fmt = next(((u, f) for u, f, role in srcs if role == "volume"),
+                                    (None, None))
+            label_zarr = vol_url if vol_fmt in (None, "zarr", "zarr2", "n5") else None
+            if vol_fmt == "precomputed" and not mesh_url:
+                mesh_url = vol_url
             if mesh_url or label_zarr or skel_url:
                 seg_ids = [int(s) for s in (layer.get("segments") or []) if str(s).isdigit()]
                 shader = (layer.get("skeletonRendering") or {}).get("shader", "") if skel_url else ""

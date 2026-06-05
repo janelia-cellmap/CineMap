@@ -38,20 +38,37 @@ class MeshLoader:
     @property
     def cv(self) -> CloudVolume:
         if self._cv is None:
-            info = {
-                "@type": "neuroglancer_multiscale_volume",
-                "type": "segmentation",
-                "data_type": "uint64",
-                "num_channels": 1,
-                "mesh": self.subdir,
-                "scales": [{
-                    "key": "s0", "size": [1, 1, 1], "resolution": [8, 8, 8],
-                    "chunk_sizes": [[64, 64, 64]], "encoding": "raw", "voxel_offset": [0, 0, 0],
-                }],
-            }
-            self._cv = CloudVolume(
-                f"precomputed://{self.parent}", info=info, use_https=True, progress=False
-            )
+            # Two source shapes both expose meshes:
+            #  - a precomputed *segmentation* volume whose own info has `scales` and a
+            #    `mesh` key (e.g. flyem hemibrain `.../segmentation`) -> read directly.
+            #  - a bare neuroglancer *mesh* dir (mesh info, no scales; e.g. cellmap
+            #    `.../mesh/.../nuc/`) -> point at the parent with a fabricated volume
+            #    info that names this subdir as `mesh`.
+            # CloudVolume reads gs://, s3://, https:// info itself; opening a bare mesh
+            # dir as a volume raises (no `scales`), which sends us to the fabricate path.
+            try:
+                direct = CloudVolume(
+                    f"precomputed://{self.mesh_url}", use_https=True, progress=False
+                )
+                if "scales" in direct.info and direct.info.get("mesh"):
+                    self._cv = direct
+            except Exception:  # noqa: BLE001
+                pass
+            if self._cv is None:
+                info = {
+                    "@type": "neuroglancer_multiscale_volume",
+                    "type": "segmentation",
+                    "data_type": "uint64",
+                    "num_channels": 1,
+                    "mesh": self.subdir,
+                    "scales": [{
+                        "key": "s0", "size": [1, 1, 1], "resolution": [8, 8, 8],
+                        "chunk_sizes": [[64, 64, 64]], "encoding": "raw", "voxel_offset": [0, 0, 0],
+                    }],
+                }
+                self._cv = CloudVolume(
+                    f"precomputed://{self.parent}", info=info, use_https=True, progress=False
+                )
         return self._cv
 
     @lru_cache(maxsize=1)
@@ -80,7 +97,14 @@ class MeshLoader:
             bbox = self._draco(seg_id).bounds if self.mesh_url else self._label_bbox(seg_id)
             return generate(self.label_zarr, seg_id, (tuple(bbox[0]), tuple(bbox[1])),
                             target_voxels=target_voxels, colorize=colorize)
-        return self._draco(seg_id)
+        # No label volume: the precomputed draco mesh is the geometry. Tint it with
+        # the segment's neuroglancer color (the union path colors the same way).
+        mesh = self._draco(seg_id)
+        if colorize is not None:
+            r, g, b = colorize(int(seg_id))
+            rgba = (np.array([r, g, b, 1.0]) * 255).astype(np.uint8)
+            mesh.visual.vertex_colors = np.tile(rgba, (len(mesh.vertices), 1))
+        return mesh
 
     def _label_union_fits(self, target_voxels: int) -> bool:
         """True if the label volume has a whole-volume multiscale level small
