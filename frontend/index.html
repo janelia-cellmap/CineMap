@@ -81,6 +81,8 @@
       <button class="accent" onclick="bake()">★ Bake keyframe</button>
       <button onclick="updateFrame()" title="overwrite the selected keyframe with the current Neuroglancer view (camera + layers + segments)">⟳ Update current frame</button>
       <button onclick="addKeyframe()">+ Duplicate last</button>
+      <button onclick="document.getElementById('statesFile').click()" title="upload a list of neuroglancer states (one link per line, or a CSV with a state column) — each becomes a keyframe">⭱ Import states</button>
+      <input type="file" id="statesFile" accept=".csv,.txt,text/csv,text/plain" style="display:none" onchange="importStates(event)" />
     </div>
     <div id="ngWrap"><iframe id="ng"></iframe></div>
   </div>
@@ -94,6 +96,7 @@
       <label>h</label><input id="h" value="720" />
       <label>fps</label><input id="fps" value="30" />
       <label>samples</label><input id="samples" value="48" />
+      <label title="mesh detail multiplier (1 = default ~5M verts/layer). Higher = crisper but more GPU memory; auto-retries lower if it runs out.">detail</label><input id="detail" value="1" style="width:44px" />
       <button id="previewBtn" onclick="startRender('preview')">▷ Preview</button>
       <label title="preview renders at fps ÷ this">1/</label><input id="ratio" value="10" style="width:44px" />
       <button id="cancelBtn" onclick="cancelRender()" style="display:none;background:#7d2e2e;border-color:transparent;color:#fff">■ Cancel</button>
@@ -175,6 +178,29 @@ async function importProject(e) {
     await loadNg(); renderKeyframes(p);
     setStatus('imported: ' + (p.name || p.id));
   } catch (err) { setStatus('import failed: ' + err.message); }
+  e.target.value = '';
+}
+
+async function importStates(e) {
+  const file = e.target.files[0];
+  if (!file) { return; }
+  setStatus('importing states…');
+  try {
+    const text = await file.text();
+    let r;
+    if (!PID) {
+      // no project open -> create one from the first state in the script
+      r = await api('POST', '/api/projects/import_states', { text, name: file.name.replace(/\.[^.]+$/, '') });
+      PID = r.project.id; await refreshProjects(); $('projectSel').value = PID;
+      await loadNg(); renderKeyframes(r.project);
+    } else {
+      r = await api('POST', `/api/projects/${PID}/keyframes/import_states`, { text });
+      await reload();
+    }
+    let msg = `imported ${r.count} keyframe${r.count === 1 ? '' : 's'}`;
+    if (r.errors && r.errors.length) { msg += ` (${r.errors.length} skipped)`; }
+    setStatus(msg);
+  } catch (err) { setStatus('import states failed: ' + err.message); }
   e.target.value = '';
 }
 
@@ -355,7 +381,7 @@ async function startRender(mode) {
   // Preview is a fast, low-res look (coarse EM + low-voxel meshes); Export/blend
   // use full resolution for the final output.
   const body = { width:+$('w').value, height:+$('h').value, fps, samples:+$('samples').value,
-                 draft: mode === 'preview' };
+                 draft: mode === 'preview', mesh_detail: +$('detail').value || 1 };
   if (mode === 'blend') body.export_blend = true;   // bake an animated .blend, no video
   let job_id;
   try { ({ job_id } = await api('POST', `/api/projects/${PID}/render`, body)); }

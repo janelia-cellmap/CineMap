@@ -26,21 +26,30 @@ class LayerColors:
     seed: int = 0
     default: list[float] | None = None          # segmentDefaultColor (rgb 0-1) or None
     overrides: dict[int, list[float]] = field(default_factory=dict)  # segmentColors
+    saturation: float = 1.0                     # layer `saturation` (0 = grayscale)
+
+    def _desaturate(self, r, g, b) -> tuple[float, float, float]:
+        if self.saturation >= 0.999:
+            return (r, g, b)
+        # neuroglancer mixes the color toward its luminance by (1 - saturation)
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        s = self.saturation
+        return (lum + (r - lum) * s, lum + (g - lum) * s, lum + (b - lum) * s)
 
     def rgb(self, seg_id: int) -> tuple[float, float, float]:
         sid = int(seg_id)
         if sid in self.overrides:
             r, g, b = self.overrides[sid]
-            return (r, g, b)
-        if self.default is not None:
+        elif self.default is not None:
             r, g, b = self.default
-            return (r, g, b)
-        # neuroglancer's exact hash coloring for (colorSeed, segment id)
-        return tuple(hex_to_rgb(_ngsc.hex_string_from_segment_id(self.seed, sid)))
+        else:  # neuroglancer's exact hash coloring for (colorSeed, segment id)
+            r, g, b = hex_to_rgb(_ngsc.hex_string_from_segment_id(self.seed, sid))
+        return self._desaturate(r, g, b)
 
     def cache_key(self):
         return (self.seed, tuple(self.default) if self.default else None,
-                tuple(sorted((k, tuple(v)) for k, v in self.overrides.items())))
+                tuple(sorted((k, tuple(v)) for k, v in self.overrides.items())),
+                round(self.saturation, 3))
 
 
 def from_layer_dict(layer: dict) -> LayerColors:
@@ -54,13 +63,19 @@ def from_layer_dict(layer: dict) -> LayerColors:
             overrides[int(k)] = hex_to_rgb(v) if isinstance(v, str) else list(v)
         except Exception:  # noqa: BLE001
             pass
-    return LayerColors(seed=seed, default=default, overrides=overrides)
+    sat = layer.get("saturation", 1.0)
+    saturation = float(sat) if sat is not None else 1.0
+    return LayerColors(seed=seed, default=default, overrides=overrides, saturation=saturation)
 
 
 def render3d_from_layer(layer: dict) -> dict:
     """The neuroglancer 3D mesh render-tab settings from a layer JSON dict:
-    'Opacity (3d)' (objectAlpha) and 'Silhouette (3d)' (meshSilhouetteRendering)."""
+    'Opacity (3d)' (objectAlpha) and 'Silhouette (3d)' (meshSilhouetteRendering).
+    Note: objectAlpha=0 is how neuroglancer HIDES a layer, so we must NOT fold 0
+    into the default with `or` (0 is falsy) — only None falls back to the default."""
+    oa = layer.get("objectAlpha", 1.0)
+    sil = layer.get("meshSilhouetteRendering", 0.0)
     return {
-        "object_alpha": float(layer.get("objectAlpha", 1.0) or 1.0),
-        "silhouette": float(layer.get("meshSilhouetteRendering", 0.0) or 0.0),
+        "object_alpha": float(oa) if oa is not None else 1.0,
+        "silhouette": float(sil) if sil is not None else 0.0,
     }

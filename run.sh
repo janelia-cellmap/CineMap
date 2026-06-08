@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-ENV=mv_env
+ENV="${CINEMAP_ENV:-cinemap}"
 HOST="${CINEMAP_HOST:-0.0.0.0}"          # uvicorn bind (0.0.0.0 = all interfaces)
 PORT="${CINEMAP_PORT:-8000}"
 

@@ -21,6 +21,8 @@ class MeshSource(BaseModel):
     name: str
     mesh_url: str = ""  # multilod-draco mesh dir + segment_properties (for ids/bbox)
     label_zarr: str = ""  # OME-Zarr label volume — preferred geometry via marching cubes
+    skeleton_url: str = ""  # precomputed neuroglancer_skeletons dir (rendered as tubes)
+    skeleton_shader: str = ""  # NG skeletonRendering.shader -> matched colormap on tubes
     segment_ids: list[int] = Field(default_factory=list)
 
 
@@ -75,9 +77,27 @@ class MeshInstance(BaseModel):
     color_seed: int = 0
     default_color: Optional[list[float]] = None
     segment_colors: dict[str, list[float]] = Field(default_factory=dict)
+    saturation: float = 1.0     # NG layer saturation (0 = grayscale meshes)
     # neuroglancer 3D mesh render state (per keyframe -> can change frame to frame)
     object_alpha: float = 1.0   # NG "Opacity (3d)"  (objectAlpha)
     silhouette: float = 0.0     # NG "Silhouette (3d)" (meshSilhouetteRendering)
+
+
+class AnnotationInstance(BaseModel):
+    """A neuroglancer annotation layer captured for a keyframe. Geometry is stored
+    normalized in nm (x/y/z) so the render path is source-agnostic (inline now;
+    precomputed later)."""
+
+    name: str
+    color: list[float] = Field(default_factory=lambda: [1.0, 0.95, 0.30])
+    visible: bool = True
+    opacity: float = 1.0
+    points: list[list[float]] = Field(default_factory=list)         # [[x,y,z], ...]
+    lines: list[list[list[float]]] = Field(default_factory=list)    # [[[x,y,z],[x,y,z]], ...]
+    boxes: list[list[list[float]]] = Field(default_factory=list)    # [[[lo],[hi]], ...]
+    ellipsoids: list[dict] = Field(default_factory=list)            # [{center, radii}, ...]
+    point_radius_nm: float = 80.0
+    line_radius_nm: float = 40.0
 
 
 class Lighting(BaseModel):
@@ -91,6 +111,7 @@ class Keyframe(BaseModel):
     camera: Camera
     slices: list[SlicePlane] = Field(default_factory=list)
     meshes: list[MeshInstance] = Field(default_factory=list)
+    annotations: list[AnnotationInstance] = Field(default_factory=list)
     lighting: Lighting = Field(default_factory=Lighting)
     duration_in_s: float = 2.0  # transition duration INTO this keyframe
     easing: Literal["linear", "ease-in-out"] = "ease-in-out"
@@ -110,6 +131,14 @@ class RenderSettings(BaseModel):
     # draft = fast preview/thumbnail quality: coarse EM slice level + low-voxel
     # meshes (see RenderWorker). Off = full resolution for the final video.
     draft: bool = False
+    # By default a layer's precomputed meshes are downloaded (fast, LOD-adaptive,
+    # matches neuroglancer). Set this to instead regenerate watertight meshes from
+    # the OME-Zarr label volume via marching cubes when one is available.
+    mesh_from_labels: bool = False
+    # Mesh detail multiplier on the per-layer vertex budget (1.0 = default 5M full /
+    # 1.2M draft). Higher = crisper meshes but more VRAM; the worker hard-caps the
+    # budget and auto-retries at lower detail if the GPU runs out of memory.
+    mesh_detail: float = 1.0
 
 
 class RenderJob(BaseModel):

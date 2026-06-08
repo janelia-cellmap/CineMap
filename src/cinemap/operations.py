@@ -6,7 +6,9 @@ edits compose on one project.json (the single source of truth).
 """
 from __future__ import annotations
 
+import datetime
 import math
+import re
 import uuid
 
 from . import store
@@ -25,6 +27,43 @@ from .models import (
 
 def _uid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+
+def _slug(text: str, maxlen: int = 40) -> str:
+    """A filesystem/URL-safe lowercase slug (used to name project dirs readably)."""
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return s[:maxlen].strip("-") or "untitled"
+
+
+def _stamp() -> str:
+    return f"{datetime.datetime.now():%Y%m%d-%H%M%S}"
+
+
+def _disambiguate(base: str, taken) -> str:
+    """`base`, else `base-2`, `base-3`, … — the first name `taken(name)` rejects.
+    Keeps dir names clean (datetime only); a numeric suffix appears solely when two
+    are created in the same second."""
+    if not taken(base):
+        return base
+    n = 2
+    while taken(f"{base}-{n}"):
+        n += 1
+    return f"{base}-{n}"
+
+
+def project_id(name: str) -> str:
+    """`<name-slug>` — the project is the stable named dir; its movies are the
+    datetime-stamped subdirs under it (see `render_id`)."""
+    return _disambiguate(_slug(name), store.exists)
+
+
+def render_id(project: Project, prefix: str = "") -> str:
+    """A movie's dir under `<project>/renders/`: `<YYYYmmdd-HHMMSS>` (or
+    `<prefix>-<YYYYmmdd-HHMMSS>`, e.g. `thumb-…`), so renders sort chronologically."""
+    rdir = store.project_dir(project.id) / "renders"
+    taken = {j.id for j in project.renders}
+    base = f"{prefix}-{_stamp()}" if prefix else _stamp()
+    return _disambiguate(base, lambda i: i in taken or (rdir / i).exists())
 
 
 # ----------------------------- analysis / framing helpers -----------------------------
@@ -82,7 +121,7 @@ def create_project(name: str, data_path: str) -> Project:
     layers are captured happen at bake time from the live neuroglancer state, so
     there's no need (and no expensive whole-volume read) at creation."""
     manifest = analyze_state(data_path)
-    project = Project(id=_uid("proj"), name=name, data_path=data_path, manifest=manifest)
+    project = Project(id=project_id(name), name=name, data_path=data_path, manifest=manifest)
     store.save(project)
     return project
 
@@ -192,7 +231,7 @@ def sweep_slice(project: Project, axis: str = "z", n: int = 12,
 # ----------------------------- render -----------------------------
 def create_render_job(project: Project, settings: RenderSettings | None = None,
                       kf_range=None) -> RenderJob:
-    job = RenderJob(id=_uid("job"), kf_range=kf_range, settings=settings or RenderSettings())
+    job = RenderJob(id=render_id(project), kf_range=kf_range, settings=settings or RenderSettings())
     project.renders.append(job)
     store.save(project)
     return job

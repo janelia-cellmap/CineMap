@@ -19,22 +19,36 @@ from scipy.spatial.transform import Rotation
 
 from ..models import Camera
 
+# neuroglancer's perspective view, taken from its source (perspective_panel):
+#   fovy = Math.PI/4 = 45deg (VERTICAL field of view), and camera distance =
+#   (projectionScale/2)/tan(fovy/2) in voxels, so the visible extent at the focus is
+#   exactly projectionScale*voxel. We render at this FOV/distance with a VERTICAL
+#   sensor fit, reproducing neuroglancer's framing exactly — and, like neuroglancer,
+#   the vertical framing is independent of the window aspect (a wider frame just
+#   shows more on the sides). No empirical calibration.
+NG_FOV_DEG = 45.0
+
 
 def _vox(voxel_nm):
     return np.array(voxel_nm, dtype=float)
 
 
-def ng_to_camera(state: dict, voxel_nm, fov_deg: float = 40.0) -> Camera:
+def ng_to_camera(state: dict, voxel_nm, fov_deg: float = NG_FOV_DEG) -> Camera:
     pos_vox = np.array(state.get("position") or [0, 0, 0], dtype=float)
     look_at = pos_vox * _vox(voxel_nm)
     q = state.get("projectionOrientation") or [0.0, 0.0, 0.0, 1.0]
     scale = float(state.get("projectionScale", 10000.0))
 
     rot = Rotation.from_quat(q)  # neuroglancer & scipy both use [x,y,z,w]
-    # neuroglancer view space: camera looks along -Z, up is +Y. World directions:
-    fwd = rot.apply([0.0, 0.0, -1.0], inverse=True)
-    up = rot.apply([0.0, 1.0, 0.0], inverse=True)
+    # neuroglancer maps view directions to world by `rot` directly (NOT its inverse).
+    # Its 3D view is Y-DOWN (screen up = -Y) and the camera looks along +Z in view
+    # space (so depth ordering matches: closer objects sit in front). Verified by
+    # matching rendered frames — including depth — to neuroglancer's video_tool output.
+    fwd = rot.apply([0.0, 0.0, 1.0])
+    up = rot.apply([0.0, -1.0, 0.0])
 
+    # NG: visible extent at the focus = projectionScale*voxel; dist back-computed from
+    # the vertical FOV. (Exactly NG's (projectionScale/2)/tan(fovy/2) * voxel.)
     visible_nm = scale * float(np.mean(_vox(voxel_nm)))
     dist = visible_nm / (2.0 * math.tan(math.radians(fov_deg) / 2.0))
     cam_pos = look_at - fwd * dist
@@ -52,14 +66,16 @@ def camera_to_ng(camera: Camera, voxel_nm, base_state: dict | None = None) -> di
     fwd = fwd / dist
     up = np.array(camera.up, dtype=float)
 
-    # build the view frame (inverse of ng_to_camera): view -Z = fwd, view +Y = up
-    z = -fwd
-    y = up - np.dot(up, z) * z
-    ny = np.linalg.norm(y)
-    y = y / ny if ny > 1e-9 else np.array([0.0, 1.0, 0.0])
-    x = np.cross(y, z)
-    world_from_view = np.column_stack([x, y, z])
-    q = Rotation.from_matrix(world_from_view.T).as_quat()  # view-from-world
+    # Inverse of ng_to_camera (which maps view->world by `rot` directly, Y-down,
+    # looking +Z): rot maps view +Z->fwd, view +Y->-up, columns are [(-up)×fwd, -up, fwd].
+    up = up - np.dot(up, fwd) * fwd
+    nu = np.linalg.norm(up)
+    up = up / nu if nu > 1e-9 else np.array([0.0, -1.0, 0.0])
+    c2 = fwd
+    c1 = -up
+    c0 = np.cross(c1, c2)
+    rot = np.column_stack([c0, c1, c2])  # view->world rotation
+    q = Rotation.from_matrix(rot).as_quat()
     state["projectionOrientation"] = [float(v) for v in q]
 
     visible_nm = 2.0 * dist * math.tan(math.radians(camera.fov_deg) / 2.0)

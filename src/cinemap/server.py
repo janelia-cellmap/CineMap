@@ -74,6 +74,8 @@ class RenderReq(BaseModel):
     kf_range: list[int] | None = None
     export_blend: bool = False  # produce a self-contained .blend instead of a video
     draft: bool = False         # fast low-res preview (coarse EM + low-voxel meshes)
+    mesh_detail: float = 1.0    # per-layer vertex-budget multiplier (hard-capped)
+    mesh_from_labels: bool = False  # regenerate watertight meshes from labels vs precomputed
 
 
 class ChatReq(BaseModel):
@@ -165,7 +167,7 @@ def import_project(body: dict):
         p = Project.model_validate(body)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"invalid project file: {e}") from e
-    p.id = ops._uid("proj")     # fresh id so import never clobbers an existing project
+    p.id = ops.project_id(p.name)  # fresh id so import never clobbers an existing project
     p.renders = []              # drop render history (output files won't exist)
     store.save(p)
     try:
@@ -205,6 +207,41 @@ def bake(pid: str):
     p = store.load(pid)
     kf = scouting.bake_keyframe(p)
     return kf.model_dump()
+
+
+@app.post("/api/projects/import_states")
+def import_states_new_project(body: dict):
+    """Create a project from an uploaded states list and bake a keyframe per state.
+    The project's dataset is taken from the FIRST state, so meshes/segments resolve
+    against the same data the states use (no project needs to exist first)."""
+    from .data.manifest import parse_state_links
+
+    links = parse_state_links(body.get("text", ""))
+    if not links:
+        raise HTTPException(400, "no states found in the uploaded file")
+    try:
+        project = ops.create_project(body.get("name") or "imported states", links[0][1])
+        scouting.load_dataset(links[0][1])
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"could not analyze the first state: {e}") from e
+    created, errors = scouting.import_states(project, links)
+    return {"project": _light_project(store.load(project.id)),
+            "count": len(created), "errors": errors}
+
+
+@app.post("/api/projects/{pid}/keyframes/import_states")
+def import_states(pid: str, body: dict):
+    """Bake a keyframe per state in an uploaded list. `body.text` is the raw file
+    content: one neuroglancer state link per line, a neuroglancer video_tool script,
+    or a CSV with a state column. Each becomes a keyframe just like a hand-baked view."""
+    from .data.manifest import parse_state_links
+
+    p = store.load(pid)
+    links = parse_state_links(body.get("text", ""))
+    if not links:
+        raise HTTPException(400, "no states found in the uploaded file")
+    created, errors = scouting.import_states(p, links)
+    return {"created": [k.id for k in created], "count": len(created), "errors": errors}
 
 
 @app.post("/api/projects/{pid}/keyframes/{kid}/goto")
@@ -356,7 +393,7 @@ def _run_render(pid: str, job_id: str, worker: RenderWorker, thumbnail_for: str 
 def _start_render(pid: str, settings: RenderSettings, kf_range=None, thumbnail_for=None) -> str:
     p = store.load(pid)
     if thumbnail_for:  # don't clutter the render history with thumbnail jobs
-        job = RenderJob(id=ops._uid("thumb"), kf_range=kf_range, settings=settings)
+        job = RenderJob(id=ops.render_id(p, "thumb"), kf_range=kf_range, settings=settings)
     else:
         job = ops.create_render_job(p, settings, kf_range=kf_range)
     worker = RenderWorker(p, job)
@@ -381,7 +418,8 @@ def _evict_finished_states(keep: int = 200) -> None:
 @app.post("/api/projects/{pid}/render")
 def render(pid: str, req: RenderReq):
     settings = RenderSettings(width=req.width, height=req.height, fps=req.fps,
-                              samples=req.samples, export_blend=req.export_blend, draft=req.draft)
+                              samples=req.samples, export_blend=req.export_blend, draft=req.draft,
+                              mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels)
     return {"job_id": _start_render(pid, settings, kf_range=req.kf_range)}
 
 

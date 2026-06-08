@@ -34,6 +34,10 @@ def _bu(p, nm_per_bu):
 
 
 class RenderWorker:
+    # Hard ceiling on a layer's combined vertex count, regardless of mesh_detail —
+    # keeps the worst case well under the GPUs' VRAM (~9 GB free on an 11 GB card).
+    MESH_BUDGET_CEILING = 20_000_000
+
     def __init__(self, project: Project, job: RenderJob, nm_per_bu: float = NM_PER_BU):
         self.project = project
         self.job = job
@@ -53,9 +57,21 @@ class RenderWorker:
         # full resolution. EM level is chosen by target px across the on-screen
         # crop; meshes by marching-cubes voxel budget (per-segment / union).
         draft = bool(getattr(job.settings, "draft", False))
+        self._draft = draft
         self._em_target_px = 768 if draft else 1600
         self._mesh_voxels_single = 1_500_000 if draft else 8_000_000
         self._mesh_voxels_union = 3_000_000 if draft else 20_000_000
+        # mesh sourcing: precomputed (LOD-adaptive) by default; opt in to watertight
+        # marching-cubes-from-labels via the render setting.
+        self._prefer_labels = bool(getattr(job.settings, "mesh_from_labels", False))
+        # Per-layer vertex budget = base * mesh_detail, hard-capped so a too-high
+        # setting can't recreate the multi-GB mesh that stalled asset prep / OOM'd the
+        # GPU. The OOM-retry loop in run() halves this and rebuilds if Cycles runs out.
+        detail = max(0.25, min(float(getattr(job.settings, "mesh_detail", 1.0) or 1.0), 8.0))
+        base_budget = 1_200_000 if draft else 5_000_000
+        self._mesh_budget = min(int(base_budget * detail), self.MESH_BUDGET_CEILING)
+        self._nm_per_px = None  # finest on-screen scale across frames (set per build)
+        self._lod_tag = ""      # cache-key component so re-framing rebuilds LOD assets
 
     # ---- asset preparation ----
     def _em_vol(self) -> EMVolume:
@@ -118,13 +134,13 @@ class RenderWorker:
         self._slice_cache[key] = out
         return out
 
-    @staticmethod
-    def _mesh_uid(mesh_name, ids, color_key=()) -> str:
-        """Stable id per (layer, exact segment set, coloring) so a different segment
-        set OR a different color (seed/fixed) becomes a distinct object/asset."""
+    def _mesh_uid(self, mesh_name, ids, color_key=()) -> str:
+        """Stable id per (layer, exact segment set, coloring, LOD scale) so a
+        different segment set, color, OR on-screen resolution becomes a distinct
+        cached asset."""
         import hashlib
 
-        sig = ",".join(map(str, sorted(ids))) + "|" + str(color_key)
+        sig = ",".join(map(str, sorted(ids))) + "|" + str(color_key) + "|" + self._lod_tag
         return f"{mesh_name}_{hashlib.md5(sig.encode()).hexdigest()[:8]}"
 
     @staticmethod
@@ -136,6 +152,7 @@ class RenderWorker:
             seed=getattr(m, "color_seed", 0),
             default=getattr(m, "default_color", None),
             overrides={int(k): v for k, v in (getattr(m, "segment_colors", {}) or {}).items()},
+            saturation=getattr(m, "saturation", 1.0),
         )
 
     def _mesh_obj(self, mesh_name, segment_ids, lc) -> str | None:
@@ -149,11 +166,20 @@ class RenderWorker:
         out = self.assets_dir / f"mesh_{uid}.ply"  # PLY keeps vertex colors
         if out.exists():
             return str(out)
-        loader = MeshLoader(src.mesh_url, src.label_zarr)
         try:
-            combined = loader.load_many(ids, colorize=lc.rgb,
-                                        target_voxels_single=self._mesh_voxels_single,
-                                        target_voxels_union=self._mesh_voxels_union)
+            if src.skeleton_url and not src.mesh_url and not src.label_zarr:
+                # skeleton-only layer -> sweep skeletons into tubes
+                from ..data.skeleton import SkeletonLoader
+
+                combined = SkeletonLoader(src.skeleton_url, shader=src.skeleton_shader).load_many(
+                    ids, colorize=lc.rgb)
+            else:
+                combined = MeshLoader(src.mesh_url, src.label_zarr).load_many(
+                    ids, colorize=lc.rgb,
+                    target_voxels_single=self._mesh_voxels_single,
+                    target_voxels_union=self._mesh_voxels_union,
+                    nm_per_px=self._nm_per_px, draft=self._draft,
+                    prefer_labels=self._prefer_labels, total_budget=self._mesh_budget)
         except Exception as e:  # noqa: BLE001
             print(f"[worker] mesh {mesh_name} ({len(ids)} segs) failed: {e}")
             return None
@@ -161,8 +187,50 @@ class RenderWorker:
         combined.export(str(out))
         return str(out)
 
+    @staticmethod
+    def _ann_uid(an) -> str:
+        """Stable id per (layer, geometry, color) so an edited annotation layer
+        becomes a distinct asset."""
+        import hashlib
+
+        sig = json.dumps([an.name, an.color, an.points, an.lines, an.boxes, an.ellipsoids,
+                          an.point_radius_nm, an.line_radius_nm], sort_keys=True)
+        return f"ann_{hashlib.md5(sig.encode()).hexdigest()[:10]}"
+
+    def _ann_obj(self, an) -> str | None:
+        from ..data.annotations import annotations_to_mesh
+
+        uid = self._ann_uid(an)
+        out = self.assets_dir / f"{uid}.ply"
+        if out.exists():
+            return str(out)
+        prims = {"points": an.points, "lines": an.lines, "boxes": an.boxes,
+                 "ellipsoids": an.ellipsoids}
+        mesh = annotations_to_mesh(prims, an.color, an.point_radius_nm, an.line_radius_nm)
+        if mesh is None:
+            return None
+        os.makedirs(out.parent, exist_ok=True)
+        mesh.export(str(out))
+        return str(out)
+
     # ---- scene spec ----
     def _build_scene_spec(self, frames: list[FrameState], index_offset: int = 0) -> dict:
+        # On-screen scale (nm per pixel) for picking precomputed-mesh LOD, like
+        # neuroglancer: take the FINEST requirement across frames (the closest the
+        # camera ever gets) so the cached mesh is sharp enough for every shot.
+        height = max(1, self.job.settings.height)
+
+        def _nmpp(fr):
+            d = math.dist(fr.position_nm, fr.look_at_nm)
+            return 2.0 * d * math.tan(math.radians(fr.fov_deg) / 2) / height
+
+        self._nm_per_px = min((_nmpp(fr) for fr in frames), default=None)
+        # Asset cache key: nm/px (framing), draft/full, label/precomputed source, and
+        # the vertex budget — so re-framing or a lower OOM-retry budget rebuilds LODs.
+        self._lod_tag = (f"npp{self._nm_per_px:.3g}|{'draft' if self._draft else 'full'}"
+                         f"|{'lab' if self._prefer_labels else 'pre'}|b{self._mesh_budget}"
+                         if self._nm_per_px else f"b{self._mesh_budget}")
+
         # one Blender object per distinct (layer, segment set) across all frames
         mesh_specs: dict[str, dict] = {}
         for fr in frames:
@@ -175,6 +243,13 @@ class RenderWorker:
                     obj = self._mesh_obj(m.mesh_name, m.segment_ids, lc)
                     if obj:
                         mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": m.color}
+            # annotation layers -> geometry assets via the same import path
+            for an in fr.annotations:
+                uid = self._ann_uid(an)
+                if uid not in mesh_specs:
+                    obj = self._ann_obj(an)
+                    if obj:
+                        mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": an.color}
         frame_specs = []
         for fi, fr in enumerate(frames):
             if self.cancel.is_set():
@@ -197,10 +272,14 @@ class RenderWorker:
                     continue
                 # slot is stable across frames (matches interpolate's slice identity)
                 # so the blend exporter can group a slice's per-frame images into one
-                # animated image-sequence plane.
-                s = {**self._slice_png(sl, region, seg_overlays),
-                     "opacity": sl.opacity, "slot": f"{sl.em_name}:{sl.axis}"}
-                slices.append(s)
+                # animated image-sequence plane. A slice that can't be read (e.g. a
+                # non-OME-Zarr EM source) is skipped, not fatal to the whole render.
+                try:
+                    png = self._slice_png(sl, region, seg_overlays)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[worker] slice {sl.em_name}:{sl.axis} failed: {e}")
+                    continue
+                slices.append({**png, "opacity": sl.opacity, "slot": f"{sl.em_name}:{sl.axis}"})
             overrides = {}
             for m in fr.meshes:
                 uid = self._mesh_uid(m.mesh_name, m.segment_ids, self._frame_colors(m).cache_key())
@@ -213,6 +292,11 @@ class RenderWorker:
                         "visible": eff > 0.001,
                         "silhouette": getattr(m, "silhouette", 0.0),
                     }
+            for an in fr.annotations:
+                uid = self._ann_uid(an)
+                if uid in mesh_specs:
+                    overrides[uid] = {"opacity": an.opacity, "visible": an.opacity > 0.001,
+                                      "silhouette": 0.0}
             frame_specs.append({
                 "camera": {
                     "position_bu": _bu(fr.position_nm, self.nm_per_bu),
@@ -251,6 +335,36 @@ class RenderWorker:
         if proc is not None and proc.poll() is None:
             proc.terminate()
 
+    def _run_blender(self, scene_path, nframes: int) -> bool:
+        """Launch the Blender render subprocess and stream progress. Returns True if it
+        failed specifically with a GPU out-of-memory error (so the caller can retry at
+        lower mesh detail); raises RuntimeError on any other non-zero exit."""
+        self._proc = subprocess.Popen(
+            [sys.executable, "-m", "cinemap.render.blender_script", str(scene_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        proc = self._proc
+        done, oom = 0, False
+        for line in proc.stdout:  # type: ignore
+            if self.cancel.is_set():
+                proc.terminate()
+                break
+            low = line.lower()
+            if ("out of memory" in low or "out of gpu memory" in low
+                    or "cuda_error_out_of_memory" in low or "failed to allocate" in low):
+                oom = True
+            if line.startswith("[blender] frame"):
+                done += 1
+                self._progress(0.6 + 0.3 * done / nframes, line.strip())
+        proc.wait()
+        if self.cancel.is_set():
+            return False
+        if proc.returncode != 0 and not oom:
+            self.job.status = "error"
+            raise RuntimeError(f"blender exited {proc.returncode}")
+        return oom
+
     def run(self, progress: Progress | None = None) -> str:
         self._cb = progress
         self.job.status = "running"
@@ -266,38 +380,30 @@ class RenderWorker:
         if not frames:
             raise ValueError("no keyframes to render")
 
-        self._progress(0.1, "preparing assets")
-        spec = self._build_scene_spec(frames)  # raises RenderCancelled if cancelled
-        if self.cancel.is_set():
-            raise RenderCancelled()
-        scene_path = self.workdir / "scene.json"
-        scene_path.write_text(json.dumps(spec, indent=2))
-
         exporting = self.job.settings.export_blend
-        self._progress(0.6, f"{'baking .blend' if exporting else 'rendering'} "
-                            f"({len(frames)} frames) in Blender")
-        py = sys.executable
-        self._proc = subprocess.Popen(
-            [py, "-m", "cinemap.render.blender_script", str(scene_path)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-        proc = self._proc
-        done = 0
-        for line in proc.stdout:  # type: ignore
+        scene_path = self.workdir / "scene.json"
+        # Build assets + render, retrying at half the mesh budget if Cycles runs out
+        # of GPU memory (a too-high mesh_detail, or many dense layers in one frame).
+        for attempt in range(3):
+            self._progress(0.1, "preparing assets" if attempt == 0 else
+                           f"GPU out of memory — retrying at lower detail "
+                           f"({self._mesh_budget // 1000}k verts/layer)")
+            spec = self._build_scene_spec(frames)  # raises RenderCancelled if cancelled
             if self.cancel.is_set():
-                proc.terminate()
+                raise RenderCancelled()
+            scene_path.write_text(json.dumps(spec, indent=2))
+            self._progress(0.6, f"{'baking .blend' if exporting else 'rendering'} "
+                                f"({len(frames)} frames) in Blender")
+            oom = self._run_blender(scene_path, len(frames))
+            if self.cancel.is_set():
+                self.job.status = "cancelled"
+                raise RenderCancelled()
+            if not oom:
                 break
-            if line.startswith("[blender] frame"):
-                done += 1
-                self._progress(0.6 + 0.3 * done / len(frames), line.strip())
-        proc.wait()
-        if self.cancel.is_set():
-            self.job.status = "cancelled"
-            raise RenderCancelled()
-        if proc.returncode != 0:
-            self.job.status = "error"
-            raise RuntimeError(f"blender exited {proc.returncode}")
+            if attempt == 2:  # 3 tries (full -> half -> quarter budget) exhausted
+                self.job.status = "error"
+                raise RuntimeError("GPU out of memory even at reduced mesh detail")
+            self._mesh_budget = max(300_000, self._mesh_budget // 2)
 
         if exporting:
             if not self.blend_path.exists():

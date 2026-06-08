@@ -12,7 +12,7 @@ import neuroglancer
 
 from . import operations as ops
 from .data.manifest import fetch_state
-from .models import Camera, Keyframe, MeshInstance, Project, SlicePlane
+from .models import AnnotationInstance, Camera, Keyframe, MeshInstance, Project, SlicePlane
 
 _viewer: neuroglancer.Viewer | None = None
 
@@ -48,6 +48,22 @@ def current_layer_visibility(project: Project) -> dict[str, bool]:
     """{layer_name: is_visible} for every layer in the scouting viewer."""
     v = get_viewer()
     return {m.name: getattr(m, "visible", True) is not False for m in v.state.layers}
+
+
+def _visible_segments_from_state(st: dict) -> dict[str, list[int]]:
+    """{layer_name: [visible segment ids]} parsed straight from a neuroglancer state
+    dict — no live-viewer round-trip, so no async race (the viewer may not have
+    applied a just-set state yet). '!'-prefixed segments are selected-but-hidden and
+    excluded, matching what the 3D view shows."""
+    out: dict[str, list[int]] = {}
+    for layer in st.get("layers", []):
+        if layer.get("type") != "segmentation" or layer.get("visible", True) is False:
+            continue
+        ids = [int(s) for s in (str(x) for x in (layer.get("segments") or []))
+               if not s.startswith("!") and s.lstrip("-").isdigit()]
+        if ids:
+            out[layer.get("name", "")] = sorted(ids)
+    return out
 
 
 def current_visible_segments(project: Project) -> dict[str, list[int]]:
@@ -97,47 +113,153 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
 
     if st is None:
         st = get_viewer().state.to_json()
-    has_mesh = {m.name: bool(m.mesh_url) for m in project.manifest.meshes}
+    # a layer renders 3D geometry if it has a precomputed mesh OR a skeleton source;
+    # label-only layers stay on the EM slice (render_3d=False).
+    has_mesh = {m.name: bool(m.mesh_url or m.skeleton_url) for m in project.manifest.meshes}
     lcolors = current_layer_colors(project, st)
     # per-layer 3D render state (Opacity/Silhouette) from the serialized state
     layers = {l.get("name"): l for l in st.get("layers", [])}
+    vis = _visible_segments_from_state(st)
+    # Resolve linkedSegmentationGroup: a visible segmentation layer with no segments
+    # of its own but linked to another layer shows that layer's segments (e.g.
+    # mito-objects-grouped, keyed by neuron id, linked to the neuron layer). Fetch
+    # the linked layer's segments for it so the linked meshes render too.
+    by_name = {m.name for m in project.manifest.meshes}
+    for name, ldict in layers.items():
+        link = ldict.get("linkedSegmentationGroup")
+        if (link and name in by_name and ldict.get("visible", True) is not False
+                and not vis.get(name) and vis.get(link)):
+            vis[name] = list(vis[link])
     meshes: list[MeshInstance] = []
-    for name, ids in current_visible_segments(project).items():
+    for name, ids in vis.items():
         lc = lcolors.get(name)
         fields = {"segment_ids": ids, "render_3d": has_mesh.get(name, True)}
         if lc is not None:
             fields.update(color_seed=lc.seed, default_color=lc.default,
-                          segment_colors={str(k): v for k, v in lc.overrides.items()})
+                          segment_colors={str(k): v for k, v in lc.overrides.items()},
+                          saturation=lc.saturation)
         if name in layers:
             fields.update(_colors.render3d_from_layer(layers[name]))  # Opacity/Silhouette (3d)
         meshes.append(MeshInstance(mesh_name=name, **fields))
     return meshes
 
 
-def _scene_from_view(project: Project):
-    """Capture the current scouting view as (camera, slices, meshes, ng_state):
-    the 3D-view camera, the EM slice (if the image layer is shown), and meshes for
-    the visible segmentation layers/segments."""
+def _scene_from_view(project: Project, st: dict | None = None):
+    """Capture a scene as (camera, slices, meshes, annotations, ng_state) from a
+    neuroglancer state dict. `st` defaults to the live scouting viewer; importing
+    passes the saved state directly so capture never races the viewer's async load."""
     from .data.ng_camera import ng_to_camera
 
-    st = get_viewer().state.to_json()  # serialize the viewer state ONCE; reuse below
+    if st is None:
+        st = get_viewer().state.to_json()  # serialize the live viewer ONCE; reuse below
     cam = ng_to_camera(st, project.manifest.voxel_size_nm)
     em_name = project.manifest.em.name if project.manifest.em else "em"
-    vis = current_layer_visibility(project)
+    layer_vis = {l.get("name"): l.get("visible", True) is not False
+                 for l in st.get("layers", [])}
+    # a "3d" layout shows no cross-section in neuroglancer, so bake no EM slice
+    show_slice = layer_vis.get(em_name, True) and st.get("layout") != "3d"
     slices = ([SlicePlane(em_name=em_name, axis="z", position_nm=cam.look_at_nm[2])]
-              if vis.get(em_name, True) else [])
+              if show_slice else [])
     meshes = _meshes_from_visible(project, st=st)
-    return cam, slices, meshes, st
+    annotations = _annotations_from_view(project, st)
+    return cam, slices, meshes, annotations, st
 
 
-def bake_keyframe(project: Project, label: str = "scouted") -> Keyframe:
-    """Build a NEW keyframe from the current scouting view."""
-    cam, slices, meshes, st = _scene_from_view(project)
+def _hex_to_rgb(h: str) -> list[float]:
+    h = (h or "").lstrip("#")
+    if len(h) != 6:
+        return [1.0, 0.95, 0.30]
+    return [int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
+
+
+def _annotations_from_view(project: Project, st: dict) -> list[AnnotationInstance]:
+    """Capture visible annotation layers (inline points/lines/boxes/ellipsoids) from
+    the serialized state. Layers backed only by a precomputed source (no inline
+    `annotations`) are skipped for now."""
+    from .data import annotations as _ann
+
+    vox = project.manifest.voxel_size_nm
+    out: list[AnnotationInstance] = []
+    for layer in st.get("layers", []):
+        if layer.get("type") != "annotation":
+            continue
+        prims = _ann.parse_inline(layer, vox)
+        if not _ann.has_geometry(prims):
+            continue
+        out.append(AnnotationInstance(
+            name=layer.get("name", "annotations"),
+            color=_hex_to_rgb(layer.get("annotationColor", "#ffff4d")),
+            visible=layer.get("visible", True) is not False,
+            points=prims["points"], lines=prims["lines"],
+            boxes=prims["boxes"], ellipsoids=prims["ellipsoids"]))
+    return out
+
+
+def bake_keyframe(project: Project, label: str = "scouted", st: dict | None = None) -> Keyframe:
+    """Build a NEW keyframe from a neuroglancer state (the live view by default)."""
+    cam, slices, meshes, annotations, st = _scene_from_view(project, st)
     if not meshes and not slices and project.keyframes:  # nothing on -> keep previous meshes
         meshes = [m.model_copy() for m in project.keyframes[-1].meshes]
     kf = Keyframe(id=ops._uid("kf"), label=label, camera=cam, slices=slices,
-                  meshes=meshes, ng_state=st)
+                  meshes=meshes, annotations=annotations, ng_state=st)
     return ops.add_keyframe(project, kf)
+
+
+def bake_keyframe_from_state(project: Project, state: dict, label: str = "imported") -> Keyframe:
+    """Bake a keyframe from an arbitrary neuroglancer state (not the live view).
+
+    Drives the scouting viewer to `state`, then bakes exactly as if the user had
+    loaded that view and clicked Bake — so an imported keyframe is identical to a
+    hand-baked one (visible layers/segments, colors, 3D style, camera). Used by the
+    "import states" feature to turn a list of saved views into a keyframe timeline.
+    """
+    get_viewer().set_state(state)            # update the iframe so the user sees it…
+    return bake_keyframe(project, label=label, st=state)  # …but capture from the dict
+
+
+def _merge_manifest(project: Project, state: dict) -> None:
+    """Union one imported state's mesh/EM sources into the project manifest, so a
+    layer that appears only in a later state (e.g. a skeleton layer not present in
+    state 1) is known to the renderer. Matches by layer name; first one wins."""
+    from .data.manifest import analyze_state_dict
+
+    m = analyze_state_dict(state)
+    have = {x.name for x in project.manifest.meshes}
+    for ms in m.meshes:
+        if ms.name not in have:
+            project.manifest.meshes.append(ms)
+            have.add(ms.name)
+    if project.manifest.em is None and m.em is not None:
+        project.manifest.em = m.em
+
+
+def import_states(project: Project, links: list[tuple]) -> tuple[list[Keyframe], list[str]]:
+    """Bake one keyframe per (label, state-link[, duration]). A per-entry duration
+    (from a neuroglancer video_tool script) sets the transition INTO that keyframe.
+    Returns (keyframes, errors); a link that fails to fetch/parse is reported and
+    skipped, not fatal."""
+    from .data.manifest import fetch_state
+
+    created: list[Keyframe] = []
+    errors: list[str] = []
+    for entry in links:
+        label, link = entry[0], entry[1]
+        duration = entry[2] if len(entry) > 2 else None
+        try:
+            state = fetch_state(link)
+            _merge_manifest(project, state)  # register layers new to this state
+            kf = bake_keyframe_from_state(project, state, label=label)
+            # match neuroglancer's video_tool: linear interpolation between states,
+            # the script's number is the transition duration into this keyframe, and
+            # an OMITTED duration defaults to 1.0s (NG's load_script default) — not
+            # CineMap's normal 2.0s — so the total runtime matches NG exactly.
+            kf.easing = "linear"
+            kf.duration_in_s = float(duration) if duration is not None else 1.0
+            created.append(kf)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{label}: {e}")
+    ops.store.save(project)  # persist the easing/duration overrides once for the batch
+    return created, errors
 
 
 def update_keyframe_from_view(project: Project, keyframe_id: str) -> Keyframe | None:
@@ -146,9 +268,9 @@ def update_keyframe_from_view(project: Project, keyframe_id: str) -> Keyframe | 
     kf = next((k for k in project.keyframes if k.id == keyframe_id), None)
     if kf is None:
         return None
-    cam, slices, meshes, st = _scene_from_view(project)
-    updated = kf.model_copy(update={"camera": cam, "slices": slices,
-                                    "meshes": meshes, "ng_state": st})
+    cam, slices, meshes, annotations, st = _scene_from_view(project)
+    updated = kf.model_copy(update={"camera": cam, "slices": slices, "meshes": meshes,
+                                    "annotations": annotations, "ng_state": st})
     project.keyframes = [updated if k.id == keyframe_id else k for k in project.keyframes]
     ops.store.save(project)
     return updated
