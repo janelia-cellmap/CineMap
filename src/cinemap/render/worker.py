@@ -71,10 +71,10 @@ class RenderWorker:
         base_budget = 1_200_000 if draft else 5_000_000
         self._mesh_budget = min(int(base_budget * detail), self.MESH_BUDGET_CEILING)
         self._nm_per_px = None  # finest on-screen scale across frames (set per build)
-        # dynamic per-frame LOD: build coarser meshes for frames where a layer is
-        # small/far on screen, finer for close-ups (like neuroglancer). Collapses to
-        # a single build for ~constant-distance shots, so it's free on pure orbits.
-        self._dynamic_lod = bool(getattr(job.settings, "dynamic_lod", True))
+        # mesh LOD strategy: "single" (one build), "frame" (per-frame adaptive, like
+        # neuroglancer; free on orbits), or "chunk" (per-chunk spatial — not yet
+        # implemented, treated as "frame").
+        self._lod_mode = getattr(job.settings, "lod_mode", "frame") or "frame"
         # non-destructive presentation pass (lighting rig / materials / DOF)
         self._auto_direct = bool(getattr(job.settings, "auto_direct", True))
 
@@ -156,8 +156,10 @@ class RenderWorker:
         if not nmpps:
             return []
         lo, hi = min(nmpps), max(nmpps)
-        if not self._dynamic_lod or max_buckets <= 1 or hi <= lo * 1.6:
-            return [lo] * len(nmpps)          # one bucket -> finest (current behavior)
+        # "single" => one finest build; adaptive modes bucket by zoom (a ~constant-
+        # distance shot still collapses to one bucket).
+        if self._lod_mode == "single" or max_buckets <= 1 or hi <= lo * 1.6:
+            return [lo] * len(nmpps)
         span = math.log(hi / lo)
         bands = [min(max_buckets - 1, int(math.log(x / lo) / span * max_buckets))
                  for x in nmpps]

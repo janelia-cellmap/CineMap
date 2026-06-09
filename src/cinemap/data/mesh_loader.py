@@ -111,19 +111,30 @@ class MeshLoader:
             m = re.search(r"-?\d+\s*-\s*(\d+)\)", str(e))
             return int(m.group(1)) if m else 0
 
+    @staticmethod
+    def _mesh_resolution_nm(mesh: trimesh.Trimesh) -> float:
+        """A LOD's spatial resolution (nm) ~ its mean triangle edge length. A robust
+        stand-in for the multilod manifest's lodScale, measured from the geometry."""
+        try:
+            el = mesh.edges_unique_length
+            if len(el):
+                return float(el.mean())
+        except Exception:  # noqa: BLE001
+            pass
+        ext = mesh.bounds[1] - mesh.bounds[0]   # fallback: cube-root volume per vertex
+        return float((float(np.prod(ext)) / max(1, len(mesh.vertices))) ** (1 / 3))
+
     def _draco_lod_for_screen(self, seg_id: int, nm_per_px: float, draft: bool,
                               max_verts: float | None = None) -> trimesh.Trimesh | None:
-        """Fetch the precomputed mesh at the coarsest LOD that still looks sharp at
-        the given on-screen scale (`nm_per_px`). Like neuroglancer: a mesh that's
-        small on screen loads coarse, a close-up loads fine. Fetches coarse->fine and
-        stops once vertex spacing is finer than ~1-2 px, so little data is wasted."""
-        # target world-space vertex spacing that projects to ~px_spacing pixels.
-        # The (extent/spacing)^2 budget below treats the mesh as a full sheet, which
-        # over-counts for thin neurites, so px_spacing is set generously — large for
-        # draft previews (coarse, fast), tighter for the final video.
-        px_spacing = 8.0 if draft else 2.0
-        spacing_nm = max(px_spacing * nm_per_px, 1e-6)
-        target = None
+        """Pick the coarsest LOD that still looks sharp at the given on-screen scale
+        (`nm_per_px`) — neuroglancer's criterion: render a LOD once its spatial
+        resolution (lodScale) is finer than one screen pixel times a tolerance
+        (`lodScale <= nm_per_px * detailCutoff`; NG's default cutoff is ~1). We
+        estimate each LOD's resolution from its mean edge length, which — unlike a
+        sheet-area vertex count — doesn't over-refine thin neurites. Capped at
+        `max_verts` (the offline budget NG doesn't need, since it streams)."""
+        tol = 6.0 if draft else 1.5      # px of mesh resolution to allow (NG default ~1)
+        target_nm = max(tol * nm_per_px, 1e-6)
         chosen = None
         for lod in range(self._max_lod(seg_id), -1, -1):  # coarse -> fine
             try:
@@ -131,15 +142,12 @@ class MeshLoader:
             except Exception as e:  # noqa: BLE001
                 print(f"[mesh] {seg_id} lod{lod} failed: {e}")
                 continue
-            if target is None:  # size the screen budget from the (cheap) coarsest mesh
-                extent = float(np.max(mesh.bounds[1] - mesh.bounds[0]))
-                target = (extent / spacing_nm) ** 2  # ~verts for a surface at that spacing
             # hard budget ceiling: if going this fine would exceed max_verts, keep the
             # previous (coarser, in-budget) LOD instead.
             if max_verts is not None and len(mesh.vertices) > max_verts and chosen is not None:
                 break
             chosen = mesh
-            if len(mesh.vertices) >= target:  # enough on-screen detail
+            if self._mesh_resolution_nm(mesh) <= target_nm:  # fine enough on screen
                 break
         return chosen
 

@@ -143,10 +143,13 @@ class RenderSettings(BaseModel):
     # rim lighting, publication materials, subtle depth-of-field on the framed
     # subject). On by default; off renders the plain neuroglancer-faithful scene.
     auto_direct: bool = True
-    # Dynamic per-frame LOD: build coarser meshes for frames where a layer is small/
-    # far on screen, finer for close-ups (like neuroglancer). Collapses to a single
-    # build for ~constant-distance shots; off always builds at the finest scale.
-    dynamic_lod: bool = True
+    # Mesh LOD strategy:
+    #   "single" — one LOD for the whole shot (built at the closest frame's scale).
+    #   "frame"  — per-frame LOD: coarser when a layer is far/small on screen, finer
+    #              on close-ups (like neuroglancer); collapses to one build on orbits.
+    #   "chunk"  — per-chunk spatial LOD (different LODs within one mesh); not yet
+    #              implemented, currently falls back to "frame".
+    lod_mode: Literal["single", "frame", "chunk"] = "frame"
 
 
 class RenderJob(BaseModel):
