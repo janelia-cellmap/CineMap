@@ -72,6 +72,8 @@ class RenderWorker:
         self._mesh_budget = min(int(base_budget * detail), self.MESH_BUDGET_CEILING)
         self._nm_per_px = None  # finest on-screen scale across frames (set per build)
         self._lod_tag = ""      # cache-key component so re-framing rebuilds LOD assets
+        # non-destructive presentation pass (lighting rig / materials / DOF)
+        self._auto_direct = bool(getattr(job.settings, "auto_direct", True))
 
     # ---- asset preparation ----
     def _em_vol(self) -> EMVolume:
@@ -309,7 +311,7 @@ class RenderWorker:
                 "index": index_offset + fi,   # global frame index (split cluster jobs)
             })
             self._progress(0.1 + 0.5 * (fi + 1) / len(frames), f"assets {fi + 1}/{len(frames)}")
-        return {
+        spec = {
             "world": {"nm_per_bu": self.nm_per_bu,
                       "background": self.project.lighting.background},
             "lighting": {"key_energy": self.project.lighting.key_energy},
@@ -320,6 +322,17 @@ class RenderWorker:
             "fps": self.job.settings.fps,
             "export_blend": str(self.blend_path) if self.job.settings.export_blend else None,
         }
+        if self._auto_direct:
+            # Non-destructive presentation directives (optional fields; absent => the
+            # plain neuroglancer-faithful look). DOF focuses on the framed subject —
+            # the camera's look-at, which is exactly what neuroglancer centered on.
+            from . import director
+            plan = director.plan(self.project.keyframes)
+            spec["direction"] = plan
+            if plan["dof"]["enabled"]:
+                for fr in spec["frames"]:
+                    fr["camera"]["dof"] = {"fstop": plan["dof"]["fstop"]}
+        return spec
 
     # ---- run ----
     def _progress(self, p, msg):

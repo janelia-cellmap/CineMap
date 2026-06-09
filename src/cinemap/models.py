@@ -139,6 +139,10 @@ class RenderSettings(BaseModel):
     # 1.2M draft). Higher = crisper meshes but more VRAM; the worker hard-caps the
     # budget and auto-retries at lower detail if the GPU runs out of memory.
     mesh_detail: float = 1.0
+    # Auto-direction: a non-destructive presentation pass (camera-relative key/fill/
+    # rim lighting, publication materials, subtle depth-of-field on the framed
+    # subject). On by default; off renders the plain neuroglancer-faithful scene.
+    auto_direct: bool = True
 
 
 class RenderJob(BaseModel):

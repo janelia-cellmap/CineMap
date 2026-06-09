@@ -52,11 +52,17 @@ def _setup_render(scene_spec: dict) -> None:
 
 
 def _add_light(scene_spec: dict) -> None:
+    """Three-point key/fill/rim rig. The director (auto-direct) supplies energies and
+    asks for a camera-relative rig — _update_lights then re-aims these per frame so
+    the rim/key stay consistent as the camera orbits. Without it, the fixed world
+    rotations below are the faithful fallback."""
+    rig = scene_spec.get("direction", {}).get("lighting", {})
     energy = scene_spec.get("lighting", {}).get("key_energy", 3000.0)
-    base = max(2.0, energy / 600.0)
+    base = rig.get("key_energy") or max(2.0, energy / 600.0)
+    fill_mult, rim_mult = rig.get("fill_ratio", 0.45), rig.get("rim_ratio", 0.6)
     for name, rot, mult in [("Key", (0.6, 0.2, 0.4), 1.0),
-                            ("Fill", (-0.5, -0.3, 2.4), 0.45),
-                            ("Rim", (1.2, 0.0, -1.8), 0.6)]:
+                            ("Fill", (-0.5, -0.3, 2.4), fill_mult),
+                            ("Rim", (1.2, 0.0, -1.8), rim_mult)]:
         data = bpy.data.lights.new(name, type="SUN")
         data.energy = base * mult
         obj = bpy.data.objects.new(name, data)
@@ -67,7 +73,33 @@ def _add_light(scene_spec: dict) -> None:
     if world and world.use_nodes:
         bg = world.node_tree.nodes.get("Background")
         if bg:
-            bg.inputs[1].default_value = 0.3
+            bg.inputs[1].default_value = rig.get("ambient", 0.3)
+
+
+def _update_lights(frame: dict, rig: dict) -> None:
+    """Re-aim the key/fill/rim suns relative to the camera for this frame, so the
+    rig (and the rim edge-light) stays consistent as the camera moves. Suns are
+    directional, so only their orientation matters."""
+    if not rig.get("camera_relative", True):
+        return
+    pos = Vector(frame["camera"]["position_bu"])
+    fwd = (Vector(frame["camera"]["look_at_bu"]) - pos)
+    if fwd.length < 1e-9:
+        return
+    fwd.normalize()
+    up = Vector(frame["camera"].get("up", [0.0, 0.0, 1.0]))
+    right = fwd.cross(up)
+    right = right.normalized() if right.length > 1e-9 else Vector((1.0, 0.0, 0.0))
+    tup = right.cross(fwd).normalized()                  # true up, orthogonal to fwd
+    # photon travel directions: key from upper-left, fill from lower-right (softer),
+    # rim from behind the subject toward the camera (edge glow).
+    dirs = {"Key":  (fwd + 0.6 * right - 0.5 * tup),
+            "Fill": (fwd - 0.6 * right + 0.3 * tup),
+            "Rim":  (-fwd + 0.4 * tup)}
+    for name, d in dirs.items():
+        obj = bpy.data.objects.get(name)
+        if obj and d.length > 1e-9:
+            obj.rotation_euler = d.normalized().to_track_quat("-Z", "Y").to_euler()
 
 
 def _import_meshes(scene_spec: dict) -> dict:
@@ -101,7 +133,17 @@ def _import_meshes(scene_spec: dict) -> dict:
         nt = mat.node_tree
         bsdf = nt.nodes["Principled BSDF"]
         col = m["color"]
-        bsdf.inputs["Roughness"].default_value = 0.35
+        # publication-quality shading over the NG color: tuned roughness/specular +
+        # a touch of sheen. From the director when auto-direct is on; sensible
+        # defaults otherwise. Input names vary by Blender version, so set defensively.
+        prof = scene_spec.get("direction", {}).get("material", {})
+        def _set_in(node, key, val):
+            if key in node.inputs:
+                node.inputs[key].default_value = val
+        _set_in(bsdf, "Roughness", prof.get("roughness", 0.35))
+        _set_in(bsdf, "Specular IOR Level", prof.get("specular", 0.5))
+        _set_in(bsdf, "Sheen Weight", prof.get("sheen", 0.0))
+        _set_in(bsdf, "Coat Weight", prof.get("coat", 0.0))
         has_colors = bool(getattr(obj.data, "color_attributes", None)) and len(obj.data.color_attributes) > 0
         if has_colors:  # per-vertex (per-segment) colors
             attr = nt.nodes.new("ShaderNodeVertexColor")
@@ -114,7 +156,7 @@ def _import_meshes(scene_spec: dict) -> dict:
             if "Emission Color" in bsdf.inputs:
                 bsdf.inputs["Emission Color"].default_value = (col[0], col[1], col[2], 1.0)
         if "Emission Strength" in bsdf.inputs:
-            bsdf.inputs["Emission Strength"].default_value = 0.15
+            bsdf.inputs["Emission Strength"].default_value = prof.get("emission_strength", 0.15)
 
         # neuroglancer 3D render state: Alpha = object_alpha * facing^silhouette, where
         # `facing` is Blender's LayerWeight Facing output = 0 head-on, 1 at grazing
@@ -256,6 +298,15 @@ def _set_camera(frame: dict) -> None:
     y = y.normalized() if y.length > 1e-9 else Vector((0.0, 0.0, 1.0))
     x = y.cross(z)                                    # right (right-handed: x = y × z)
     cam.rotation_euler = Matrix((x, y, z)).transposed().to_euler()
+    # subtle depth-of-field on the framed subject: focus at the look-at (what
+    # neuroglancer centered on). Faithful — only far/near context softens slightly.
+    dof = frame["camera"].get("dof")
+    if dof and cam.data.type == "PERSP":
+        cam.data.dof.use_dof = True
+        cam.data.dof.focus_distance = (Vector(frame["camera"]["look_at_bu"]) - cam.location).length
+        cam.data.dof.aperture_fstop = dof.get("fstop", 4.0)
+    else:
+        cam.data.dof.use_dof = False
 
 
 def main(scene_path: str) -> None:
@@ -270,8 +321,11 @@ def main(scene_path: str) -> None:
     meshes = _import_meshes(spec)
     scene = bpy.context.scene
     out_dir = spec["output_dir"]
+    rig = spec.get("direction", {}).get("lighting", {})
     for fi, frame in enumerate(spec["frames"]):
         _set_camera(frame)
+        if rig:
+            _update_lights(frame, rig)
         _build_slices(frame)
         _set_mesh_state(meshes, frame.get("mesh_overrides", {}))
         idx = frame.get("index", fi)  # global frame index (for split cluster jobs)

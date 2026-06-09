@@ -76,6 +76,7 @@ class RenderReq(BaseModel):
     draft: bool = False         # fast low-res preview (coarse EM + low-voxel meshes)
     mesh_detail: float = 1.0    # per-layer vertex-budget multiplier (hard-capped)
     mesh_from_labels: bool = False  # regenerate watertight meshes from labels vs precomputed
+    auto_direct: bool = True    # non-destructive presentation pass (lighting/material/DOF)
 
 
 class ChatReq(BaseModel):
@@ -419,7 +420,8 @@ def _evict_finished_states(keep: int = 200) -> None:
 def render(pid: str, req: RenderReq):
     settings = RenderSettings(width=req.width, height=req.height, fps=req.fps,
                               samples=req.samples, export_blend=req.export_blend, draft=req.draft,
-                              mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels)
+                              mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels,
+                              auto_direct=req.auto_direct)
     return {"job_id": _start_render(pid, settings, kf_range=req.kf_range)}
 
 
