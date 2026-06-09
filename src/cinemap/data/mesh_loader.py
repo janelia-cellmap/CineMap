@@ -133,7 +133,7 @@ class MeshLoader:
         estimate each LOD's resolution from its mean edge length, which — unlike a
         sheet-area vertex count — doesn't over-refine thin neurites. Capped at
         `max_verts` (the offline budget NG doesn't need, since it streams)."""
-        tol = 6.0 if draft else 1.5      # px of mesh resolution to allow (NG default ~1)
+        tol = 6.0 if draft else 1.0      # px of mesh resolution to allow (matches NG's ~1)
         target_nm = max(tol * nm_per_px, 1e-6)
         chosen = None
         for lod in range(self._max_lod(seg_id), -1, -1):  # coarse -> fine
