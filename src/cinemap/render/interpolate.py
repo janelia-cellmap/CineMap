@@ -166,20 +166,24 @@ def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
     return fs
 
 
-def build_frames(keyframes: list[Keyframe], fps: int) -> list[FrameState]:
+def build_frames(keyframes: list[Keyframe], fps: int,
+                 ease_override: str | None = None) -> list[FrameState]:
     """Flatten keyframes to per-frame states, matching neuroglancer's video_tool
     exactly: for each transition i->i+1 emit round(duration*fps) frames at t = k/n
     for k in [0, n) (so keyframe i is shown at the START of its outgoing transition),
     then one final frame holding the last keyframe. `duration_in_s` is stored on the
     DESTINATION keyframe (the transition into it). A duration of 0 emits no transition
-    frames (an instant cut)."""
+    frames (an instant cut). `ease_override` (e.g. "ease-in-out" from the director)
+    reshapes the motion within each transition — same frame count and total duration,
+    just a smoother settle into each keyframe — without changing video_tool timing."""
     if not keyframes:
         return []
     frames: list[FrameState] = []
     for i in range(len(keyframes) - 1):
         a, b = keyframes[i], keyframes[i + 1]
         n = 0 if b.duration_in_s <= 0 else max(1, int(round(b.duration_in_s * fps)))
+        ease = ease_override or b.easing
         for k in range(n):
-            frames.append(_state_at(a, b, _ease(k / n, b.easing)))
+            frames.append(_state_at(a, b, _ease(k / n, ease)))
     frames.append(_state_at(keyframes[-1], keyframes[-1], 0.0))  # final keyframe, 1 frame
     return frames

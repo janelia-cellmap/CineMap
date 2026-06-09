@@ -155,8 +155,12 @@ def _import_meshes(scene_spec: dict) -> dict:
             bsdf.inputs["Base Color"].default_value = (col[0], col[1], col[2], 1.0)
             if "Emission Color" in bsdf.inputs:
                 bsdf.inputs["Emission Color"].default_value = (col[0], col[1], col[2], 1.0)
+        # Emission strength via a value node so the director can pulse it per frame
+        # (the appear/highlight glow) by overriding cm_emit; base = the material floor.
+        emit_v = nt.nodes.new("ShaderNodeValue"); emit_v.name = "cm_emit"
+        emit_v.outputs[0].default_value = prof.get("emission_strength", 0.15)
         if "Emission Strength" in bsdf.inputs:
-            bsdf.inputs["Emission Strength"].default_value = prof.get("emission_strength", 0.15)
+            nt.links.new(emit_v.outputs[0], bsdf.inputs["Emission Strength"])
 
         # neuroglancer 3D render state: Alpha = object_alpha * facing^silhouette, where
         # `facing` is Blender's LayerWeight Facing output = 0 head-on, 1 at grazing
@@ -183,7 +187,7 @@ def _import_meshes(scene_spec: dict) -> dict:
     return out
 
 
-def _set_mesh_state(meshes: dict, overrides: dict) -> None:
+def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> None:
     for mid, (obj, mat) in meshes.items():
         ov = overrides.get(mid)
         if ov is None:  # not referenced this frame -> hidden (belongs to another keyframe)
@@ -198,6 +202,10 @@ def _set_mesh_state(meshes: dict, overrides: dict) -> None:
             av.outputs[0].default_value = opacity
         if sv is not None:
             sv.outputs[0].default_value = ov.get("silhouette", 0.0)   # Silhouette (3d)
+        # reset emission every frame (base + the director's transient glow, if any)
+        ev = nt.nodes.get("cm_emit")
+        if ev is not None:
+            ev.outputs[0].default_value = base_emit + ov.get("emphasis", 0.0)
         if av is None and "Alpha" in nt.nodes["Principled BSDF"].inputs:
             nt.nodes["Principled BSDF"].inputs["Alpha"].default_value = opacity
 
@@ -322,12 +330,13 @@ def main(scene_path: str) -> None:
     scene = bpy.context.scene
     out_dir = spec["output_dir"]
     rig = spec.get("direction", {}).get("lighting", {})
+    base_emit = spec.get("direction", {}).get("material", {}).get("emission_strength", 0.15)
     for fi, frame in enumerate(spec["frames"]):
         _set_camera(frame)
         if rig:
             _update_lights(frame, rig)
         _build_slices(frame)
-        _set_mesh_state(meshes, frame.get("mesh_overrides", {}))
+        _set_mesh_state(meshes, frame.get("mesh_overrides", {}), base_emit)
         idx = frame.get("index", fi)  # global frame index (for split cluster jobs)
         scene.render.filepath = f"{out_dir}/frame_{idx:05d}.png"
         print(f"[blender] frame {fi + 1}/{len(spec['frames'])}", flush=True)

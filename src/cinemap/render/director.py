@@ -47,10 +47,64 @@ class DepthOfField:
 
 
 @dataclass
+class Emphasis:
+    """Phase 2: a transient cue when an object is introduced/highlighted, decaying
+    over `seconds`. `glow` is the added emission at the peak (a brief brightening of
+    the object's own color); `spotlight` briefly dims the *other* (context) layers
+    to draw the eye. Both leave the persistent scene unchanged once decayed."""
+    seconds: float = 0.7
+    glow: float = 0.6
+    spotlight: float = 0.25      # context layers dip to (1 - this) at the peak
+
+
+@dataclass
 class DirectorSettings:
     material: MaterialProfile = field(default_factory=MaterialProfile)
     lighting: LightRig = field(default_factory=LightRig)
     dof: DepthOfField = field(default_factory=DepthOfField)
+    emphasis: Emphasis = field(default_factory=Emphasis)
+    smooth_camera: bool = True   # Phase 3: ease into/out of keyframes (vs linear)
+
+
+def _frame_starts(keyframes, fps: int) -> tuple[list[int], int]:
+    """Frame index where each keyframe is shown (start of its outgoing transition),
+    mirroring interpolate.build_frames, plus the total frame count (incl. the final
+    held frame). Lets the director map per-keyframe events onto frame ranges."""
+    starts: list[int] = []
+    f = 0
+    for i, kf in enumerate(keyframes):
+        starts.append(f)
+        if i < len(keyframes) - 1:
+            d = keyframes[i + 1].duration_in_s
+            f += 0 if d <= 0 else max(1, int(round(d * fps)))
+    return starts, f + 1
+
+
+def emphasis_track(keyframes, fps: int, settings: DirectorSettings | None = None):
+    """Per-frame emphasis as a list of (hero_layer, glow_add, spotlight_factor). A
+    glow pulse + context dip fires when a layer is introduced or highlighted, peaking
+    as it appears and decaying over `emphasis.seconds`. The opening keyframe is
+    skipped (nothing is 'revealed' there)."""
+    s = settings or DirectorSettings()
+    starts, total = _frame_starts(keyframes, fps)
+    heroes = infer_heroes(keyframes)
+    pulse = max(1, int(round(s.emphasis.seconds * fps)))
+    track = [(None, 0.0, 1.0)] * total
+    for i in range(1, len(heroes)):           # skip the opening keyframe
+        h = heroes[i]
+        if h["reason"] not in ("introduced", "highlighted") or not h["hero"]:
+            continue
+        for df in range(pulse):
+            fi = starts[i] + df
+            if fi >= total:
+                break
+            env = 1.0 - df / pulse            # 1 at appearance -> 0 after `pulse`
+            glow = s.emphasis.glow * env
+            spot = 1.0 - s.emphasis.spotlight * env
+            cur = track[fi]
+            if glow >= cur[1]:                # strongest overlapping event wins
+                track[fi] = (h["hero"], glow, min(spot, cur[2]))
+    return track
 
 
 def _visible_layer_segments(kf) -> dict[str, frozenset]:

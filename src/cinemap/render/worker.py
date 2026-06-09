@@ -288,10 +288,19 @@ class RenderWorker:
                         mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": an.color}
             self._progress(0.1 + 0.35 * (fi + 1) / len(frames),
                            f"loading meshes {fi + 1}/{len(frames)}")
+        # director Phase 2: per-frame (hero, glow, spotlight) emphasis for appear/
+        # highlight events — a brief glow on the new structure + a context dip.
+        emph_track = None
+        if self._auto_direct:
+            from . import director
+            emph_track = director.emphasis_track(getattr(self, "_kfs", self.project.keyframes),
+                                                 self.job.settings.fps)
         frame_specs = []
         for fi, fr in enumerate(frames):
             if self.cancel.is_set():
                 raise RenderCancelled()
+            emph_hero, emph_glow, emph_spot = (
+                emph_track[fi] if emph_track and fi < len(emph_track) else (None, 0.0, 1.0))
             # region to crop EM around the camera target, sized to what's on screen
             dist = math.dist(fr.position_nm, fr.look_at_nm)
             half = max(500.0, dist * math.tan(math.radians(fr.fov_deg) / 2) * 1.25)
@@ -326,11 +335,17 @@ class RenderWorker:
                     # effective 3D alpha = cinematic fade (opacity) * NG "Opacity (3d)"
                     oa = getattr(m, "object_alpha", 1.0)
                     eff = m.opacity * oa
-                    overrides[uid] = {
+                    is_hero = (m.mesh_name == emph_hero)
+                    if emph_track and not is_hero and emph_spot < 1.0:
+                        eff *= emph_spot                 # spotlight: briefly dim context
+                    ov = {
                         "opacity": eff,
                         "visible": eff > 0.001,
                         "silhouette": getattr(m, "silhouette", 0.0),
                     }
+                    if is_hero and emph_glow > 0.0:
+                        ov["emphasis"] = emph_glow       # brief emission glow on the hero
+                    overrides[uid] = ov
             for an in fr.annotations:
                 uid = self._ann_uid(an)
                 if uid in mesh_specs:
@@ -425,8 +440,12 @@ class RenderWorker:
         if self.job.kf_range:
             a, b = self.job.kf_range
             kfs = kfs[a : b + 1]
+        self._kfs = kfs   # the exact keyframes these frames came from (for the director)
         self._progress(0.05, "interpolating keyframes")
-        frames = build_frames(kfs, self.job.settings.fps)
+        # director (Phase 3): ease into/out of each keyframe for cinematic motion;
+        # off => linear (video_tool-faithful). Same frame count and total duration.
+        ease = "ease-in-out" if self._auto_direct else None
+        frames = build_frames(kfs, self.job.settings.fps, ease_override=ease)
         if not frames:
             raise ValueError("no keyframes to render")
 
