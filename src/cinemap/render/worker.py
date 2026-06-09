@@ -45,7 +45,10 @@ class RenderWorker:
         self.manifest: Manifest = project.manifest
         self.workdir = PROJECTS_DIR / project.id / "renders" / job.id
         self.frames_dir = self.workdir / "frames"
-        self.assets_dir = self.workdir / "assets"
+        # asset cache is PROJECT-level (not per-job) so re-renders, A/B (director on/off),
+        # and changes to fps/samples/detail all reuse already-downloaded geometry. The
+        # uid keys geometry+LOD+color, so sharing across jobs is safe.
+        self.assets_dir = PROJECTS_DIR / project.id / "assets"
         self.blend_path = self.workdir / "scene.blend"
         self.cancel = threading.Event()   # set to request cancellation
         self._proc: subprocess.Popen | None = None
