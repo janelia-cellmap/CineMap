@@ -269,7 +269,6 @@ class RenderWorker:
         W = self.job.settings.width
         H = max(1, self.job.settings.height)
         aspect = W / H
-        cap = max(200_000, self._mesh_budget // 8)        # generous per-segment ceiling
 
         def _bucket(nmpp):                                 # geometric grid -> reuse
             return round(1.5 ** round(_m.log(max(nmpp, 1e-6)) / _m.log(1.5)), 3)
@@ -307,17 +306,21 @@ class RenderWorker:
                     continue
                 lc = self._frame_colors(m)
                 ckey = str(lc.cache_key())
+                # spend the layer budget on the VISIBLE segments (so a zoom on a few
+                # gives each lots of detail; a wide view spreads it thin) — keeps the
+                # per-frame total ~the budget while still letting near segments go fine.
+                cap = max(150_000, self._mesh_budget // max(8, len(vis)))
                 sel = sorted((int(s), _bucket(n)) for s, n in vis.items())
-                uid = f"{m.mesh_name}_{hashlib.md5((ckey + '|' + str(sel)).encode()).hexdigest()[:10]}"
+                uid = f"{m.mesh_name}_{hashlib.md5((ckey + '|' + str(cap) + '|' + str(sel)).encode()).hexdigest()[:10]}"
                 per[m.mesh_name] = uid
                 if uid not in mesh_specs:
                     parts = []
                     for s, b in sel:
-                        key = (m.mesh_name, s, b, ckey)
+                        key = (m.mesh_name, s, b, cap, ckey)
                         mesh = seg_cache.get(key)
                         if mesh is None and key not in seg_cache:
                             try:
-                                mesh = ld._precomputed(s, lc.rgb, b, self._draft, max_verts=cap)
+                                mesh = ld._precomputed(s, lc.rgb, b, self._draft, max_verts=key[3])
                             except Exception as e:  # noqa: BLE001
                                 print(f"[chunk] {m.mesh_name} seg {s} failed: {e}")
                                 mesh = None
