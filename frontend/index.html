@@ -42,7 +42,9 @@
   #preview img, #preview video { max-width:100%; max-height:100%; }
   .controls { padding:8px 10px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; border-top:1px solid var(--line); }
   .controls label { font-size:12px; color:var(--mut); }
-  .controls input { width:64px; }
+  .controls input:not([type=checkbox]) { width:64px; }
+  .controls input[type=checkbox] { width:auto; margin:0 2px 0 0; vertical-align:middle; }
+  .controls label.chk { color:var(--fg); }  /* toggle labels read as active controls */
   #bar { height:6px; background:#222734; border-radius:3px; overflow:hidden; }
   #barFill { height:100%; width:0%; background:var(--accent); transition:width .2s; }
   footer { height:200px; border-top:1px solid var(--line); background:#12151c; display:flex; flex-direction:column; }
@@ -97,7 +99,7 @@
       <label>fps</label><input id="fps" value="30" />
       <label>samples</label><input id="samples" value="48" />
       <label title="mesh detail multiplier (1 = default ~5M verts/layer). Higher = crisper but more GPU memory; auto-retries lower if it runs out.">detail</label><input id="detail" value="1" style="width:44px" />
-      <label title="Auto-direct: non-destructive presentation pass — camera-relative key/fill/rim lighting, publication materials, subtle depth-of-field on the framed subject. Off = plain neuroglancer-faithful look."><input id="autoDirect" type="checkbox" checked /> direct</label>
+      <label class="chk" title="Director: a non-destructive presentation pass that enhances the look WITHOUT changing your neuroglancer data — camera-relative key/fill/rim lighting, publication-quality materials, and subtle depth-of-field on the framed subject. Uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
       <label title="Mesh LOD strategy: Single = one resolution for the whole shot. Per-frame = coarser when far, finer on close-ups (like neuroglancer; free on orbits). Per-chunk = spatial LOD within a mesh (experimental, currently same as per-frame).">lod
         <select id="lodMode">
           <option value="frame" selected>per-frame</option>
