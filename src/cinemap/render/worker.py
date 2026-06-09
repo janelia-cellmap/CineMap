@@ -445,9 +445,12 @@ class RenderWorker:
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         except Exception:  # noqa: BLE001
             ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+        # yuv444p keeps full-resolution color (no 4:2:0 chroma subsampling), so the
+        # thin saturated colored structures stay crisp. Trade-off: this is H.264 High
+        # 4:4:4 — Chrome/VLC/ffmpeg play it, but Safari/QuickTime may not.
         subprocess.run([
             ffmpeg, "-y", "-framerate", str(self.job.settings.fps),
             "-i", str(self.frames_dir / "frame_%05d.png"),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", str(out),
+            "-c:v", "libx264", "-pix_fmt", "yuv444p", "-crf", "18", str(out),
         ], check=True, capture_output=True)
         return str(out)
