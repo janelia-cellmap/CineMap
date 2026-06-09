@@ -445,13 +445,15 @@ class RenderWorker:
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         except Exception:  # noqa: BLE001
             ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-        # yuv444p keeps full-resolution color (no 4:2:0 chroma subsampling) and crf 14
-        # (near visually lossless) preserves the thin saturated colored structures, so
-        # the mp4 closely matches the PNG frames. Trade-off: yuv444p is H.264 High
-        # 4:4:4 — Chrome/VLC/ffmpeg play it, but Safari/QuickTime may not.
+        # yuv420p for universal playback (QuickTime/Safari refuse H.264 4:4:4), with
+        # crf 14 (near visually lossless) + faststart. crf 14 is the real crispness
+        # win — 4:4:4's extra color resolution was marginal on this content and not
+        # worth losing Mac/Safari playback. For a publication-grade master (full 4:4:4
+        # color), use the .blend export or render the PNG frames directly.
         subprocess.run([
             ffmpeg, "-y", "-framerate", str(self.job.settings.fps),
             "-i", str(self.frames_dir / "frame_%05d.png"),
-            "-c:v", "libx264", "-pix_fmt", "yuv444p", "-crf", "14", str(out),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "14",
+            "-movflags", "+faststart", str(out),
         ], check=True, capture_output=True)
         return str(out)
