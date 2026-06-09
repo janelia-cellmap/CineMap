@@ -98,7 +98,12 @@
       <label>h</label><input id="h" value="720" />
       <label>fps</label><input id="fps" value="30" />
       <label>samples</label><input id="samples" value="48" />
-      <label title="mesh detail multiplier (1 = default ~5M verts/layer). Higher = crisper but more GPU memory; auto-retries lower if it runs out.">detail</label><input id="detail" value="1" style="width:44px" />
+      <label title="Mesh quality = the per-layer vertex budget. Higher = crisper but more GPU memory (auto-retries lower if it runs out).">quality
+        <select id="detail">
+          <option value="1" selected>basic (~5M/layer)</option>
+          <option value="2">high (~10M/layer)</option>
+          <option value="3">max (~15M/layer)</option>
+        </select></label>
       <label class="chk" title="Director: a non-destructive presentation pass that enhances the look WITHOUT changing your neuroglancer data — camera-relative key/fill/rim lighting, publication-quality materials, and subtle depth-of-field on the framed subject. Uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
       <label title="Mesh LOD strategy: Single = one resolution for the whole shot. Per-frame = coarser when far, finer on close-ups (like neuroglancer; free on orbits). Per-chunk = spatial LOD within a mesh (experimental, currently same as per-frame).">lod
         <select id="lodMode">

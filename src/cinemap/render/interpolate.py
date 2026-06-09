@@ -19,8 +19,12 @@ from ..models import Keyframe
 
 def _ease(t: float, mode: str) -> float:
     if mode == "ease-in-out":
-        return t * t * (3 - 2 * t)  # smoothstep
-    return t
+        return t * t * (3 - 2 * t)              # smoothstep (slow in AND out)
+    if mode == "ease-in":
+        return t * t                            # slow start, full speed at end
+    if mode == "ease-out":
+        return t * (2 - t)                      # full speed start, slow stop
+    return t                                    # linear (constant velocity)
 
 
 def _cam_basis(cam):
@@ -167,22 +171,31 @@ def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
 
 
 def build_frames(keyframes: list[Keyframe], fps: int,
-                 ease_override: str | None = None) -> list[FrameState]:
+                 smooth_ends: bool = False) -> list[FrameState]:
     """Flatten keyframes to per-frame states, matching neuroglancer's video_tool
     exactly: for each transition i->i+1 emit round(duration*fps) frames at t = k/n
     for k in [0, n) (so keyframe i is shown at the START of its outgoing transition),
     then one final frame holding the last keyframe. `duration_in_s` is stored on the
     DESTINATION keyframe (the transition into it). A duration of 0 emits no transition
-    frames (an instant cut). `ease_override` (e.g. "ease-in-out" from the director)
-    reshapes the motion within each transition — same frame count and total duration,
-    just a smoother settle into each keyframe — without changing video_tool timing."""
+    frames (an instant cut).
+
+    `smooth_ends` (the director's cinematic motion) eases into the FIRST transition
+    and out of the LAST, but keeps the middle LINEAR — so the camera glides to a
+    gentle start/stop without pausing at every intermediate keyframe (per-transition
+    ease-in-out would decelerate to a near-stop at each one). Same frame count and
+    total duration as video_tool either way."""
     if not keyframes:
         return []
     frames: list[FrameState] = []
-    for i in range(len(keyframes) - 1):
+    n_trans = len(keyframes) - 1
+    for i in range(n_trans):
         a, b = keyframes[i], keyframes[i + 1]
         n = 0 if b.duration_in_s <= 0 else max(1, int(round(b.duration_in_s * fps)))
-        ease = ease_override or b.easing
+        if smooth_ends:
+            ease = ("ease-in-out" if n_trans == 1 else
+                    "ease-in" if i == 0 else "ease-out" if i == n_trans - 1 else "linear")
+        else:
+            ease = b.easing
         for k in range(n):
             frames.append(_state_at(a, b, _ease(k / n, ease)))
     frames.append(_state_at(keyframes[-1], keyframes[-1], 0.0))  # final keyframe, 1 frame

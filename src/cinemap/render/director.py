@@ -98,7 +98,8 @@ def emphasis_track(keyframes, fps: int, settings: DirectorSettings | None = None
             fi = starts[i] + df
             if fi >= total:
                 break
-            env = 1.0 - df / pulse            # 1 at appearance -> 0 after `pulse`
+            x = df / pulse                    # smooth bump: quick rise, soft falloff
+            env = (x / 0.2) if x < 0.2 else (1.0 - (x - 0.2) / 0.8) ** 2
             glow = s.emphasis.glow * env
             spot = 1.0 - s.emphasis.spotlight * env
             cur = track[fi]
@@ -107,41 +108,50 @@ def emphasis_track(keyframes, fps: int, settings: DirectorSettings | None = None
     return track
 
 
-def _visible_layer_segments(kf) -> dict[str, frozenset]:
-    """{layer name: visible segment set} for this keyframe's 3D mesh layers."""
-    out: dict[str, frozenset] = {}
+_VISIBLE_ALPHA = 0.1   # a layer counts as on-screen only above this effective opacity
+
+
+def _layer_state(kf) -> dict[str, tuple]:
+    """{layer name: (segment_count, effective_alpha, color)} for 3D mesh layers."""
+    out: dict[str, tuple] = {}
     for m in kf.meshes:
-        if (getattr(m, "render_3d", True) and getattr(m, "visible", True)
-                and m.segment_ids):
-            out[m.mesh_name] = frozenset(m.segment_ids)
+        if getattr(m, "render_3d", True) and m.segment_ids:
+            a = float(getattr(m, "object_alpha", 1.0)) if getattr(m, "visible", True) else 0.0
+            out[m.mesh_name] = (len(m.segment_ids), round(a, 3), tuple(m.color or []))
     return out
 
 
 def infer_heroes(keyframes) -> list[dict]:
-    """Per keyframe, the most salient ("hero") layer and why. Salience priority,
-    matching how a viewer's eye is drawn:
-      introduced (new this keyframe) > highlighted (color/opacity changed) >
-      focal (fewest segments — the specific object vs the bulk context) > first 3D.
-    Pure presentation metadata (focus/emphasis); it never alters the data."""
+    """Per keyframe, the most salient ("hero") layer and why — emphasis should fire
+    only when a structure becomes MORE prominent, never as it fades out:
+      introduced (newly visible — new layer, or one that just rose above invisible) >
+      highlighted (recolored, or opacity clearly increased) >
+      focal (fewest visible segments; no emphasis — just metadata).
+    A layer that's (near-)invisible, or merely fading away, is never a hero. Pure
+    presentation metadata; it never alters the data."""
     heroes: list[dict] = []
-    prev_segs: dict[str, frozenset] = {}
-    prev_style: dict[str, tuple] = {}
+    prev: dict[str, tuple] = {}
     for kf in keyframes:
-        segs = _visible_layer_segments(kf)
-        style = {m.mesh_name: (tuple(m.color or []),
-                               round(float(getattr(m, "object_alpha", 1.0)), 3))
-                 for m in kf.meshes}
-        hero, reason = None, ""
-        appeared = [n for n in segs if n not in prev_segs]
-        changed = [n for n in segs if n in prev_style and style.get(n) != prev_style[n]]
-        if appeared:
-            hero, reason = min(appeared, key=lambda n: len(segs[n])), "introduced"
-        elif changed:
-            hero, reason = changed[0], "highlighted"
-        elif segs:
-            hero, reason = min(segs, key=lambda n: len(segs[n])), "focal"
+        st = _layer_state(kf)
+        introduced, highlighted = [], []
+        for name, (n, a, col) in st.items():
+            if a < _VISIBLE_ALPHA:                         # not visibly shown
+                continue
+            if name not in prev or prev[name][1] < _VISIBLE_ALPHA:
+                introduced.append((name, n))               # new, or just became visible
+            else:
+                _, pa, pcol = prev[name]
+                if col != pcol or a > pa + 0.05:           # recolored / more opaque
+                    highlighted.append((name, n))
+        if introduced:
+            hero, reason = min(introduced, key=lambda x: x[1])[0], "introduced"
+        elif highlighted:
+            hero, reason = min(highlighted, key=lambda x: x[1])[0], "highlighted"
+        else:
+            vis = [(name, s[0]) for name, s in st.items() if s[1] >= _VISIBLE_ALPHA]
+            hero, reason = (min(vis, key=lambda x: x[1])[0] if vis else None), "focal"
         heroes.append({"hero": hero, "reason": reason})
-        prev_segs, prev_style = segs, style
+        prev = st
     return heroes
 
 

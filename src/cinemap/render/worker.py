@@ -445,10 +445,10 @@ class RenderWorker:
             kfs = kfs[a : b + 1]
         self._kfs = kfs   # the exact keyframes these frames came from (for the director)
         self._progress(0.05, "interpolating keyframes")
-        # director (Phase 3): ease into/out of each keyframe for cinematic motion;
-        # off => linear (video_tool-faithful). Same frame count and total duration.
-        ease = "ease-in-out" if self._auto_direct else None
-        frames = build_frames(kfs, self.job.settings.fps, ease_override=ease)
+        # director (Phase 3): glide to a gentle start/stop (ease the first/last
+        # transition, linear through the middle so a rotation doesn't pause at every
+        # keyframe); off => linear (video_tool-faithful). Same frame count/duration.
+        frames = build_frames(kfs, self.job.settings.fps, smooth_ends=self._auto_direct)
         if not frames:
             raise ValueError("no keyframes to render")
 
