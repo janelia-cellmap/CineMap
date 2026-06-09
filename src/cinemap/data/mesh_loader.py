@@ -11,7 +11,12 @@ import json
 import os
 import re
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+
+# segments are fetched concurrently (cloud-volume .get is network + draco decode =
+# I/O-bound, GIL released), a big win for many-segment layers (e.g. thousands of mitos).
+_FETCH_WORKERS = 12
 
 import numpy as np
 import trimesh
@@ -215,9 +220,21 @@ class MeshLoader:
         combined vertex count — split evenly across segments — so a layer with many
         segments (e.g. 50 neurons) stays bounded even when the camera zooms in on one
         frame; a single segment can still use the whole budget for a sharp close-up."""
+        seg_ids = list(seg_ids)
         per_seg = (total_budget / max(1, len(seg_ids))) if total_budget else None
-        parts = [self._precomputed(s, colorize, nm_per_px, draft, max_verts=per_seg)
-                 for s in seg_ids]
+
+        def _fetch(s):
+            try:
+                return self._precomputed(s, colorize, nm_per_px, draft, max_verts=per_seg)
+            except Exception as e:  # noqa: BLE001  (one bad segment shouldn't sink the layer)
+                print(f"[mesh] segment {s} failed: {e}")
+                return None
+
+        if len(seg_ids) > 1:
+            with ThreadPoolExecutor(max_workers=min(_FETCH_WORKERS, len(seg_ids))) as ex:
+                parts = list(ex.map(_fetch, seg_ids))
+        else:
+            parts = [_fetch(seg_ids[0])]
         parts = [p for p in parts if p is not None]
         if not parts:
             return None
