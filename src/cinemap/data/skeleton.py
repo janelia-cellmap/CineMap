@@ -12,6 +12,7 @@ for a whole layer's selected segments) to stay fast across thousands of segments
 """
 from __future__ import annotations
 
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 
@@ -19,7 +20,8 @@ import numpy as np
 import trimesh
 from cloudvolume import CloudVolume
 
-_FETCH_WORKERS = 12  # concurrent per-segment skeleton fetches (I/O-bound)
+# concurrent per-segment fetches; logical CPU count (incl. hyperthreading) by default
+_FETCH_WORKERS = int(os.environ.get("CINEMAP_FETCH_WORKERS") or (os.cpu_count() or 8))
 
 # Default tube radius (nm). Skeletons are 1D, so this is a render choice, not data;
 # tuned to read as a visible strand at EM/organelle scale. Override per call.

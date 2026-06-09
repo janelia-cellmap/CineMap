@@ -16,7 +16,8 @@ from functools import lru_cache
 
 # segments are fetched concurrently (cloud-volume .get is network + draco decode =
 # I/O-bound, GIL released), a big win for many-segment layers (e.g. thousands of mitos).
-_FETCH_WORKERS = 12
+# Default to logical CPU count (includes hyperthreading); CINEMAP_FETCH_WORKERS overrides.
+_FETCH_WORKERS = int(os.environ.get("CINEMAP_FETCH_WORKERS") or (os.cpu_count() or 8))
 
 import numpy as np
 import trimesh
