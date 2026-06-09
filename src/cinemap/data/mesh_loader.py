@@ -117,6 +117,18 @@ class MeshLoader:
             m = re.search(r"-?\d+\s*-\s*(\d+)\)", str(e))
             return int(m.group(1)) if m else 0
 
+    def seg_bbox(self, seg_id: int):
+        """World-space ((x0,y0,z0),(x1,y1,z1)) bbox in nm from the coarsest LOD (a
+        cheap fetch) — used by the view-aware ('chunk') LOD mode to frustum-cull and
+        size each segment on screen. None if the segment can't be read."""
+        try:
+            b = self._draco(int(seg_id), lod=self._max_lod(seg_id)).bounds
+            return ((float(b[0][0]), float(b[0][1]), float(b[0][2])),
+                    (float(b[1][0]), float(b[1][1]), float(b[1][2])))
+        except Exception as e:  # noqa: BLE001
+            print(f"[mesh] bbox {seg_id} failed: {e}")
+            return None
+
     @staticmethod
     def _mesh_resolution_nm(mesh: trimesh.Trimesh) -> float:
         """A LOD's spatial resolution (nm) ~ its mean triangle edge length. A robust

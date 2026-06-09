@@ -250,6 +250,93 @@ class RenderWorker:
         mesh.export(str(out))
         return str(out)
 
+    def _build_chunk_assets(self, frames, mesh_specs) -> list[dict]:
+        """View-aware ('chunk') LOD, the closest we get to neuroglancer per-frame:
+        for each frame, frustum-cull each layer's off-screen segments and size each
+        visible one by ITS OWN on-screen footprint (so only what's shown is built,
+        and only near/large segments go fine). The visible set is assembled into one
+        mesh, cached by selection so frames sharing a selection reuse it. Returns
+        per-frame {layer name: asset uid}."""
+        import hashlib
+        import math as _m
+        from concurrent.futures import ThreadPoolExecutor
+
+        import trimesh
+
+        from ..data.mesh_loader import MeshLoader, _FETCH_WORKERS
+        from .visibility import visible_segments
+
+        W = self.job.settings.width
+        H = max(1, self.job.settings.height)
+        aspect = W / H
+        cap = max(200_000, self._mesh_budget // 8)        # generous per-segment ceiling
+
+        def _bucket(nmpp):                                 # geometric grid -> reuse
+            return round(1.5 ** round(_m.log(max(nmpp, 1e-6)) / _m.log(1.5)), 3)
+
+        # one loader + per-segment bbox per 3D mesh layer (bboxes fetched in parallel)
+        layers: dict[str, tuple] = {}
+        for fr in frames:
+            for m in fr.meshes:
+                if not m.render_3d or not m.segment_ids or m.mesh_name in layers:
+                    continue
+                src = next((s for s in self.manifest.meshes
+                            if s.name == m.mesh_name and s.mesh_url), None)
+                if not src:
+                    continue
+                ld = MeshLoader(src.mesh_url, src.label_zarr)
+                with ThreadPoolExecutor(max_workers=min(_FETCH_WORKERS, len(m.segment_ids))) as ex:
+                    bbs = list(ex.map(ld.seg_bbox, m.segment_ids))
+                layers[m.mesh_name] = (ld, {s: b for s, b in zip(m.segment_ids, bbs) if b})
+
+        seg_cache: dict = {}                               # (layer, seg, bucket, color) -> mesh
+        frame_layer_uid: list[dict] = []
+        for fi, fr in enumerate(frames):
+            if self.cancel.is_set():
+                raise RenderCancelled()
+            per: dict[str, str] = {}
+            for m in fr.meshes:
+                if m.mesh_name not in layers:
+                    continue
+                ld, bboxes = layers[m.mesh_name]
+                if not bboxes:
+                    continue
+                vis = visible_segments(bboxes, fr.position_nm, fr.look_at_nm, fr.up,
+                                       _m.radians(fr.fov_deg), aspect, H)
+                if not vis:
+                    continue
+                lc = self._frame_colors(m)
+                ckey = str(lc.cache_key())
+                sel = sorted((int(s), _bucket(n)) for s, n in vis.items())
+                uid = f"{m.mesh_name}_{hashlib.md5((ckey + '|' + str(sel)).encode()).hexdigest()[:10]}"
+                per[m.mesh_name] = uid
+                if uid not in mesh_specs:
+                    parts = []
+                    for s, b in sel:
+                        key = (m.mesh_name, s, b, ckey)
+                        mesh = seg_cache.get(key)
+                        if mesh is None and key not in seg_cache:
+                            try:
+                                mesh = ld._precomputed(s, lc.rgb, b, self._draft, max_verts=cap)
+                            except Exception as e:  # noqa: BLE001
+                                print(f"[chunk] {m.mesh_name} seg {s} failed: {e}")
+                                mesh = None
+                            seg_cache[key] = mesh
+                        if mesh is not None:
+                            parts.append(mesh)
+                    if not parts:
+                        per.pop(m.mesh_name, None)
+                        continue
+                    combined = trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+                    out = self.assets_dir / f"mesh_{uid}.ply"
+                    os.makedirs(out.parent, exist_ok=True)
+                    combined.export(str(out))
+                    mesh_specs[uid] = {"id": uid, "obj_path": str(out), "color": m.color}
+            frame_layer_uid.append(per)
+            self._progress(0.1 + 0.35 * (fi + 1) / len(frames),
+                           f"chunk assets {fi + 1}/{len(frames)} ({len(mesh_specs)} built)")
+        return frame_layer_uid
+
     # ---- scene spec ----
     def _build_scene_spec(self, frames: list[FrameState], index_offset: int = 0) -> dict:
         # On-screen scale (nm per pixel) per frame, for picking precomputed-mesh LOD
@@ -269,19 +356,24 @@ class RenderWorker:
         # references only its bucket's variant and the others auto-hide, so far frames
         # render a coarse mesh and close-ups a fine one.
         mesh_specs: dict[str, dict] = {}
+        # "chunk" mode: per-frame frustum cull + per-segment on-screen LOD (see
+        # _build_chunk_assets); other modes: one combined mesh per (layer, segset, bucket).
+        frame_layer_uid = (self._build_chunk_assets(frames, mesh_specs)
+                           if self._lod_mode == "chunk" else None)
         for fi, fr in enumerate(frames):
             if self.cancel.is_set():
                 raise RenderCancelled()
             nmpp = frame_lod_nmpp[fi]
-            for m in fr.meshes:
-                if not m.render_3d:           # label-only layer -> slice overlay only
-                    continue
-                lc = self._frame_colors(m)
-                uid = self._mesh_uid(m.mesh_name, m.segment_ids, lc.cache_key(), nmpp)
-                if uid not in mesh_specs:
-                    obj = self._mesh_obj(m.mesh_name, m.segment_ids, lc, nmpp)
-                    if obj:
-                        mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": m.color}
+            if frame_layer_uid is None:
+                for m in fr.meshes:
+                    if not m.render_3d:       # label-only layer -> slice overlay only
+                        continue
+                    lc = self._frame_colors(m)
+                    uid = self._mesh_uid(m.mesh_name, m.segment_ids, lc.cache_key(), nmpp)
+                    if uid not in mesh_specs:
+                        obj = self._mesh_obj(m.mesh_name, m.segment_ids, lc, nmpp)
+                        if obj:
+                            mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": m.color}
             # annotation layers -> geometry assets via the same import path
             for an in fr.annotations:
                 uid = self._ann_uid(an)
@@ -289,8 +381,9 @@ class RenderWorker:
                     obj = self._ann_obj(an)
                     if obj:
                         mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": an.color}
-            self._progress(0.1 + 0.35 * (fi + 1) / len(frames),
-                           f"loading meshes {fi + 1}/{len(frames)}")
+            if frame_layer_uid is None:
+                self._progress(0.1 + 0.35 * (fi + 1) / len(frames),
+                               f"loading meshes {fi + 1}/{len(frames)}")
         # director Phase 2: per-frame (hero, glow, spotlight) emphasis for appear/
         # highlight events — a brief glow on the new structure + a context dip.
         emph_track = None
@@ -332,9 +425,12 @@ class RenderWorker:
                 slices.append({**png, "opacity": sl.opacity, "slot": f"{sl.em_name}:{sl.axis}"})
             overrides = {}
             for m in fr.meshes:
-                uid = self._mesh_uid(m.mesh_name, m.segment_ids,
-                                     self._frame_colors(m).cache_key(), frame_lod_nmpp[fi])
-                if uid in mesh_specs:
+                if frame_layer_uid is not None:           # chunk mode: per-frame selection
+                    uid = frame_layer_uid[fi].get(m.mesh_name)
+                else:
+                    uid = self._mesh_uid(m.mesh_name, m.segment_ids,
+                                         self._frame_colors(m).cache_key(), frame_lod_nmpp[fi])
+                if uid and uid in mesh_specs:
                     # effective 3D alpha = cinematic fade (opacity) * NG "Opacity (3d)"
                     oa = getattr(m, "object_alpha", 1.0)
                     eff = m.opacity * oa
