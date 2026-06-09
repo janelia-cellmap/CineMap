@@ -143,6 +143,10 @@ class RenderSettings(BaseModel):
     # rim lighting, publication materials, subtle depth-of-field on the framed
     # subject). On by default; off renders the plain neuroglancer-faithful scene.
     auto_direct: bool = True
+    # Dynamic per-frame LOD: build coarser meshes for frames where a layer is small/
+    # far on screen, finer for close-ups (like neuroglancer). Collapses to a single
+    # build for ~constant-distance shots; off always builds at the finest scale.
+    dynamic_lod: bool = True
 
 
 class RenderJob(BaseModel):

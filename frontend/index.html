@@ -98,6 +98,7 @@
       <label>samples</label><input id="samples" value="48" />
       <label title="mesh detail multiplier (1 = default ~5M verts/layer). Higher = crisper but more GPU memory; auto-retries lower if it runs out.">detail</label><input id="detail" value="1" style="width:44px" />
       <label title="Auto-direct: non-destructive presentation pass — camera-relative key/fill/rim lighting, publication materials, subtle depth-of-field on the framed subject. Off = plain neuroglancer-faithful look."><input id="autoDirect" type="checkbox" checked /> direct</label>
+      <label title="Dynamic LOD: build coarser meshes when a layer is small/far on screen, finer for close-ups (like neuroglancer). Collapses to a single build for constant-distance shots."><input id="dynamicLod" type="checkbox" checked /> lod</label>
       <button id="previewBtn" onclick="startRender('preview')">▷ Preview</button>
       <label title="preview renders at fps ÷ this">1/</label><input id="ratio" value="10" style="width:44px" />
       <button id="cancelBtn" onclick="cancelRender()" style="display:none;background:#7d2e2e;border-color:transparent;color:#fff">■ Cancel</button>
@@ -383,7 +384,7 @@ async function startRender(mode) {
   // use full resolution for the final output.
   const body = { width:+$('w').value, height:+$('h').value, fps, samples:+$('samples').value,
                  draft: mode === 'preview', mesh_detail: +$('detail').value || 1,
-                 auto_direct: $('autoDirect').checked };
+                 auto_direct: $('autoDirect').checked, dynamic_lod: $('dynamicLod').checked };
   if (mode === 'blend') body.export_blend = true;   // bake an animated .blend, no video
   let job_id;
   try { ({ job_id } = await api('POST', `/api/projects/${PID}/render`, body)); }

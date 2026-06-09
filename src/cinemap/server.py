@@ -77,6 +77,7 @@ class RenderReq(BaseModel):
     mesh_detail: float = 1.0    # per-layer vertex-budget multiplier (hard-capped)
     mesh_from_labels: bool = False  # regenerate watertight meshes from labels vs precomputed
     auto_direct: bool = True    # non-destructive presentation pass (lighting/material/DOF)
+    dynamic_lod: bool = True    # per-frame mesh LOD (coarser when far, finer on close-ups)
 
 
 class ChatReq(BaseModel):
@@ -421,7 +422,7 @@ def render(pid: str, req: RenderReq):
     settings = RenderSettings(width=req.width, height=req.height, fps=req.fps,
                               samples=req.samples, export_blend=req.export_blend, draft=req.draft,
                               mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels,
-                              auto_direct=req.auto_direct)
+                              auto_direct=req.auto_direct, dynamic_lod=req.dynamic_lod)
     return {"job_id": _start_render(pid, settings, kf_range=req.kf_range)}
 
 

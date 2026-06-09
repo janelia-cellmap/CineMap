@@ -71,7 +71,10 @@ class RenderWorker:
         base_budget = 1_200_000 if draft else 5_000_000
         self._mesh_budget = min(int(base_budget * detail), self.MESH_BUDGET_CEILING)
         self._nm_per_px = None  # finest on-screen scale across frames (set per build)
-        self._lod_tag = ""      # cache-key component so re-framing rebuilds LOD assets
+        # dynamic per-frame LOD: build coarser meshes for frames where a layer is
+        # small/far on screen, finer for close-ups (like neuroglancer). Collapses to
+        # a single build for ~constant-distance shots, so it's free on pure orbits.
+        self._dynamic_lod = bool(getattr(job.settings, "dynamic_lod", True))
         # non-destructive presentation pass (lighting rig / materials / DOF)
         self._auto_direct = bool(getattr(job.settings, "auto_direct", True))
 
@@ -136,13 +139,40 @@ class RenderWorker:
         self._slice_cache[key] = out
         return out
 
-    def _mesh_uid(self, mesh_name, ids, color_key=()) -> str:
+    def _lod_tag_for(self, nmpp) -> str:
+        """Cache-key component for a mesh built at on-screen scale `nmpp` (nm/px):
+        re-framing, draft, source, budget, or a different LOD bucket each rebuild."""
+        return (f"npp{nmpp:.3g}|{'draft' if self._draft else 'full'}"
+                f"|{'lab' if self._prefer_labels else 'pre'}|b{self._mesh_budget}"
+                if nmpp else f"b{self._mesh_budget}")
+
+    def _lod_bucket_nmpp(self, nmpps, max_buckets: int = 4) -> list:
+        """Per-frame nm/px to BUILD the mesh at. With dynamic LOD, far frames (large
+        nm/px = layer small on screen) build a coarser mesh and near frames a finer
+        one — like neuroglancer streaming higher-LOD chunks when you zoom in. The
+        bucket value is the FINEST nm/px in its band, so no frame is under-detailed.
+        A ~constant-distance shot collapses to one bucket (= the prior single-LOD
+        build), so extra asset prep only happens for shots that change zoom."""
+        if not nmpps:
+            return []
+        lo, hi = min(nmpps), max(nmpps)
+        if not self._dynamic_lod or max_buckets <= 1 or hi <= lo * 1.6:
+            return [lo] * len(nmpps)          # one bucket -> finest (current behavior)
+        span = math.log(hi / lo)
+        bands = [min(max_buckets - 1, int(math.log(x / lo) / span * max_buckets))
+                 for x in nmpps]
+        band_finest: dict[int, float] = {}
+        for b, x in zip(bands, nmpps):
+            band_finest[b] = min(band_finest.get(b, x), x)
+        return [band_finest[b] for b in bands]
+
+    def _mesh_uid(self, mesh_name, ids, color_key=(), nmpp=None) -> str:
         """Stable id per (layer, exact segment set, coloring, LOD scale) so a
         different segment set, color, OR on-screen resolution becomes a distinct
         cached asset."""
         import hashlib
 
-        sig = ",".join(map(str, sorted(ids))) + "|" + str(color_key) + "|" + self._lod_tag
+        sig = ",".join(map(str, sorted(ids))) + "|" + str(color_key) + "|" + self._lod_tag_for(nmpp)
         return f"{mesh_name}_{hashlib.md5(sig.encode()).hexdigest()[:8]}"
 
     @staticmethod
@@ -157,14 +187,14 @@ class RenderWorker:
             saturation=getattr(m, "saturation", 1.0),
         )
 
-    def _mesh_obj(self, mesh_name, segment_ids, lc) -> str | None:
+    def _mesh_obj(self, mesh_name, segment_ids, lc, nmpp=None) -> str | None:
         src = next((m for m in self.manifest.meshes if m.name == mesh_name), None)
         if not src:
             return None
         ids = segment_ids or src.segment_ids
         if not ids:
             return None
-        uid = self._mesh_uid(mesh_name, ids, lc.cache_key())
+        uid = self._mesh_uid(mesh_name, ids, lc.cache_key(), nmpp)
         out = self.assets_dir / f"mesh_{uid}.ply"  # PLY keeps vertex colors
         if out.exists():
             return str(out)
@@ -180,7 +210,7 @@ class RenderWorker:
                     ids, colorize=lc.rgb,
                     target_voxels_single=self._mesh_voxels_single,
                     target_voxels_union=self._mesh_voxels_union,
-                    nm_per_px=self._nm_per_px, draft=self._draft,
+                    nm_per_px=nmpp, draft=self._draft,
                     prefer_labels=self._prefer_labels, total_budget=self._mesh_budget)
         except Exception as e:  # noqa: BLE001
             print(f"[worker] mesh {mesh_name} ({len(ids)} segs) failed: {e}")
@@ -217,32 +247,34 @@ class RenderWorker:
 
     # ---- scene spec ----
     def _build_scene_spec(self, frames: list[FrameState], index_offset: int = 0) -> dict:
-        # On-screen scale (nm per pixel) for picking precomputed-mesh LOD, like
-        # neuroglancer: take the FINEST requirement across frames (the closest the
-        # camera ever gets) so the cached mesh is sharp enough for every shot.
+        # On-screen scale (nm per pixel) per frame, for picking precomputed-mesh LOD
+        # like neuroglancer. With dynamic LOD this varies per frame (coarser when the
+        # layer is far/small on screen); otherwise every frame uses the finest.
         height = max(1, self.job.settings.height)
 
         def _nmpp(fr):
             d = math.dist(fr.position_nm, fr.look_at_nm)
             return 2.0 * d * math.tan(math.radians(fr.fov_deg) / 2) / height
 
-        self._nm_per_px = min((_nmpp(fr) for fr in frames), default=None)
-        # Asset cache key: nm/px (framing), draft/full, label/precomputed source, and
-        # the vertex budget — so re-framing or a lower OOM-retry budget rebuilds LODs.
-        self._lod_tag = (f"npp{self._nm_per_px:.3g}|{'draft' if self._draft else 'full'}"
-                         f"|{'lab' if self._prefer_labels else 'pre'}|b{self._mesh_budget}"
-                         if self._nm_per_px else f"b{self._mesh_budget}")
+        frame_nmpp = [_nmpp(fr) for fr in frames]
+        self._nm_per_px = min(frame_nmpp, default=None)
+        frame_lod_nmpp = self._lod_bucket_nmpp(frame_nmpp)  # nm/px to build each frame at
 
-        # one Blender object per distinct (layer, segment set) across all frames
+        # One Blender object per distinct (layer, segment set, LOD bucket): a frame
+        # references only its bucket's variant and the others auto-hide, so far frames
+        # render a coarse mesh and close-ups a fine one.
         mesh_specs: dict[str, dict] = {}
-        for fr in frames:
+        for fi, fr in enumerate(frames):
+            if self.cancel.is_set():
+                raise RenderCancelled()
+            nmpp = frame_lod_nmpp[fi]
             for m in fr.meshes:
                 if not m.render_3d:           # label-only layer -> slice overlay only
                     continue
                 lc = self._frame_colors(m)
-                uid = self._mesh_uid(m.mesh_name, m.segment_ids, lc.cache_key())
+                uid = self._mesh_uid(m.mesh_name, m.segment_ids, lc.cache_key(), nmpp)
                 if uid not in mesh_specs:
-                    obj = self._mesh_obj(m.mesh_name, m.segment_ids, lc)
+                    obj = self._mesh_obj(m.mesh_name, m.segment_ids, lc, nmpp)
                     if obj:
                         mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": m.color}
             # annotation layers -> geometry assets via the same import path
@@ -252,6 +284,8 @@ class RenderWorker:
                     obj = self._ann_obj(an)
                     if obj:
                         mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": an.color}
+            self._progress(0.1 + 0.35 * (fi + 1) / len(frames),
+                           f"loading meshes {fi + 1}/{len(frames)}")
         frame_specs = []
         for fi, fr in enumerate(frames):
             if self.cancel.is_set():
@@ -284,7 +318,8 @@ class RenderWorker:
                 slices.append({**png, "opacity": sl.opacity, "slot": f"{sl.em_name}:{sl.axis}"})
             overrides = {}
             for m in fr.meshes:
-                uid = self._mesh_uid(m.mesh_name, m.segment_ids, self._frame_colors(m).cache_key())
+                uid = self._mesh_uid(m.mesh_name, m.segment_ids,
+                                     self._frame_colors(m).cache_key(), frame_lod_nmpp[fi])
                 if uid in mesh_specs:
                     # effective 3D alpha = cinematic fade (opacity) * NG "Opacity (3d)"
                     oa = getattr(m, "object_alpha", 1.0)
@@ -310,7 +345,7 @@ class RenderWorker:
                 "mesh_overrides": overrides,
                 "index": index_offset + fi,   # global frame index (split cluster jobs)
             })
-            self._progress(0.1 + 0.5 * (fi + 1) / len(frames), f"assets {fi + 1}/{len(frames)}")
+            self._progress(0.45 + 0.15 * (fi + 1) / len(frames), f"slices {fi + 1}/{len(frames)}")
         spec = {
             "world": {"nm_per_bu": self.nm_per_bu,
                       "background": self.project.lighting.background},
