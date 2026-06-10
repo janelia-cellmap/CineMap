@@ -153,6 +153,40 @@ class MeshLoader:
             print(f"[mesh] bbox {seg_id} failed: {e}")
             return None
 
+    def fragment_boxes(self, seg_id: int):
+        """The mesh's octree as per-LOD fragments with exact WORLD (nm) bounding
+        boxes — the basis for true per-chunk LOD (frustum-cull + per-fragment screen
+        size, like neuroglancer). Uses cloud-volume's own decode (multilod.py):
+
+            model = grid_origin + vertex_offsets[lod] + chunk_shape·2^lod·[pos, pos+1]
+            nm    = info `transform` · model        (transform carries the resolution)
+
+        No calibration — the resolution is read from the mesh info. Returns
+        (per_lod_fragments, lod_scales_nm) where per_lod_fragments[lod] is a list of
+        (frag_index, lo_nm(3,), hi_nm(3,), grid_pos(3 ints)), and lod_scales_nm is the
+        spatial resolution (nm) of each LOD."""
+        m = self.cv.mesh
+        T = np.asarray(m.transform, float)               # 4x4, resolution baked in
+        man = m.get_manifest(int(seg_id))
+        go = np.asarray(man.grid_origin, float)
+        cs = np.asarray(man.chunk_shape, float)
+        vo = np.asarray(man.vertex_offsets, float)
+        scale = float(abs(np.linalg.det(T[:3, :3])) ** (1.0 / 3.0))  # nm per model unit
+        per_lod = []
+        for lod in range(man.num_lods):
+            cell = cs * (2 ** lod)
+            base = go + vo[lod]
+            frags = []
+            for idx, p in enumerate(np.asarray(man.fragment_positions[lod], float)):
+                lo_m, hi_m = base + cell * p, base + cell * (p + 1)
+                corners = np.array([[x, y, z] for x in (lo_m[0], hi_m[0])
+                                    for y in (lo_m[1], hi_m[1]) for z in (lo_m[2], hi_m[2])])
+                w = (T[:3, :3] @ corners.T).T + T[:3, 3]
+                frags.append((idx, w.min(0), w.max(0), tuple(int(v) for v in p)))
+            per_lod.append(frags)
+        lod_scales_nm = np.asarray(man.lod_scales, float) * scale
+        return per_lod, lod_scales_nm
+
     @staticmethod
     def _mesh_resolution_nm(mesh: trimesh.Trimesh) -> float:
         """A LOD's spatial resolution (nm) ~ its mean triangle edge length. A robust
