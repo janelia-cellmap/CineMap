@@ -44,6 +44,23 @@ def _setup_render(scene_spec: dict) -> None:
         except Exception as e:  # noqa: BLE001
             print(f"[blender] GPU unavailable, CPU: {e}")
         scene.cycles.samples = r.get("samples", 64)
+        # Adaptive sampling + a denoiser do most of the work: `samples` becomes a CEILING,
+        # Cycles stops early on pixels that already look clean (flat areas, the black bg)
+        # and spends rays only where it's still noisy (shadows/edges), then the denoiser
+        # removes the leftover grain. Lets us render far fewer samples for equal/cleaner
+        # output — much faster, and the deep-shadow "drama" look stays clean.
+        try:
+            scene.cycles.use_adaptive_sampling = True
+            scene.cycles.adaptive_threshold = float(r.get("noise_threshold", 0.01))
+            scene.cycles.use_denoising = True
+            for dn in ("OPTIX", "OPENIMAGEDENOISE"):   # GPU denoiser first, then CPU OIDN
+                try:
+                    scene.cycles.denoiser = dn
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception as e:  # noqa: BLE001
+            print(f"[blender] denoise/adaptive unavailable: {e}")
     scene.render.resolution_x = r["width"]
     scene.render.resolution_y = r["height"]
     scene.render.image_settings.file_format = "PNG"
