@@ -25,9 +25,10 @@ class MaterialProfile:
     """Principled-BSDF tuning applied over each layer's neuroglancer base color."""
     roughness: float = 0.38
     specular: float = 0.5        # Blender "Specular IOR Level"
-    sheen: float = 0.08          # subtle soft-edge sheen for a publication look
-    coat: float = 0.0
+    sheen: float = 0.12          # subtle soft-edge sheen for a publication look
+    coat: float = 0.12           # a touch of clear coat -> wet/organic highlight
     emission_strength: float = 0.05  # faint self-illum floor so nothing is pure black
+    edge_glow: float = 0.5       # fresnel rim emission (grazing edges glow their color)
 
 
 @dataclass
@@ -48,13 +49,24 @@ class DepthOfField:
 
 @dataclass
 class Emphasis:
-    """Phase 2: a transient cue when an object is introduced/highlighted, decaying
-    over `seconds`. `glow` is the added emission at the peak (a brief brightening of
-    the object's own color); `spotlight` briefly dims the *other* (context) layers
-    to draw the eye. Both leave the persistent scene unchanged once decayed."""
+    """Transient appear/highlight cue. DISABLED by default (glow/spotlight = 0): a
+    per-object brightness flash is gaudy when many objects appear, and it lands a beat
+    late (at the keyframe, after the fade-in). The reveal is carried by the fade-in
+    itself; structures read as 'lit' via the constant bloom + edge-glow instead."""
     seconds: float = 0.7
-    glow: float = 0.6
-    spotlight: float = 0.25      # context layers dip to (1 - this) at the peak
+    glow: float = 0.0
+    spotlight: float = 0.0       # context layers dip to (1 - this) at the peak
+
+
+@dataclass
+class Bloom:
+    """Soft glow on bright/emissive areas (compositor) — bright structures bloom
+    against the dark background, the 'publication glow'. Constant, so it works the
+    same with one object or thousands (unlike a per-object flash)."""
+    enabled: bool = True
+    threshold: float = 0.6       # brightness above which it blooms
+    size: int = 7                # blur radius (larger = softer/wider glow)
+    mix: float = -0.55           # -1 image only … +1 glare only; small = subtle add
 
 
 @dataclass
@@ -63,6 +75,7 @@ class DirectorSettings:
     lighting: LightRig = field(default_factory=LightRig)
     dof: DepthOfField = field(default_factory=DepthOfField)
     emphasis: Emphasis = field(default_factory=Emphasis)
+    bloom: Bloom = field(default_factory=Bloom)
     smooth_camera: bool = True   # Phase 3: ease into/out of keyframes (vs linear)
 
 
@@ -162,5 +175,6 @@ def plan(keyframes, settings: DirectorSettings | None = None) -> dict:
         "material": asdict(s.material),
         "lighting": asdict(s.lighting),
         "dof": asdict(s.dof),
+        "bloom": asdict(s.bloom),
         "heroes": infer_heroes(keyframes),
     }

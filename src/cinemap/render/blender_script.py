@@ -76,6 +76,31 @@ def _add_light(scene_spec: dict) -> None:
             bg.inputs[1].default_value = rig.get("ambient", 0.3)
 
 
+def _setup_bloom(scene_spec: dict) -> None:
+    """Soft bloom on bright/emissive structures via a compositor Glare (fog-glow)
+    node — the 'publication glow' that makes the colored meshes read as illuminated
+    against the dark background. Constant (no per-object flash), so it scales to any
+    number of objects. From the director; absent => no compositor change."""
+    b = scene_spec.get("direction", {}).get("bloom") or {}
+    if not b.get("enabled"):
+        return
+    scene = bpy.context.scene
+    scene.use_nodes = True
+    tree = scene.node_tree
+    rl = next((n for n in tree.nodes if n.type == "R_LAYERS"), None)
+    comp = next((n for n in tree.nodes if n.type == "COMPOSITE"), None)
+    if rl is None or comp is None:
+        return
+    glare = tree.nodes.new("CompositorNodeGlare")
+    glare.glare_type = "FOG_GLOW"
+    glare.quality = "HIGH"
+    glare.threshold = b.get("threshold", 0.6)
+    glare.size = int(b.get("size", 7))
+    glare.mix = b.get("mix", -0.55)
+    tree.links.new(rl.outputs["Image"], glare.inputs["Image"])
+    tree.links.new(glare.outputs["Image"], comp.inputs["Image"])
+
+
 def _update_lights(frame: dict, rig: dict) -> None:
     """Re-aim the key/fill/rim suns relative to the camera for this frame, so the
     rig (and the rim edge-light) stays consistent as the camera moves. Suns are
@@ -125,6 +150,9 @@ def _import_meshes(scene_spec: dict) -> dict:
                 bpy.ops.object.join()
         bpy.context.view_layer.objects.active = obj
         bpy.ops.object.shade_smooth()
+        # No cast shadows: neuroglancer has none, and a layer faded to low opacity
+        # would otherwise cast a shadow with no visible caster (the stray-shadow bug).
+        obj.visible_shadow = False
         s = 1.0 / scene_spec["world"]["nm_per_bu"]  # nm -> BU
         obj.scale = (s, s, s)
 
@@ -179,6 +207,19 @@ def _import_meshes(scene_spec: dict) -> dict:
         nt.links.new(powr.outputs[0], mul.inputs[1])
         if "Alpha" in bsdf.inputs:
             nt.links.new(mul.outputs[0], bsdf.inputs["Alpha"])
+
+        # Fresnel edge-glow: grazing edges emit their own color (a soft rim glow that
+        # makes structures read as 'lit' against the dark background, esp. with bloom).
+        # Emission Strength = cm_emit (base/pulse) + Facing * edge_glow.
+        edge = prof.get("edge_glow", 0.0)
+        if edge > 0 and "Emission Strength" in bsdf.inputs:
+            egw = nt.nodes.new("ShaderNodeMath"); egw.operation = "MULTIPLY"
+            egw.inputs[1].default_value = edge
+            nt.links.new(lw.outputs["Facing"], egw.inputs[0])    # 0 head-on, 1 grazing
+            eadd = nt.nodes.new("ShaderNodeMath"); eadd.operation = "ADD"
+            nt.links.new(emit_v.outputs[0], eadd.inputs[0])
+            nt.links.new(egw.outputs[0], eadd.inputs[1])
+            nt.links.new(eadd.outputs[0], bsdf.inputs["Emission Strength"])
 
         mat.blend_method = "BLEND"
         obj.data.materials.clear()
@@ -326,6 +367,7 @@ def main(scene_path: str) -> None:
     _clear()
     _setup_render(spec)
     _add_light(spec)
+    _setup_bloom(spec)
     meshes = _import_meshes(spec)
     scene = bpy.context.scene
     out_dir = spec["output_dir"]
