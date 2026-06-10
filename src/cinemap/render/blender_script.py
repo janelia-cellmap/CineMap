@@ -47,21 +47,31 @@ def _setup_render(scene_spec: dict) -> None:
     scene.render.resolution_x = r["width"]
     scene.render.resolution_y = r["height"]
     scene.render.image_settings.file_format = "PNG"
-    # Standard (sRGB) view transform like neuroglancer — keeps the segment colors fully
-    # saturated. The Blender default (AgX) desaturates and rolls bright colors toward
-    # white, which read as washed-out / "blown". Lighting is kept moderate so values
-    # don't clip (clipped highlights would hide the surface texture).
+    # View transform from the director (default AgX + "Punchy"). AgX rolls bright values
+    # off smoothly instead of clipping them to neon -> no oversaturation/blowout, and it
+    # gives soft, dimensional filmic shadows; the "Punchy" look restores color richness so
+    # it isn't washed. (Standard/sRGB matches NG's flat look but clips -> oversaturation.)
+    view = scene_spec.get("direction", {}).get("view", {})
     try:
-        scene.view_settings.view_transform = "Standard"
+        scene.view_settings.view_transform = view.get("transform", "AgX")
     except Exception as e:  # noqa: BLE001
         print(f"[blender] view transform: {e}")
+    look = view.get("look", "AgX - Punchy")
+    if look:
+        try:
+            scene.view_settings.look = look
+        except Exception as e:  # noqa: BLE001
+            print(f"[blender] view look: {e}")
 
     # World gives EVEN ambient fill from all directions (so surfaces facing away from
     # the key aren't pure black — like neuroglancer's even lighting), while the CAMERA
     # still sees the dark background. A Light-Path "Is Camera Ray" mix separates the two:
     # camera ray -> dark bg color; diffuse/AO rays -> gray ambient.
-    c = scene_spec["world"].get("background", [0.02, 0.02, 0.03])
-    amb = float(scene_spec.get("direction", {}).get("lighting", {}).get("ambient", 0.3))
+    c = scene_spec["world"].get("background", [0.0, 0.0, 0.0])  # black, like neuroglancer
+    lrig = scene_spec.get("direction", {}).get("lighting", {})
+    amb = float(lrig.get("ambient", 0.3))
+    # cool-tinted ambient (warm key / cool fill = a subtle studio/MeshLab dimension)
+    ac = lrig.get("ambient_color", [1.0, 1.0, 1.0])
     world = bpy.data.worlds.new("World")
     world.use_nodes = True
     nt = world.node_tree
@@ -70,7 +80,7 @@ def _setup_render(scene_spec: dict) -> None:
     bg_cam = nt.nodes.new("ShaderNodeBackground")
     bg_cam.inputs[0].default_value = (c[0], c[1], c[2], 1.0)
     bg_amb = nt.nodes.new("ShaderNodeBackground")
-    bg_amb.inputs[0].default_value = (amb, amb, amb, 1.0)
+    bg_amb.inputs[0].default_value = (amb * ac[0], amb * ac[1], amb * ac[2], 1.0)
     lp = nt.nodes.new("ShaderNodeLightPath")
     mix = nt.nodes.new("ShaderNodeMixShader")
     nt.links.new(lp.outputs["Is Camera Ray"], mix.inputs[0])  # 0 -> ambient, 1 -> bg
@@ -78,6 +88,35 @@ def _setup_render(scene_spec: dict) -> None:
     nt.links.new(bg_cam.outputs[0], mix.inputs[2])
     nt.links.new(mix.outputs[0], out.inputs["Surface"])
     scene.world = world
+
+    _setup_freestyle(scene_spec)
+
+
+def _setup_freestyle(scene_spec: dict) -> None:
+    """Optional true outline (Freestyle) pass — crisp dark lines on object silhouettes,
+    borders and creases, so overlapping structures are unmistakably separated. Off unless
+    the director asks (direction.freestyle.enabled); the material edge-darken is the
+    subtler default. Best-effort: never fail the render if the API differs."""
+    fs = scene_spec.get("direction", {}).get("freestyle") or {}
+    if not fs.get("enabled"):
+        return
+    try:
+        scene = bpy.context.scene
+        scene.render.use_freestyle = True
+        col = fs.get("color", [0.0, 0.0, 0.0])
+        thick = float(fs.get("thickness", 1.5))
+        for vl in scene.view_layers:
+            vl.use_freestyle = True
+            fset = vl.freestyle_settings
+            lineset = fset.linesets[0] if len(fset.linesets) else fset.linesets.new("ls")
+            lineset.select_silhouette = True
+            lineset.select_border = True
+            lineset.select_crease = True
+            ls = lineset.linestyle
+            ls.color = (col[0], col[1], col[2])
+            ls.thickness = thick
+    except Exception as e:  # noqa: BLE001
+        print(f"[blender] freestyle skipped: {e}")
 
 
 def _add_light(scene_spec: dict) -> None:
@@ -89,11 +128,14 @@ def _add_light(scene_spec: dict) -> None:
     energy = scene_spec.get("lighting", {}).get("key_energy", 3000.0)
     base = rig.get("key_energy") or max(2.0, energy / 600.0)
     fill_mult, rim_mult = rig.get("fill_ratio", 0.45), rig.get("rim_ratio", 0.6)
+    kc = rig.get("key_color", [1.0, 1.0, 1.0])           # subtle warm key
     for name, rot, mult in [("Key", (0.6, 0.2, 0.4), 1.0),
                             ("Fill", (-0.5, -0.3, 2.4), fill_mult),
                             ("Rim", (1.2, 0.0, -1.8), rim_mult)]:
         data = bpy.data.lights.new(name, type="SUN")
         data.energy = base * mult
+        if name == "Key":
+            data.color = (kc[0], kc[1], kc[2])
         obj = bpy.data.objects.new(name, data)
         obj.rotation_euler = rot
         bpy.context.scene.collection.objects.link(obj)
@@ -153,8 +195,8 @@ def _update_lights(frame: dict, rig: dict) -> None:
     # camera-facing surfaces are lit and grazing edges/bumps darken (texture via the
     # normals), evenly across the frame — not a raking key that blows tops / crushes
     # undersides. A small off-axis fill adds a touch of dimension; ambient fills the rest.
-    dirs = {"Key":  (fwd + 0.15 * right - 0.2 * tup),     # ~headlight, slight offset
-            "Fill": (fwd - 0.6 * right + 0.4 * tup),      # gentle upper-left fill
+    dirs = {"Key":  (0.4 * fwd + 0.85 * right - 0.7 * tup),  # off-axis raking key ->
+            "Fill": (0.4 * fwd - 0.7 * right + 0.3 * tup),   # strong intra-mesh shadows
             "Rim":  (-fwd + 0.4 * tup)}
     for name, d in dirs.items():
         obj = bpy.data.objects.get(name)
@@ -235,6 +277,28 @@ def _import_meshes(scene_spec: dict) -> dict:
             nt.links.new(color_out, mixao.inputs[1])          # ao=0 -> original color
             nt.links.new(ao.outputs["Color"], mixao.inputs[2])  # ao=1 -> crevices darkened
             color_out = mixao.outputs[0]
+        # Subtle Fresnel edge-darken: a soft dark rim at each object's silhouette so
+        # overlapping/adjacent objects separate visually (the front one's grazing edge
+        # darkens against whatever is behind). factor = 1 - edge_darken * facing^power,
+        # with facing = 0 head-on, 1 at grazing -> only the rim darkens, interior intact.
+        edk = prof.get("edge_darken", 0.0)
+        if edk > 0:
+            elw = nt.nodes.new("ShaderNodeLayerWeight")
+            epw = nt.nodes.new("ShaderNodeMath"); epw.operation = "POWER"
+            epw.inputs[1].default_value = prof.get("edge_power", 4.0)
+            nt.links.new(elw.outputs["Facing"], epw.inputs[0])
+            emul = nt.nodes.new("ShaderNodeMath"); emul.operation = "MULTIPLY"
+            emul.inputs[1].default_value = edk
+            nt.links.new(epw.outputs[0], emul.inputs[0])
+            esub = nt.nodes.new("ShaderNodeMath"); esub.operation = "SUBTRACT"
+            esub.use_clamp = True
+            esub.inputs[0].default_value = 1.0
+            nt.links.new(emul.outputs[0], esub.inputs[1])        # 1 - edge_darken*facing^p
+            edmix = nt.nodes.new("ShaderNodeMixRGB"); edmix.blend_type = "MULTIPLY"
+            edmix.inputs[0].default_value = 1.0
+            nt.links.new(color_out, edmix.inputs[1])
+            nt.links.new(esub.outputs[0], edmix.inputs[2])       # color * factor (broadcast)
+            color_out = edmix.outputs[0]
         nt.links.new(color_out, bsdf.inputs["Base Color"])
         if "Emission Color" in bsdf.inputs:
             nt.links.new(color_out, bsdf.inputs["Emission Color"])

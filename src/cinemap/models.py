@@ -102,7 +102,7 @@ class AnnotationInstance(BaseModel):
 
 class Lighting(BaseModel):
     key_energy: float = 3000.0
-    background: list[float] = Field(default_factory=lambda: [0.02, 0.02, 0.03])
+    background: list[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])  # black, like NG
 
 
 class Keyframe(BaseModel):

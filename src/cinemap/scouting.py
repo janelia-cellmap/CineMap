@@ -233,6 +233,23 @@ def _merge_manifest(project: Project, state: dict) -> None:
         project.manifest.em = m.em
 
 
+def _bg_from_state(state: dict) -> list[float] | None:
+    """The neuroglancer 3D (perspective) view background = `projectionBackgroundColor`
+    (a CSS hex). Default is black. Returned LINEAR so it round-trips through Blender's
+    Standard (sRGB) view transform back to exactly the color NG shows."""
+    from .data.colors import hex_to_rgb
+
+    bg = state.get("projectionBackgroundColor")
+    if not isinstance(bg, str) or not bg:
+        return [0.0, 0.0, 0.0]
+    try:
+        srgb = hex_to_rgb(bg)
+    except Exception:  # noqa: BLE001
+        return [0.0, 0.0, 0.0]
+    # sRGB -> linear (Blender background colors are linear)
+    return [(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4) for c in srgb]
+
+
 def import_states(project: Project, links: list[tuple]) -> tuple[list[Keyframe], list[str]]:
     """Bake one keyframe per (label, state-link[, duration]). A per-entry duration
     (from a neuroglancer video_tool script) sets the transition INTO that keyframe.
@@ -247,6 +264,8 @@ def import_states(project: Project, links: list[tuple]) -> tuple[list[Keyframe],
         duration = entry[2] if len(entry) > 2 else None
         try:
             state = fetch_state(link)
+            if not created:                  # first state sets the NG view background
+                project.lighting.background = _bg_from_state(state)
             _merge_manifest(project, state)  # register layers new to this state
             kf = bake_keyframe_from_state(project, state, label=label)
             # match neuroglancer's video_tool: linear interpolation between states,

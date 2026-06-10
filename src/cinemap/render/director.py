@@ -25,16 +25,20 @@ class MaterialProfile:
     """Principled-BSDF tuning. Kept close to neuroglancer's look: flat-shaded, fairly
     matte, bright saturated color with simple lighting — not glossy/fancy (gloss +
     heavy emission wash out the crisp faceted definition)."""
-    roughness: float = 0.7       # matte (NG meshes have no gloss)
-    specular: float = 0.0        # fully matte — no specular hotspots
+    roughness: float = 0.55      # mostly matte, a hint of sheen catches the raking key
+    specular: float = 0.15       # slight specular defines the lit edges under the raking key
     sheen: float = 0.0
     coat: float = 0.0
     emission_strength: float = 0.02  # near-zero: shading must come from light, not self-glow
                                      # (emission lifts dark faces -> flat, kills the detail)
     edge_glow: float = 0.0       # off — the rim glow washed out the faceting
-    ao: float = 0.9              # ambient-occlusion strength: dark crevices/contacts (NG-like)
-    ao_distance_nm: float = 4000  # how far AO looks for occluders — long enough to darken
-                                  # where separate tubes touch/overlap, not just tiny crevices
+    ao: float = 0.6              # ambient-occlusion strength: dark crevices (NG-like)
+    ao_distance_nm: float = 2000  # AO reach; catches crevices + where tubes contact/overlap
+    # Fresnel edge-darken border: OFF. On thin tubular meshes nearly all surface is at a
+    # grazing angle, so it dims broadly instead of drawing clean borders (and Freestyle is
+    # infeasible here). Real object outlines would need a compositor object-ID edge pass.
+    edge_darken: float = 0.0
+    edge_power: float = 2.5      # rim tightness (only used when edge_darken > 0)
     flat_shading: bool = True    # per-face normals (no smoothing) — faces go dark/light
                                  # individually -> the crisp faceted look NG has
 
@@ -42,16 +46,18 @@ class MaterialProfile:
 @dataclass
 class LightRig:
     """Three-point rig, oriented relative to the camera each frame."""
-    # Mimic neuroglancer's mesh lighting: lightingFactor = |normal·lightDir|*directional
-    # + ambient, with the light ~along the view (a HEADLIGHT). Camera-facing surfaces are
-    # lit, grazing edges/bumps darken -> texture; ambient keeps nothing pure-black. So:
-    # a head-on key + strong ambient, NOT an angled raking key (which blew tops/crushed
-    # undersides). Texture comes from the normals + flat shading + AO.
-    key_energy: float = 2.6      # SUN irradiance (W/m^2), ~the directional term
-    fill_ratio: float = 0.25     # small off-axis fill for a touch of dimension
-    rim_ratio: float = 0.0       # NG has no rim
+    # Off-axis RAKING key (see _update_lights) + rim + low ambient => strong directional
+    # intra-mesh shadows (the "cool", dimensional look). AgX rolls the bright raking
+    # highlights off, so this strong key gives contrast/shadow without clipping to neon.
+    key_energy: float = 7.5      # SUN irradiance (W/m^2) — raking, strong
+    fill_ratio: float = 0.3      # off-axis fill softens the shadow side
+    rim_ratio: float = 0.5       # rim separates silhouettes from the dark background
     camera_relative: bool = True
-    ambient: float = 0.3         # ambient term (gray fill from all directions)
+    ambient: float = 0.18        # low ambient => deep, defined shadows
+    # Light colors default neutral (the original rake look). A subtle warm key / cool
+    # ambient here would add a studio/MeshLab dimension if ever wanted.
+    key_color: tuple = (1.0, 1.0, 1.0)
+    ambient_color: tuple = (1.0, 1.0, 1.0)
 
 
 @dataclass
@@ -90,6 +96,11 @@ class DirectorSettings:
     emphasis: Emphasis = field(default_factory=Emphasis)
     bloom: Bloom = field(default_factory=Bloom)
     smooth_camera: bool = True   # Phase 3: ease into/out of keyframes (vs linear)
+    # AgX (the transform the preferred raking-key look used): rolls the bright raking
+    # highlights off instead of clipping them to neon, so the strong key gives contrast
+    # and shadow without blowout. Plain AgX (no "Punchy") = the f144_rake color balance.
+    view_transform: str = "AgX"
+    view_look: str = ""
 
 
 def _frame_starts(keyframes, fps: int) -> tuple[list[int], int]:
@@ -189,5 +200,6 @@ def plan(keyframes, settings: DirectorSettings | None = None) -> dict:
         "lighting": asdict(s.lighting),
         "dof": asdict(s.dof),
         "bloom": asdict(s.bloom),
+        "view": {"transform": s.view_transform, "look": s.view_look},
         "heroes": infer_heroes(keyframes),
     }
