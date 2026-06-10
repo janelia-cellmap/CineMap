@@ -66,31 +66,62 @@ def project_bbox(corners, pos, right, true_up, fwd, fov_rad, aspect, height, mar
 
 def select_fragments(per_lod, lod_scales_nm, pos, look_at, up, fov_rad, aspect, height,
                      tol=1.0):
-    """Neuroglancer's per-chunk rule, offline: for each octree fragment, frustum-cull,
-    then keep the COARSEST LOD whose spatial resolution is finer than ~one pixel*tol
-    at that fragment's depth (`lodScale <= pixelSize*tol`). For a complete octree this
-    selects exactly one LOD per spatial region (no overlap): a fragment at lod L is
-    kept iff it's fine enough AND its parent (L+1) would be too coarse there.
+    """Neuroglancer's octree traversal, offline. Descend the mesh octree top-down from
+    the coarsest LOD: frustum-cull a node's whole subtree if its box is off-screen;
+    render a node at its LOD once it's fine enough for its on-screen size
+    (`lodScale <= pixelSize*tol`) or it's a leaf; otherwise recurse into its children
+    (the finer fragments that exist). Because the finer LODs tile the same surface,
+    recursing covers every surface region exactly once — no gaps, no overlap. (My
+    earlier per-fragment rule compared each fragment to its parent using DIFFERENT
+    pixel sizes, which dropped regions — the 'broken up' look.)
 
     Returns ({lod: [frag_index, ...]}, total_bytes)."""
+    import itertools
+
     right, true_up, fwd = camera_basis(pos, look_at, up)
     maxlod = len(per_lod) - 1
+    by_pos = []                                  # per lod: {grid_pos: (idx, lo, hi, nbytes)}
+    for frags in per_lod:
+        by_pos.append({tuple(gp): (idx, lo, hi, nb) for (idx, lo, hi, gp, nb) in frags})
+
     sel: dict[int, list] = {}
-    total_bytes = 0
+    total = 0
+
+    def children(lod, gpos):
+        if lod == 0:
+            return []
+        base = tuple(2 * c for c in gpos)
+        return [(lod - 1, q) for d in itertools.product((0, 1), repeat=3)
+                if (q := (base[0] + d[0], base[1] + d[1], base[2] + d[2])) in by_pos[lod - 1]]
+
+    def visit(lod, gpos):
+        nonlocal total
+        node = by_pos[lod].get(gpos)
+        kids = children(lod, gpos)
+        if node is None:                         # missing parent -> descend to children
+            for cl, cq in kids:
+                visit(cl, cq)
+            return
+        idx, lo, hi, nb = node
+        vis, pxnm = project_bbox(bbox_corners((lo, hi)), pos, right, true_up, fwd,
+                                 fov_rad, aspect, height)
+        if not vis:                              # subtree is inside this box -> all off-screen
+            return
+        if lod == 0 or not kids or lod_scales_nm[lod] <= pxnm * tol:
+            sel.setdefault(lod, []).append(idx)  # fine enough (or leaf) -> render here
+            total += nb
+        else:
+            for cl, cq in kids:                  # too coarse -> refine
+                visit(cl, cq)
+
+    roots = set()                                # coarsest-LOD ancestor of every fragment
     for L, frags in enumerate(per_lod):
-        res = lod_scales_nm[L]
-        res_parent = lod_scales_nm[L + 1] if L < maxlod else float("inf")
-        for (idx, lo, hi, _p, nbytes) in frags:
-            corners = bbox_corners((lo, hi))
-            vis, pxnm = project_bbox(corners, pos, right, true_up, fwd, fov_rad, aspect, height)
-            if not vis:
-                continue
-            fine = (L == 0) or (res <= pxnm * tol)
-            parent_coarse = (L == maxlod) or (res_parent > pxnm * tol)
-            if fine and parent_coarse:
-                sel.setdefault(L, []).append(idx)
-                total_bytes += nbytes
-    return sel, total_bytes
+        shift = maxlod - L
+        for (_idx, _lo, _hi, gp, _nb) in frags:
+            roots.add(tuple(c >> shift for c in gp))
+    for r in roots:
+        visit(maxlod, r)
+    return sel, total
 
 
 def visible_segments(seg_bboxes, pos, look_at, up, fov_rad, aspect, height):
