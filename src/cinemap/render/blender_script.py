@@ -224,7 +224,11 @@ def _import_meshes(scene_spec: dict) -> dict:
         ao_amt = prof.get("ao", 0.0)
         if ao_amt > 0:
             ao = nt.nodes.new("ShaderNodeAmbientOcclusion")
-            ao.samples = 8
+            ao.samples = 16
+            # reach (BU) = AO distance in nm / nm_per_bu — long enough to catch where
+            # separate tubes contact/overlap, giving the dark contact shadows NG shows.
+            ao.inputs["Distance"].default_value = (
+                prof.get("ao_distance_nm", 2000.0) / scene_spec["world"]["nm_per_bu"])
             nt.links.new(color_out, ao.inputs["Color"])
             mixao = nt.nodes.new("ShaderNodeMixRGB"); mixao.blend_type = "MIX"
             mixao.inputs[0].default_value = ao_amt

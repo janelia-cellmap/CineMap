@@ -32,7 +32,9 @@ class MaterialProfile:
     emission_strength: float = 0.02  # near-zero: shading must come from light, not self-glow
                                      # (emission lifts dark faces -> flat, kills the detail)
     edge_glow: float = 0.0       # off — the rim glow washed out the faceting
-    ao: float = 0.8              # crevice darkening -> the ridge/bump texture NG shows
+    ao: float = 0.9              # ambient-occlusion strength: dark crevices/contacts (NG-like)
+    ao_distance_nm: float = 4000  # how far AO looks for occluders — long enough to darken
+                                  # where separate tubes touch/overlap, not just tiny crevices
     flat_shading: bool = True    # per-face normals (no smoothing) — faces go dark/light
                                  # individually -> the crisp faceted look NG has
 
