@@ -49,6 +49,9 @@ class RenderWorker:
         # and changes to fps/samples/detail all reuse already-downloaded geometry. The
         # uid keys geometry+LOD+color, so sharing across jobs is safe.
         self.assets_dir = PROJECTS_DIR / project.id / "assets"
+        # raw per-(segment, LOD) mesh download cache, shared across ALL projects (keyed
+        # by mesh_url+seg+lod) so changing quality/zoom only fetches new finer LODs.
+        self._mesh_cache_dir = PROJECTS_DIR / ".mesh_cache"
         self.blend_path = self.workdir / "scene.blend"
         self.cancel = threading.Event()   # set to request cancellation
         self._proc: subprocess.Popen | None = None
@@ -211,7 +214,8 @@ class RenderWorker:
                 combined = SkeletonLoader(src.skeleton_url, shader=src.skeleton_shader).load_many(
                     ids, colorize=lc.rgb)
             else:
-                combined = MeshLoader(src.mesh_url, src.label_zarr).load_many(
+                combined = MeshLoader(src.mesh_url, src.label_zarr,
+                                      cache_dir=self._mesh_cache_dir).load_many(
                     ids, colorize=lc.rgb,
                     target_voxels_single=self._mesh_voxels_single,
                     target_voxels_union=self._mesh_voxels_union,
@@ -283,7 +287,7 @@ class RenderWorker:
                             if s.name == m.mesh_name and s.mesh_url), None)
                 if not src:
                     continue
-                ld = MeshLoader(src.mesh_url, src.label_zarr)
+                ld = MeshLoader(src.mesh_url, src.label_zarr, cache_dir=self._mesh_cache_dir)
                 with ThreadPoolExecutor(max_workers=min(_FETCH_WORKERS, len(m.segment_ids))) as ex:
                     bbs = list(ex.map(ld.seg_bbox, m.segment_ids))
                 layers[m.mesh_name] = (ld, {s: b for s, b in zip(m.segment_ids, bbs) if b})

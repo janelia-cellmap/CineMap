@@ -44,12 +44,16 @@ def _segment_ids(mesh_url: str) -> list[int]:
 
 
 class MeshLoader:
-    def __init__(self, mesh_url: str = "", label_zarr: str = ""):
+    def __init__(self, mesh_url: str = "", label_zarr: str = "", cache_dir=None):
         self.mesh_url = (mesh_url or "").rstrip("/")
         self.label_zarr = (label_zarr or "").rstrip("/")
         self.parent, self.subdir = (
             self.mesh_url.rsplit("/", 1) if "/" in self.mesh_url else ("", self.mesh_url))
         self._cv = None
+        # persistent on-disk cache of RAW (uncolored) per-(segment, LOD) geometry,
+        # keyed by (mesh_url, seg, lod) — so re-rendering at a different quality/zoom
+        # only downloads the genuinely-new finer LODs and reuses the rest.
+        self._cache_dir = str(cache_dir) if cache_dir else None
 
     @property
     def cv(self) -> CloudVolume:
@@ -93,17 +97,35 @@ class MeshLoader:
 
     def _draco(self, seg_id: int, lod: int = 0) -> trimesh.Trimesh:
         """Precomputed mesh for `seg_id` at level-of-detail `lod` (0 = finest).
-        Falls back to the finest mesh if the source isn't multi-resolution."""
+        Falls back to the finest mesh if the source isn't multi-resolution. Raw
+        geometry is disk-cached (when a cache dir is set) so it's downloaded once."""
+        cache = None
+        if self._cache_dir:
+            import hashlib
+            key = hashlib.md5(f"{self.mesh_url}|{int(seg_id)}|{int(lod)}".encode()).hexdigest()
+            cache = os.path.join(self._cache_dir, f"{key}.ply")
+            if os.path.exists(cache):
+                try:
+                    return trimesh.load(cache, process=False)
+                except Exception:  # noqa: BLE001  (corrupt cache entry -> re-fetch)
+                    pass
         try:
             m = self.cv.mesh.get(int(seg_id), lod=lod) if lod else self.cv.mesh.get(int(seg_id))
         except TypeError:  # source has no LOD support -> finest only
             m = self.cv.mesh.get(int(seg_id))
         mesh = m[seg_id] if isinstance(m, dict) else m
-        return trimesh.Trimesh(
+        out = trimesh.Trimesh(
             vertices=np.asarray(mesh.vertices, dtype=np.float64),
             faces=np.asarray(mesh.faces, dtype=np.int64),
             process=False,
         )
+        if cache:
+            try:
+                os.makedirs(self._cache_dir, exist_ok=True)
+                out.export(cache)
+            except Exception:  # noqa: BLE001  (cache write best-effort)
+                pass
+        return out
 
     def _max_lod(self, seg_id: int) -> int:
         """Coarsest available LOD index for a multi-resolution mesh (0 if single
