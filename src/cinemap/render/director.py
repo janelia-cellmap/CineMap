@@ -43,6 +43,9 @@ class MaterialProfile:
     # infeasible here). Real object outlines would need a compositor object-ID edge pass.
     edge_darken: float = 0.0
     edge_power: float = 2.5      # rim tightness (only used when edge_darken > 0)
+    backface_cull: bool = False  # make back faces transparent: thin tubes/cell-bodies stop
+                                 # doubling up (front+back) at low opacity -> glassier, more
+                                 # see-through transparent state (closer to neuroglancer)
     flat_shading: bool = True    # per-face normals (no smoothing) — faces go dark/light
                                  # individually -> the crisp faceted look NG has
 

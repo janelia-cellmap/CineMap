@@ -380,6 +380,22 @@ def _import_meshes(scene_spec: dict) -> dict:
             nt.links.new(egw.outputs[0], eadd.inputs[1])
             nt.links.new(eadd.outputs[0], bsdf.inputs["Emission Strength"])
 
+        # Optional backface culling (Cycles): mix in a Transparent BSDF on back faces, so
+        # a tube/cell-body shows only its front surface instead of front+back stacking.
+        # At low opacity that halves the alpha build-up -> glassier, see-through transparent
+        # state closer to neuroglancer (instead of dense clusters piling up to opaque).
+        if prof.get("backface_cull"):
+            out_node = nt.nodes.get("Material Output") or next(
+                (n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None)
+            if out_node is not None:
+                geo_bf = nt.nodes.new("ShaderNodeNewGeometry")
+                transp = nt.nodes.new("ShaderNodeBsdfTransparent")
+                bfmix = nt.nodes.new("ShaderNodeMixShader")
+                nt.links.new(geo_bf.outputs["Backfacing"], bfmix.inputs[0])  # 1 on back
+                nt.links.new(bsdf.outputs[0], bfmix.inputs[1])               # front -> shaded
+                nt.links.new(transp.outputs[0], bfmix.inputs[2])             # back -> clear
+                nt.links.new(bfmix.outputs[0], out_node.inputs["Surface"])
+
         mat.blend_method = "BLEND"
         obj.data.materials.clear()
         obj.data.materials.append(mat)
