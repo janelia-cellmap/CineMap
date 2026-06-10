@@ -47,6 +47,14 @@ def _setup_render(scene_spec: dict) -> None:
     scene.render.resolution_x = r["width"]
     scene.render.resolution_y = r["height"]
     scene.render.image_settings.file_format = "PNG"
+    # Standard (sRGB) view transform like neuroglancer — keeps the segment colors fully
+    # saturated. The Blender default (AgX) desaturates and rolls bright colors toward
+    # white, which read as washed-out / "blown". Lighting is kept moderate so values
+    # don't clip (clipped highlights would hide the surface texture).
+    try:
+        scene.view_settings.view_transform = "Standard"
+    except Exception as e:  # noqa: BLE001
+        print(f"[blender] view transform: {e}")
 
     world = bpy.data.worlds.new("World")
     world.use_nodes = True
