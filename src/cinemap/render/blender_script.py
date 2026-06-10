@@ -150,9 +150,6 @@ def _import_meshes(scene_spec: dict) -> dict:
                 bpy.ops.object.join()
         bpy.context.view_layer.objects.active = obj
         bpy.ops.object.shade_smooth()
-        # No cast shadows: neuroglancer has none, and a layer faded to low opacity
-        # would otherwise cast a shadow with no visible caster (the stray-shadow bug).
-        obj.visible_shadow = False
         s = 1.0 / scene_spec["world"]["nm_per_bu"]  # nm -> BU
         obj.scale = (s, s, s)
 
@@ -237,6 +234,10 @@ def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> N
         opacity = ov.get("opacity", 1.0)            # effective alpha = fade * Opacity(3d)
         visible = ov.get("visible", True) and opacity > 0.001
         obj.hide_render = not visible
+        # cast a shadow only when reasonably opaque — Cycles already makes a mid-opacity
+        # object's shadow proportional to its alpha; gating off the near-invisible ones
+        # (e.g. a layer faded to 0.06) avoids a solid shadow with no visible caster.
+        obj.visible_shadow = opacity > 0.25
         nt = mat.node_tree
         av, sv = nt.nodes.get("cm_alpha"), nt.nodes.get("cm_silh")
         if av is not None:
