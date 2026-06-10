@@ -24,6 +24,30 @@ import trimesh
 from cloudvolume import CloudVolume
 
 
+def _tune_http_pool():
+    """Size cloudfiles' shared HTTP connection pool to our parallel fetching, so it
+    doesn't churn connections under many workers (the 'Connection pool is full'
+    urllib3 warnings) — both a perf fix and silences the noise. Best-effort."""
+    pool = max(32, _FETCH_WORKERS * 2)
+    try:
+        import requests
+        from cloudfiles.interfaces import HttpInterface
+        HttpInterface.adaptor = requests.adapters.HTTPAdapter(
+            pool_connections=pool, pool_maxsize=pool)
+    except Exception:  # noqa: BLE001
+        pass
+    import logging  # also drop just this one message if anything else still emits it
+
+    class _PoolFilter(logging.Filter):
+        def filter(self, record):
+            return "Connection pool is full" not in record.getMessage()
+
+    logging.getLogger("urllib3.connectionpool").addFilter(_PoolFilter())
+
+
+_tune_http_pool()
+
+
 def _http(url: str) -> str:
     """urllib can't open gs://; map cloud URLs to their https equivalent."""
     if url.startswith("gs://"):
@@ -196,28 +220,59 @@ class MeshLoader:
         lod_scales_nm = np.asarray(man.lod_scales, float) * scale
         return per_lod, lod_scales_nm
 
+    def _frag_cache_path(self, seg_id: int, lod: int, idx: int):
+        if not self._cache_dir:
+            return None
+        import hashlib
+        key = hashlib.md5(f"{self.mesh_url}|{int(seg_id)}|f|{int(lod)}|{int(idx)}".encode()).hexdigest()
+        return os.path.join(self._cache_dir, f"{key}.ply")
+
     def get_fragments(self, seg_id: int, selection: dict, colorize=None) -> trimesh.Trimesh | None:
         """Fetch only the SELECTED octree fragments and combine them. `selection` is
-        {lod: [frag_index, ...]} (indices from fragment_boxes). Fetches each needed
-        LOD's fragments via concat=False (whole-LOD download, disk-cached) and keeps
-        the chosen ones — so a frame renders fine fragments only where near, coarse
-        elsewhere, like neuroglancer."""
+        {lod: [frag_index, ...]} (indices from fragment_boxes). Each RAW fragment is
+        disk-cached individually (per mesh_url/seg/lod/index), so a re-render or a
+        different zoom reuses fragments already fetched; a whole-LOD download happens
+        only when some needed fragment isn't cached yet. Fine where near, coarse where
+        far — like neuroglancer."""
         parts = []
         for lod, idxs in selection.items():
+            idxs = sorted({int(i) for i in (idxs or [])})
             if not idxs:
                 continue
-            try:
-                got = self.cv.mesh.get(int(seg_id), lod=int(lod), concat=False)
-            except Exception as e:  # noqa: BLE001
-                print(f"[chunk] {seg_id} lod{lod} frags failed: {e}")
-                continue
-            frags = got[int(seg_id)] if isinstance(got, dict) else got
+            meshes: dict[int, trimesh.Trimesh] = {}      # idx -> raw (uncolored)
+            need_fetch = False
             for i in idxs:
-                if i >= len(frags):
+                cp = self._frag_cache_path(seg_id, lod, i)
+                if cp and os.path.exists(cp):
+                    try:
+                        meshes[i] = trimesh.load(cp, process=False)
+                    except Exception:  # noqa: BLE001
+                        need_fetch = True
+                else:
+                    need_fetch = True
+            if need_fetch:
+                try:
+                    got = self.cv.mesh.get(int(seg_id), lod=int(lod), concat=False)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[chunk] {seg_id} lod{lod} frags failed: {e}")
+                    got = None
+                frags = (got.get(int(seg_id)) if isinstance(got, dict) else got) or []
+                for j, fm in enumerate(frags):           # cache the WHOLE lod's fragments
+                    raw = trimesh.Trimesh(vertices=np.asarray(fm.vertices, dtype=np.float64),
+                                          faces=np.asarray(fm.faces, dtype=np.int64), process=False)
+                    cp = self._frag_cache_path(seg_id, lod, j)
+                    if cp:
+                        try:
+                            os.makedirs(self._cache_dir, exist_ok=True)
+                            raw.export(cp)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if j in idxs and j not in meshes:
+                        meshes[j] = raw
+            for i in idxs:
+                mesh = meshes.get(i)
+                if mesh is None:
                     continue
-                fm = frags[i]
-                mesh = trimesh.Trimesh(vertices=np.asarray(fm.vertices, dtype=np.float64),
-                                       faces=np.asarray(fm.faces, dtype=np.int64), process=False)
                 if colorize is not None:
                     r, g, b = colorize(int(seg_id))
                     mesh.visual.vertex_colors = np.tile(
