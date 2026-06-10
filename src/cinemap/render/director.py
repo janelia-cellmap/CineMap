@@ -34,6 +34,10 @@ class MaterialProfile:
     edge_glow: float = 0.0       # off — the rim glow washed out the faceting
     ao: float = 0.6              # ambient-occlusion strength: dark crevices (NG-like)
     ao_distance_nm: float = 2000  # AO reach; catches crevices + where tubes contact/overlap
+    cavity: float = 0.0          # curvature (pointiness) shading: convex ridges brighten,
+                                 # concave creases darken -> crisp surface contrast that
+                                 # follows the geometry (sharper than AO; MeshLab-like).
+                                 # 0 = off; ~0.5 = pronounced. Cheap (Cycles computes it).
     # Fresnel edge-darken border: OFF. On thin tubular meshes nearly all surface is at a
     # grazing angle, so it dims broadly instead of drawing clean borders (and Freestyle is
     # infeasible here). Real object outlines would need a compositor object-ID edge pass.
@@ -46,18 +50,23 @@ class MaterialProfile:
 @dataclass
 class LightRig:
     """Three-point rig, oriented relative to the camera each frame."""
-    # Off-axis RAKING key (see _update_lights) + rim + low ambient => strong directional
-    # intra-mesh shadows (the "cool", dimensional look). AgX rolls the bright raking
-    # highlights off, so this strong key gives contrast/shadow without clipping to neon.
-    key_energy: float = 7.5      # SUN irradiance (W/m^2) — raking, strong
+    # "Drama" look: off-axis RAKING key (see _update_lights) + rim + VERY low ambient =>
+    # deep, dramatic directional intra-mesh shadows. Warm key + cool fill/rim/ambient give
+    # a studio warm-lit / cool-shadow color contrast. AgX (+ Punchy tone) rolls the bright
+    # raking highlights off, so the strong key gives contrast without clipping to neon.
+    key_energy: float = 8.5      # SUN irradiance (W/m^2) — strong raking key
     fill_ratio: float = 0.3      # off-axis fill softens the shadow side
-    rim_ratio: float = 0.5       # rim separates silhouettes from the dark background
+    rim_ratio: float = 0.8       # rim separates silhouettes from the dark background
     camera_relative: bool = True
-    ambient: float = 0.18        # low ambient => deep, defined shadows
-    # Light colors default neutral (the original rake look). A subtle warm key / cool
-    # ambient here would add a studio/MeshLab dimension if ever wanted.
-    key_color: tuple = (1.0, 1.0, 1.0)
-    ambient_color: tuple = (1.0, 1.0, 1.0)
+    ambient: float = 0.10        # very low ambient => deep, dramatic shadows
+    key_color: tuple = (1.0, 0.88, 0.72)     # warm key
+    fill_color: tuple = (0.72, 0.82, 1.0)    # cool fill
+    rim_color: tuple = (0.78, 0.85, 1.0)     # cool rim
+    ambient_color: tuple = (0.85, 0.9, 1.0)  # cool ambient (cool shadows)
+    # Optional 2nd back/edge light on the OPPOSITE side from the rim, in a contrasting
+    # color -> cinematic two-tone edge separation (off by default; set kick_ratio > 0).
+    kick_ratio: float = 0.0
+    kick_color: tuple = (1.0, 1.0, 1.0)
 
 
 @dataclass
@@ -96,11 +105,10 @@ class DirectorSettings:
     emphasis: Emphasis = field(default_factory=Emphasis)
     bloom: Bloom = field(default_factory=Bloom)
     smooth_camera: bool = True   # Phase 3: ease into/out of keyframes (vs linear)
-    # AgX (the transform the preferred raking-key look used): rolls the bright raking
-    # highlights off instead of clipping them to neon, so the strong key gives contrast
-    # and shadow without blowout. Plain AgX (no "Punchy") = the f144_rake color balance.
+    # AgX rolls the bright raking highlights off instead of clipping to neon; the "Punchy"
+    # look deepens midtone contrast for the dramatic, rich look (no blowout: 0% clipped).
     view_transform: str = "AgX"
-    view_look: str = ""
+    view_look: str = "AgX - Punchy"
 
 
 def _frame_starts(keyframes, fps: int) -> tuple[list[int], int]:

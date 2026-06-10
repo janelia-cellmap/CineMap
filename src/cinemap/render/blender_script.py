@@ -128,14 +128,19 @@ def _add_light(scene_spec: dict) -> None:
     energy = scene_spec.get("lighting", {}).get("key_energy", 3000.0)
     base = rig.get("key_energy") or max(2.0, energy / 600.0)
     fill_mult, rim_mult = rig.get("fill_ratio", 0.45), rig.get("rim_ratio", 0.6)
-    kc = rig.get("key_color", [1.0, 1.0, 1.0])           # subtle warm key
+    kick_mult = rig.get("kick_ratio", 0.0)
+    colors = {"Key": rig.get("key_color", [1.0, 1.0, 1.0]),    # warm/cool studio split:
+              "Fill": rig.get("fill_color", [1.0, 1.0, 1.0]),  # warm key + cool fill/rim,
+              "Rim": rig.get("rim_color", [1.0, 1.0, 1.0]),    # opposing colored kicker
+              "Kick": rig.get("kick_color", [1.0, 1.0, 1.0])}
     for name, rot, mult in [("Key", (0.6, 0.2, 0.4), 1.0),
                             ("Fill", (-0.5, -0.3, 2.4), fill_mult),
-                            ("Rim", (1.2, 0.0, -1.8), rim_mult)]:
+                            ("Rim", (1.2, 0.0, -1.8), rim_mult),
+                            ("Kick", (1.2, 0.0, 1.8), kick_mult)]:
         data = bpy.data.lights.new(name, type="SUN")
         data.energy = base * mult
-        if name == "Key":
-            data.color = (kc[0], kc[1], kc[2])
+        col = colors[name]
+        data.color = (col[0], col[1], col[2])
         obj = bpy.data.objects.new(name, data)
         obj.rotation_euler = rot
         bpy.context.scene.collection.objects.link(obj)
@@ -195,9 +200,10 @@ def _update_lights(frame: dict, rig: dict) -> None:
     # camera-facing surfaces are lit and grazing edges/bumps darken (texture via the
     # normals), evenly across the frame — not a raking key that blows tops / crushes
     # undersides. A small off-axis fill adds a touch of dimension; ambient fills the rest.
-    dirs = {"Key":  (0.4 * fwd + 0.85 * right - 0.7 * tup),  # off-axis raking key ->
-            "Fill": (0.4 * fwd - 0.7 * right + 0.3 * tup),   # strong intra-mesh shadows
-            "Rim":  (-fwd + 0.4 * tup)}
+    dirs = {"Key":  (0.4 * fwd + 0.85 * right - 0.7 * tup),   # off-axis raking key ->
+            "Fill": (0.4 * fwd - 0.7 * right + 0.3 * tup),    # strong intra-mesh shadows
+            "Rim":  (-0.8 * fwd + 0.7 * right + 0.4 * tup),   # back-right edge light
+            "Kick": (-0.8 * fwd - 0.7 * right + 0.4 * tup)}   # back-left (opposing) kicker
     for name, d in dirs.items():
         obj = bpy.data.objects.get(name)
         if obj and d.length > 1e-9:
@@ -277,6 +283,28 @@ def _import_meshes(scene_spec: dict) -> dict:
             nt.links.new(color_out, mixao.inputs[1])          # ao=0 -> original color
             nt.links.new(ao.outputs["Color"], mixao.inputs[2])  # ao=1 -> crevices darkened
             color_out = mixao.outputs[0]
+        # Cavity / curvature shading via the geometry's Pointiness (0 concave .. 1 convex,
+        # 0.5 flat): factor = 1 + cavity*2*(pointiness-0.5) -> concave creases darken,
+        # convex ridges brighten. Sharper than AO and follows the surface (MeshLab-like),
+        # making every fold/bump pop. Multiplies the running color.
+        cav = prof.get("cavity", 0.0)
+        if cav > 0:
+            geo = nt.nodes.new("ShaderNodeNewGeometry")
+            csub = nt.nodes.new("ShaderNodeMath"); csub.operation = "SUBTRACT"
+            csub.inputs[1].default_value = 0.5
+            nt.links.new(geo.outputs["Pointiness"], csub.inputs[0])
+            cmul = nt.nodes.new("ShaderNodeMath"); cmul.operation = "MULTIPLY"
+            cmul.inputs[1].default_value = 2.0 * cav
+            nt.links.new(csub.outputs[0], cmul.inputs[0])
+            cadd = nt.nodes.new("ShaderNodeMath"); cadd.operation = "ADD"
+            cadd.use_clamp = True                                 # factor >= 0
+            cadd.inputs[1].default_value = 1.0
+            nt.links.new(cmul.outputs[0], cadd.inputs[0])
+            cavmix = nt.nodes.new("ShaderNodeMixRGB"); cavmix.blend_type = "MULTIPLY"
+            cavmix.inputs[0].default_value = 1.0
+            nt.links.new(color_out, cavmix.inputs[1])
+            nt.links.new(cadd.outputs[0], cavmix.inputs[2])       # color * curvature factor
+            color_out = cavmix.outputs[0]
         # Subtle Fresnel edge-darken: a soft dark rim at each object's silhouette so
         # overlapping/adjacent objects separate visually (the front one's grazing edge
         # darkens against whatever is behind). factor = 1 - edge_darken * facing^power,
