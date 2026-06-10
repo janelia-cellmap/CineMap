@@ -318,19 +318,24 @@ class RenderWorker:
                 uid = f"{m.mesh_name}_{hashlib.md5((ckey + '|' + str(cap) + '|' + str(sel)).encode()).hexdigest()[:10]}"
                 per[m.mesh_name] = uid
                 if uid not in mesh_specs:
-                    parts = []
-                    for s, b in sel:
-                        key = (m.mesh_name, s, b, cap, ckey)
-                        mesh = seg_cache.get(key)
-                        if mesh is None and key not in seg_cache:
-                            try:
-                                mesh = ld._precomputed(s, lc.rgb, b, self._draft, max_verts=key[3])
-                            except Exception as e:  # noqa: BLE001
-                                print(f"[chunk] {m.mesh_name} seg {s} failed: {e}")
-                                mesh = None
-                            seg_cache[key] = mesh
-                        if mesh is not None:
-                            parts.append(mesh)
+                    # fetch the not-yet-cached segments for this selection in parallel
+                    todo = [(s, b) for s, b in sel
+                            if (m.mesh_name, s, b, cap, ckey) not in seg_cache]
+
+                    def _one(sb, _ld=ld, _lc=lc, _cap=cap):
+                        s, b = sb
+                        try:
+                            return sb, _ld._precomputed(s, _lc.rgb, b, self._draft, max_verts=_cap)
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[chunk] {m.mesh_name} seg {s} failed: {e}")
+                            return sb, None
+
+                    if todo:
+                        with ThreadPoolExecutor(max_workers=min(_FETCH_WORKERS, len(todo))) as ex:
+                            for sb, mesh in ex.map(_one, todo):
+                                seg_cache[(m.mesh_name, sb[0], sb[1], cap, ckey)] = mesh
+                    parts = [seg_cache[(m.mesh_name, s, b, cap, ckey)] for s, b in sel
+                             if seg_cache.get((m.mesh_name, s, b, cap, ckey)) is not None]
                     if not parts:
                         per.pop(m.mesh_name, None)
                         continue

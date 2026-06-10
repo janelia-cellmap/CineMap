@@ -127,9 +127,11 @@ class MeshLoader:
                 pass
         return out
 
+    @lru_cache(maxsize=8192)
     def _max_lod(self, seg_id: int) -> int:
         """Coarsest available LOD index for a multi-resolution mesh (0 if single
-        resolution). Reads only the mesh manifest, not geometry."""
+        resolution). Network-probes the manifest, so it's cached per segment (it was
+        being re-probed for every LOD pick — a big chunk-mode slowdown)."""
         try:
             self.cv.mesh.get(int(seg_id), lod=999)
             return 0
