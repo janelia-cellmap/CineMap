@@ -22,23 +22,28 @@ from dataclasses import asdict, dataclass, field
 
 @dataclass
 class MaterialProfile:
-    """Principled-BSDF tuning applied over each layer's neuroglancer base color."""
-    roughness: float = 0.38
-    specular: float = 0.5        # Blender "Specular IOR Level"
-    sheen: float = 0.12          # subtle soft-edge sheen for a publication look
-    coat: float = 0.12           # a touch of clear coat -> wet/organic highlight
-    emission_strength: float = 0.05  # faint self-illum floor so nothing is pure black
-    edge_glow: float = 0.5       # fresnel rim emission (grazing edges glow their color)
+    """Principled-BSDF tuning. Kept close to neuroglancer's look: flat-shaded, fairly
+    matte, bright saturated color with simple lighting — not glossy/fancy (gloss +
+    heavy emission wash out the crisp faceted definition)."""
+    roughness: float = 0.55      # matte-ish (low gloss, like NG)
+    specular: float = 0.15       # minimal specular
+    sheen: float = 0.0
+    coat: float = 0.0
+    emission_strength: float = 0.1   # low: let flat-shading face contrast show; just a floor
+    edge_glow: float = 0.0       # off — the rim glow washed out the faceting
+    ao: float = 0.5              # subtle crevice darkening for within-mesh definition
+    flat_shading: bool = True    # per-face normals (no smoothing) — faces go dark/light
+                                 # individually -> the crisp faceted look NG has
 
 
 @dataclass
 class LightRig:
     """Three-point rig, oriented relative to the camera each frame."""
-    key_energy: float = 4.5      # SUN irradiance (W/m^2)
+    key_energy: float = 6.5      # SUN irradiance (W/m^2) — bright so colors read vibrant
     fill_ratio: float = 0.4      # fill = key * this
-    rim_ratio: float = 0.85      # rim/back = key * this
+    rim_ratio: float = 0.6       # rim/back = key * this
     camera_relative: bool = True
-    ambient: float = 0.25        # world background multiplier (soft global fill)
+    ambient: float = 0.45        # lift shadowed faces so they're not pure black (NG-ish)
 
 
 @dataclass

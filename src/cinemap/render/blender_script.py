@@ -164,7 +164,12 @@ def _import_meshes(scene_spec: dict) -> dict:
             with bpy.context.temp_override(active_object=obj, selected_editable_objects=new):
                 bpy.ops.object.join()
         bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.shade_smooth()
+        # flat (per-face) shading by default — each face shades dark/light on its own,
+        # giving the crisp faceted definition neuroglancer has; smooth blurs it to blobs.
+        if scene_spec.get("direction", {}).get("material", {}).get("flat_shading", True):
+            bpy.ops.object.shade_flat()
+        else:
+            bpy.ops.object.shade_smooth()
         s = 1.0 / scene_spec["world"]["nm_per_bu"]  # nm -> BU
         obj.scale = (s, s, s)
 
@@ -186,15 +191,29 @@ def _import_meshes(scene_spec: dict) -> dict:
         _set_in(bsdf, "Coat Weight", prof.get("coat", 0.0))
         has_colors = bool(getattr(obj.data, "color_attributes", None)) and len(obj.data.color_attributes) > 0
         if has_colors:  # per-vertex (per-segment) colors
-            attr = nt.nodes.new("ShaderNodeVertexColor")
-            attr.layer_name = obj.data.color_attributes[0].name
-            nt.links.new(attr.outputs["Color"], bsdf.inputs["Base Color"])
-            if "Emission Color" in bsdf.inputs:
-                nt.links.new(attr.outputs["Color"], bsdf.inputs["Emission Color"])
+            csrc = nt.nodes.new("ShaderNodeVertexColor")
+            csrc.layer_name = obj.data.color_attributes[0].name
+            color_out = csrc.outputs["Color"]
         else:  # solid color
-            bsdf.inputs["Base Color"].default_value = (col[0], col[1], col[2], 1.0)
-            if "Emission Color" in bsdf.inputs:
-                bsdf.inputs["Emission Color"].default_value = (col[0], col[1], col[2], 1.0)
+            csrc = nt.nodes.new("ShaderNodeRGB")
+            csrc.outputs[0].default_value = (col[0], col[1], col[2], 1.0)
+            color_out = csrc.outputs[0]
+        # Ambient occlusion: darken crevices/concavities so bumpy surfaces read crisp
+        # and defined (the "within-mesh shadows" that make NG meshes pop). The AO node
+        # outputs the color attenuated by occlusion; blend it in by the `ao` amount.
+        ao_amt = prof.get("ao", 0.0)
+        if ao_amt > 0:
+            ao = nt.nodes.new("ShaderNodeAmbientOcclusion")
+            ao.samples = 8
+            nt.links.new(color_out, ao.inputs["Color"])
+            mixao = nt.nodes.new("ShaderNodeMixRGB"); mixao.blend_type = "MIX"
+            mixao.inputs[0].default_value = ao_amt
+            nt.links.new(color_out, mixao.inputs[1])          # ao=0 -> original color
+            nt.links.new(ao.outputs["Color"], mixao.inputs[2])  # ao=1 -> crevices darkened
+            color_out = mixao.outputs[0]
+        nt.links.new(color_out, bsdf.inputs["Base Color"])
+        if "Emission Color" in bsdf.inputs:
+            nt.links.new(color_out, bsdf.inputs["Emission Color"])
         # Emission strength via a value node so the director can pulse it per frame
         # (the appear/highlight glow) by overriding cm_emit; base = the material floor.
         emit_v = nt.nodes.new("ShaderNodeValue"); emit_v.name = "cm_emit"
