@@ -56,12 +56,27 @@ def _setup_render(scene_spec: dict) -> None:
     except Exception as e:  # noqa: BLE001
         print(f"[blender] view transform: {e}")
 
+    # World gives EVEN ambient fill from all directions (so surfaces facing away from
+    # the key aren't pure black — like neuroglancer's even lighting), while the CAMERA
+    # still sees the dark background. A Light-Path "Is Camera Ray" mix separates the two:
+    # camera ray -> dark bg color; diffuse/AO rays -> gray ambient.
+    c = scene_spec["world"].get("background", [0.02, 0.02, 0.03])
+    amb = float(scene_spec.get("direction", {}).get("lighting", {}).get("ambient", 0.3))
     world = bpy.data.worlds.new("World")
     world.use_nodes = True
-    bg = world.node_tree.nodes.get("Background")
-    if bg:
-        c = scene_spec["world"].get("background", [0.02, 0.02, 0.03])
-        bg.inputs[0].default_value = (c[0], c[1], c[2], 1.0)
+    nt = world.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputWorld")
+    bg_cam = nt.nodes.new("ShaderNodeBackground")
+    bg_cam.inputs[0].default_value = (c[0], c[1], c[2], 1.0)
+    bg_amb = nt.nodes.new("ShaderNodeBackground")
+    bg_amb.inputs[0].default_value = (amb, amb, amb, 1.0)
+    lp = nt.nodes.new("ShaderNodeLightPath")
+    mix = nt.nodes.new("ShaderNodeMixShader")
+    nt.links.new(lp.outputs["Is Camera Ray"], mix.inputs[0])  # 0 -> ambient, 1 -> bg
+    nt.links.new(bg_amb.outputs[0], mix.inputs[1])
+    nt.links.new(bg_cam.outputs[0], mix.inputs[2])
+    nt.links.new(mix.outputs[0], out.inputs["Surface"])
     scene.world = world
 
 
@@ -82,12 +97,7 @@ def _add_light(scene_spec: dict) -> None:
         obj = bpy.data.objects.new(name, data)
         obj.rotation_euler = rot
         bpy.context.scene.collection.objects.link(obj)
-    # gentle ambient so nothing is pure black
-    world = bpy.context.scene.world
-    if world and world.use_nodes:
-        bg = world.node_tree.nodes.get("Background")
-        if bg:
-            bg.inputs[1].default_value = rig.get("ambient", 0.3)
+    # (even ambient fill is provided by the world's gray ambient in _setup_render)
 
 
 def _setup_bloom(scene_spec: dict) -> None:

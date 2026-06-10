@@ -40,13 +40,15 @@ class MaterialProfile:
 @dataclass
 class LightRig:
     """Three-point rig, oriented relative to the camera each frame."""
-    # ~pi so a lit matte face shows roughly its own color (like NG) rather than blowing
-    # out to white — clipped highlights hide the surface texture/roughness.
-    key_energy: float = 2.6      # SUN irradiance (W/m^2)
-    fill_ratio: float = 0.3      # fill = key * this (lower -> more dark/light contrast)
-    rim_ratio: float = 0.5       # rim/back = key * this
+    # Even, soft lighting like neuroglancer: strong all-directions ambient fill so no
+    # surface is pure-black, + a GENTLE key for form (not a harsh raking key that blows
+    # out tops and crushes undersides). Texture comes from flat shading + AO, not harsh
+    # shadows. Kept moderate so nothing clips under the Standard view transform.
+    key_energy: float = 2.0      # SUN irradiance (W/m^2) — gentle directional for form
+    fill_ratio: float = 0.5      # fill = key * this
+    rim_ratio: float = 0.4       # rim/back = key * this
     camera_relative: bool = True
-    ambient: float = 0.2         # low: let faces facing away go dark -> intra-mesh definition
+    ambient: float = 0.45        # gray ambient fill from all directions (even, NG-like)
 
 
 @dataclass
