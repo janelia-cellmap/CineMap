@@ -131,10 +131,11 @@ def _update_lights(frame: dict, rig: dict) -> None:
     right = fwd.cross(up)
     right = right.normalized() if right.length > 1e-9 else Vector((1.0, 0.0, 0.0))
     tup = right.cross(fwd).normalized()                  # true up, orthogonal to fwd
-    # photon travel directions: key from upper-left, fill from lower-right (softer),
-    # rim from behind the subject toward the camera (edge glow).
-    dirs = {"Key":  (fwd + 0.6 * right - 0.5 * tup),
-            "Fill": (fwd - 0.6 * right + 0.3 * tup),
+    # photon travel directions. Key is mostly OFF-AXIS (less fwd, more side/down) so it
+    # RAKES the surface — faces tilted toward upper-left light up, others go dark, giving
+    # strong intra-mesh definition (a head-on key lights the whole front evenly = flat).
+    dirs = {"Key":  (0.4 * fwd + 0.85 * right - 0.7 * tup),
+            "Fill": (0.4 * fwd - 0.7 * right + 0.3 * tup),
             "Rim":  (-fwd + 0.4 * tup)}
     for name, d in dirs.items():
         obj = bpy.data.objects.get(name)

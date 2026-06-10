@@ -29,9 +29,10 @@ class MaterialProfile:
     specular: float = 0.15       # minimal specular
     sheen: float = 0.0
     coat: float = 0.0
-    emission_strength: float = 0.1   # low: let flat-shading face contrast show; just a floor
+    emission_strength: float = 0.02  # near-zero: shading must come from light, not self-glow
+                                     # (emission lifts dark faces -> flat, kills the detail)
     edge_glow: float = 0.0       # off — the rim glow washed out the faceting
-    ao: float = 0.5              # subtle crevice darkening for within-mesh definition
+    ao: float = 0.6              # crevice darkening for within-mesh definition
     flat_shading: bool = True    # per-face normals (no smoothing) — faces go dark/light
                                  # individually -> the crisp faceted look NG has
 
@@ -39,11 +40,11 @@ class MaterialProfile:
 @dataclass
 class LightRig:
     """Three-point rig, oriented relative to the camera each frame."""
-    key_energy: float = 6.5      # SUN irradiance (W/m^2) — bright so colors read vibrant
-    fill_ratio: float = 0.4      # fill = key * this
-    rim_ratio: float = 0.6       # rim/back = key * this
+    key_energy: float = 7.5      # SUN irradiance (W/m^2) — bright so lit faces are vibrant
+    fill_ratio: float = 0.3      # fill = key * this (lower -> more dark/light contrast)
+    rim_ratio: float = 0.5       # rim/back = key * this
     camera_relative: bool = True
-    ambient: float = 0.45        # lift shadowed faces so they're not pure black (NG-ish)
+    ambient: float = 0.18        # low: let faces facing away go dark -> intra-mesh definition
 
 
 @dataclass
