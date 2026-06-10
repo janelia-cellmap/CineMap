@@ -612,15 +612,26 @@ class RenderWorker:
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         except Exception:  # noqa: BLE001
             ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-        # yuv420p for universal playback (QuickTime/Safari refuse H.264 4:4:4), with
-        # crf 14 (near visually lossless) + faststart. crf 14 is the real crispness
-        # win — 4:4:4's extra color resolution was marginal on this content and not
-        # worth losing Mac/Safari playback. For a publication-grade master (full 4:4:4
-        # color), use the .blend export or render the PNG frames directly.
+        # Two outputs from the lossless PNG master (the standard viz pipeline):
+        #  - output.mp4     H.264 yuv420p — universal DELIVERY copy (QuickTime/Safari/web).
+        #  - output_hq.mp4  H.264 yuv444p — near-lossless quality (full chroma; ~+9 dB PSNR
+        #                   vs 420 on fine colored detail). Plays in Chrome/VLC, NOT
+        #                   QuickTime. 4:2:0 throws away the fine colored detail (sparkly
+        #                   meshes on black); no crf recovers it, only full chroma does.
+        # (The retained PNG frames are the true lossless master for publication/ProRes.)
+        common = ["-c:v", "libx264", "-preset", "slow", "-crf", "12", "-movflags", "+faststart"]
         subprocess.run([
             ffmpeg, "-y", "-framerate", str(self.job.settings.fps),
             "-i", str(self.frames_dir / "frame_%05d.png"),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "14",
-            "-movflags", "+faststart", str(out),
+            *common, "-pix_fmt", "yuv420p", str(out),
         ], check=True, capture_output=True)
+        hq = self.workdir / "output_hq.mp4"
+        try:
+            subprocess.run([
+                ffmpeg, "-y", "-framerate", str(self.job.settings.fps),
+                "-i", str(self.frames_dir / "frame_%05d.png"),
+                *common, "-pix_fmt", "yuv444p", str(hq),
+            ], check=True, capture_output=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[worker] hq (yuv444p) encode skipped: {e}")
         return str(out)
