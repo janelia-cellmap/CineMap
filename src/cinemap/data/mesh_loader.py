@@ -153,6 +153,7 @@ class MeshLoader:
             print(f"[mesh] bbox {seg_id} failed: {e}")
             return None
 
+    @lru_cache(maxsize=4096)
     def fragment_boxes(self, seg_id: int):
         """The mesh's octree as per-LOD fragments with exact WORLD (nm) bounding
         boxes — the basis for true per-chunk LOD (frustum-cull + per-fragment screen
@@ -161,10 +162,12 @@ class MeshLoader:
             model = grid_origin + vertex_offsets[lod] + chunk_shape·2^lod·[pos, pos+1]
             nm    = info `transform` · model        (transform carries the resolution)
 
-        No calibration — the resolution is read from the mesh info. Returns
-        (per_lod_fragments, lod_scales_nm) where per_lod_fragments[lod] is a list of
-        (frag_index, lo_nm(3,), hi_nm(3,), grid_pos(3 ints)), and lod_scales_nm is the
-        spatial resolution (nm) of each LOD."""
+        No calibration — the resolution is read from the mesh info. EMPTY fragments
+        (byte size 0) are skipped, matching cloud-volume's decoder, and the index is
+        the position in the NON-EMPTY sequence so it lines up with get(...,concat=
+        False). Returns (per_lod, lod_scales_nm): per_lod[lod] is a list of
+        (frag_index, lo_nm(3,), hi_nm(3,), grid_pos, n_bytes); lod_scales_nm is each
+        LOD's spatial resolution in nm."""
         m = self.cv.mesh
         T = np.asarray(m.transform, float)               # 4x4, resolution baked in
         man = m.get_manifest(int(seg_id))
@@ -176,16 +179,53 @@ class MeshLoader:
         for lod in range(man.num_lods):
             cell = cs * (2 ** lod)
             base = go + vo[lod]
+            offs = np.asarray(man.fragment_offsets[lod])
+            positions = np.asarray(man.fragment_positions[lod], float)
             frags = []
-            for idx, p in enumerate(np.asarray(man.fragment_positions[lod], float)):
+            ni = 0                                        # index among NON-empty fragments
+            for idx, p in enumerate(positions):
+                if offs[idx] == 0:                        # empty -> decoder skips it
+                    continue
                 lo_m, hi_m = base + cell * p, base + cell * (p + 1)
                 corners = np.array([[x, y, z] for x in (lo_m[0], hi_m[0])
                                     for y in (lo_m[1], hi_m[1]) for z in (lo_m[2], hi_m[2])])
                 w = (T[:3, :3] @ corners.T).T + T[:3, 3]
-                frags.append((idx, w.min(0), w.max(0), tuple(int(v) for v in p)))
+                frags.append((ni, w.min(0), w.max(0), tuple(int(v) for v in p), int(offs[idx])))
+                ni += 1
             per_lod.append(frags)
         lod_scales_nm = np.asarray(man.lod_scales, float) * scale
         return per_lod, lod_scales_nm
+
+    def get_fragments(self, seg_id: int, selection: dict, colorize=None) -> trimesh.Trimesh | None:
+        """Fetch only the SELECTED octree fragments and combine them. `selection` is
+        {lod: [frag_index, ...]} (indices from fragment_boxes). Fetches each needed
+        LOD's fragments via concat=False (whole-LOD download, disk-cached) and keeps
+        the chosen ones — so a frame renders fine fragments only where near, coarse
+        elsewhere, like neuroglancer."""
+        parts = []
+        for lod, idxs in selection.items():
+            if not idxs:
+                continue
+            try:
+                got = self.cv.mesh.get(int(seg_id), lod=int(lod), concat=False)
+            except Exception as e:  # noqa: BLE001
+                print(f"[chunk] {seg_id} lod{lod} frags failed: {e}")
+                continue
+            frags = got[int(seg_id)] if isinstance(got, dict) else got
+            for i in idxs:
+                if i >= len(frags):
+                    continue
+                fm = frags[i]
+                mesh = trimesh.Trimesh(vertices=np.asarray(fm.vertices, dtype=np.float64),
+                                       faces=np.asarray(fm.faces, dtype=np.int64), process=False)
+                if colorize is not None:
+                    r, g, b = colorize(int(seg_id))
+                    mesh.visual.vertex_colors = np.tile(
+                        (np.array([r, g, b, 1.0]) * 255).astype(np.uint8), (len(mesh.vertices), 1))
+                parts.append(mesh)
+        if not parts:
+            return None
+        return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
 
     @staticmethod
     def _mesh_resolution_nm(mesh: trimesh.Trimesh) -> float:

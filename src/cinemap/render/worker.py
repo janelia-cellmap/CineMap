@@ -254,13 +254,19 @@ class RenderWorker:
         mesh.export(str(out))
         return str(out)
 
+    # rough draco bytes per vertex, only used to turn the layer vertex budget into a
+    # byte ceiling for the per-chunk selection (raise tolerance if a frame is over).
+    _CHUNK_BYTES_PER_VERT = 12
+
     def _build_chunk_assets(self, frames, mesh_specs) -> list[dict]:
-        """View-aware ('chunk') LOD, the closest we get to neuroglancer per-frame:
-        for each frame, frustum-cull each layer's off-screen segments and size each
-        visible one by ITS OWN on-screen footprint (so only what's shown is built,
-        and only near/large segments go fine). The visible set is assembled into one
-        mesh, cached by selection so frames sharing a selection reuse it. Returns
-        per-frame {layer name: asset uid}."""
+        """True per-chunk LOD — mimics neuroglancer's loading. Per frame, per layer,
+        per segment: walk the mesh octree, frustum-cull off-screen fragments, and keep
+        each fragment at the coarsest LOD that's still sharp for ITS on-screen size
+        (`lodScale <= pixel*tol`). So a single object renders fine only where it's near
+        the camera and coarse/absent elsewhere. The layer vertex budget acts as a
+        ceiling (tolerance is raised until a frame fits). Only the selected fragments
+        are fetched + assembled, cached by selection so identical frames reuse it.
+        Returns per-frame {layer name: asset uid}."""
         import hashlib
         import math as _m
         from concurrent.futures import ThreadPoolExecutor
@@ -268,16 +274,14 @@ class RenderWorker:
         import trimesh
 
         from ..data.mesh_loader import MeshLoader, _FETCH_WORKERS
-        from .visibility import visible_segments
+        from .visibility import select_fragments
 
-        W = self.job.settings.width
         H = max(1, self.job.settings.height)
-        aspect = W / H
+        aspect = self.job.settings.width / H
+        ceiling = self._mesh_budget * self._CHUNK_BYTES_PER_VERT   # layer byte budget
 
-        def _bucket(nmpp):                                 # geometric grid -> reuse
-            return round(1.5 ** round(_m.log(max(nmpp, 1e-6)) / _m.log(1.5)), 3)
-
-        # one loader + per-segment bbox per 3D mesh layer (bboxes fetched in parallel)
+        # one loader per 3D mesh layer; warm each segment's octree (fragment_boxes is
+        # cached on the loader) in parallel so per-frame selection is pure CPU.
         layers: dict[str, tuple] = {}
         for fr in frames:
             for m in fr.meshes:
@@ -289,10 +293,9 @@ class RenderWorker:
                     continue
                 ld = MeshLoader(src.mesh_url, src.label_zarr, cache_dir=self._mesh_cache_dir)
                 with ThreadPoolExecutor(max_workers=min(_FETCH_WORKERS, len(m.segment_ids))) as ex:
-                    bbs = list(ex.map(ld.seg_bbox, m.segment_ids))
-                layers[m.mesh_name] = (ld, {s: b for s, b in zip(m.segment_ids, bbs) if b})
+                    list(ex.map(ld.fragment_boxes, m.segment_ids))   # warm octree cache
+                layers[m.mesh_name] = (ld, list(m.segment_ids))
 
-        seg_cache: dict = {}                               # (layer, seg, bucket, color) -> mesh
         frame_layer_uid: list[dict] = []
         for fi, fr in enumerate(frames):
             if self.cancel.is_set():
@@ -301,41 +304,38 @@ class RenderWorker:
             for m in fr.meshes:
                 if m.mesh_name not in layers:
                     continue
-                ld, bboxes = layers[m.mesh_name]
-                if not bboxes:
-                    continue
-                vis = visible_segments(bboxes, fr.position_nm, fr.look_at_nm, fr.up,
-                                       _m.radians(fr.fov_deg), aspect, H)
-                if not vis:
-                    continue
+                ld, seg_ids = layers[m.mesh_name]
                 lc = self._frame_colors(m)
                 ckey = str(lc.cache_key())
-                # spend the layer budget on the VISIBLE segments (so a zoom on a few
-                # gives each lots of detail; a wide view spreads it thin) — keeps the
-                # per-frame total ~the budget while still letting near segments go fine.
-                cap = max(150_000, self._mesh_budget // max(8, len(vis)))
-                sel = sorted((int(s), _bucket(n)) for s, n in vis.items())
-                uid = f"{m.mesh_name}_{hashlib.md5((ckey + '|' + str(cap) + '|' + str(sel)).encode()).hexdigest()[:10]}"
+                fov = _m.radians(fr.fov_deg)
+                # select per-fragment LODs; raise tolerance until the frame fits budget
+                tol = 1.0
+                for _ in range(5):
+                    seg_sel: dict[int, dict] = {}
+                    total = 0
+                    for s in seg_ids:
+                        per_lod, lod_nm = ld.fragment_boxes(s)
+                        sel, nbytes = select_fragments(per_lod, lod_nm, fr.position_nm,
+                                                       fr.look_at_nm, fr.up, fov, aspect, H, tol=tol)
+                        if sel:
+                            seg_sel[s] = sel
+                            total += nbytes
+                    if total <= ceiling or not seg_sel:
+                        break
+                    tol *= 1.6
+                if not seg_sel:
+                    continue
+                sig = tuple(sorted(
+                    (s, tuple(sorted((L, tuple(sorted(ix))) for L, ix in sel.items())))
+                    for s, sel in seg_sel.items()))
+                uid = f"{m.mesh_name}_{hashlib.md5((ckey + '|' + str(sig)).encode()).hexdigest()[:10]}"
                 per[m.mesh_name] = uid
                 if uid not in mesh_specs:
-                    # fetch the not-yet-cached segments for this selection in parallel
-                    todo = [(s, b) for s, b in sel
-                            if (m.mesh_name, s, b, cap, ckey) not in seg_cache]
+                    def _one(s, _ld=ld, _lc=lc, _sel=seg_sel):
+                        return _ld.get_fragments(s, _sel[s], colorize=_lc.rgb)
 
-                    def _one(sb, _ld=ld, _lc=lc, _cap=cap):
-                        s, b = sb
-                        try:
-                            return sb, _ld._precomputed(s, _lc.rgb, b, self._draft, max_verts=_cap)
-                        except Exception as e:  # noqa: BLE001
-                            print(f"[chunk] {m.mesh_name} seg {s} failed: {e}")
-                            return sb, None
-
-                    if todo:
-                        with ThreadPoolExecutor(max_workers=min(_FETCH_WORKERS, len(todo))) as ex:
-                            for sb, mesh in ex.map(_one, todo):
-                                seg_cache[(m.mesh_name, sb[0], sb[1], cap, ckey)] = mesh
-                    parts = [seg_cache[(m.mesh_name, s, b, cap, ckey)] for s, b in sel
-                             if seg_cache.get((m.mesh_name, s, b, cap, ckey)) is not None]
+                    with ThreadPoolExecutor(max_workers=min(_FETCH_WORKERS, len(seg_sel))) as ex:
+                        parts = [p for p in ex.map(_one, list(seg_sel)) if p is not None]
                     if not parts:
                         per.pop(m.mesh_name, None)
                         continue

@@ -64,6 +64,35 @@ def project_bbox(corners, pos, right, true_up, fwd, fov_rad, aspect, height, mar
     return visible, nmpp
 
 
+def select_fragments(per_lod, lod_scales_nm, pos, look_at, up, fov_rad, aspect, height,
+                     tol=1.0):
+    """Neuroglancer's per-chunk rule, offline: for each octree fragment, frustum-cull,
+    then keep the COARSEST LOD whose spatial resolution is finer than ~one pixel*tol
+    at that fragment's depth (`lodScale <= pixelSize*tol`). For a complete octree this
+    selects exactly one LOD per spatial region (no overlap): a fragment at lod L is
+    kept iff it's fine enough AND its parent (L+1) would be too coarse there.
+
+    Returns ({lod: [frag_index, ...]}, total_bytes)."""
+    right, true_up, fwd = camera_basis(pos, look_at, up)
+    maxlod = len(per_lod) - 1
+    sel: dict[int, list] = {}
+    total_bytes = 0
+    for L, frags in enumerate(per_lod):
+        res = lod_scales_nm[L]
+        res_parent = lod_scales_nm[L + 1] if L < maxlod else float("inf")
+        for (idx, lo, hi, _p, nbytes) in frags:
+            corners = bbox_corners((lo, hi))
+            vis, pxnm = project_bbox(corners, pos, right, true_up, fwd, fov_rad, aspect, height)
+            if not vis:
+                continue
+            fine = (L == 0) or (res <= pxnm * tol)
+            parent_coarse = (L == maxlod) or (res_parent > pxnm * tol)
+            if fine and parent_coarse:
+                sel.setdefault(L, []).append(idx)
+                total_bytes += nbytes
+    return sel, total_bytes
+
+
 def visible_segments(seg_bboxes, pos, look_at, up, fov_rad, aspect, height):
     """{seg_id: nm_per_px} for the segments whose bbox is in the frustum. Off-screen
     segments are dropped (not built/rendered); each kept segment carries its own
