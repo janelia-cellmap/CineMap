@@ -13,10 +13,16 @@ Invoke:  python -m cinemap.render.blender_script <scene.json>
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import bpy
 from mathutils import Matrix, Vector
+
+# an object casts a shadow only above this effective opacity (so a layer faded to
+# near-invisible doesn't throw a solid shadow with no visible caster). Env-tunable
+# for diagnosis: CINEMAP_SHADOW_MIN=0 makes everything cast (the old behavior).
+_SHADOW_MIN = float(os.environ.get("CINEMAP_SHADOW_MIN", "0.25"))
 
 
 def _clear() -> None:
@@ -246,7 +252,7 @@ def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> N
         # cast a shadow only when reasonably opaque — Cycles already makes a mid-opacity
         # object's shadow proportional to its alpha; gating off the near-invisible ones
         # (e.g. a layer faded to 0.06) avoids a solid shadow with no visible caster.
-        obj.visible_shadow = opacity > 0.25
+        obj.visible_shadow = opacity > _SHADOW_MIN
         nt = mat.node_tree
         av, sv = nt.nodes.get("cm_alpha"), nt.nodes.get("cm_silh")
         if av is not None:
