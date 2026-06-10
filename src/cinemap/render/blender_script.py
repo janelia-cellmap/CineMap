@@ -84,21 +84,30 @@ def _setup_bloom(scene_spec: dict) -> None:
     b = scene_spec.get("direction", {}).get("bloom") or {}
     if not b.get("enabled"):
         return
-    scene = bpy.context.scene
-    scene.use_nodes = True
-    tree = scene.node_tree
-    rl = next((n for n in tree.nodes if n.type == "R_LAYERS"), None)
-    comp = next((n for n in tree.nodes if n.type == "COMPOSITE"), None)
-    if rl is None or comp is None:
-        return
-    glare = tree.nodes.new("CompositorNodeGlare")
-    glare.glare_type = "FOG_GLOW"
-    glare.quality = "HIGH"
-    glare.threshold = b.get("threshold", 0.6)
-    glare.size = int(b.get("size", 7))
-    glare.mix = b.get("mix", -0.55)
-    tree.links.new(rl.outputs["Image"], glare.inputs["Image"])
-    tree.links.new(glare.outputs["Image"], comp.inputs["Image"])
+    # Best-effort: the compositor API varies by Blender version (Scene.use_nodes /
+    # node_tree is deprecated and is None here). If it isn't available, skip bloom —
+    # the material edge-glow + emission still carry the look. Never fail the render.
+    try:
+        scene = bpy.context.scene
+        scene.use_nodes = True
+        tree = getattr(scene, "node_tree", None)
+        if tree is None:
+            print("[blender] bloom skipped: compositor node tree unavailable")
+            return
+        rl = next((n for n in tree.nodes if n.type == "R_LAYERS"), None)
+        comp = next((n for n in tree.nodes if n.type == "COMPOSITE"), None)
+        if rl is None or comp is None:
+            return
+        glare = tree.nodes.new("CompositorNodeGlare")
+        glare.glare_type = "FOG_GLOW"
+        glare.quality = "HIGH"
+        glare.threshold = b.get("threshold", 0.6)
+        glare.size = int(b.get("size", 7))
+        glare.mix = b.get("mix", -0.55)
+        tree.links.new(rl.outputs["Image"], glare.inputs["Image"])
+        tree.links.new(glare.outputs["Image"], comp.inputs["Image"])
+    except Exception as e:  # noqa: BLE001
+        print(f"[blender] bloom skipped: {e}")
 
 
 def _update_lights(frame: dict, rig: dict) -> None:
