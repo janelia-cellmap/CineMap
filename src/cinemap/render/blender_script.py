@@ -149,11 +149,12 @@ def _update_lights(frame: dict, rig: dict) -> None:
     right = fwd.cross(up)
     right = right.normalized() if right.length > 1e-9 else Vector((1.0, 0.0, 0.0))
     tup = right.cross(fwd).normalized()                  # true up, orthogonal to fwd
-    # photon travel directions. Key is mostly OFF-AXIS (less fwd, more side/down) so it
-    # RAKES the surface — faces tilted toward upper-left light up, others go dark, giving
-    # strong intra-mesh definition (a head-on key lights the whole front evenly = flat).
-    dirs = {"Key":  (0.4 * fwd + 0.85 * right - 0.7 * tup),
-            "Fill": (0.4 * fwd - 0.7 * right + 0.3 * tup),
+    # Mimic neuroglancer: the key is a HEADLIGHT (travels ~along the view), so
+    # camera-facing surfaces are lit and grazing edges/bumps darken (texture via the
+    # normals), evenly across the frame — not a raking key that blows tops / crushes
+    # undersides. A small off-axis fill adds a touch of dimension; ambient fills the rest.
+    dirs = {"Key":  (fwd + 0.15 * right - 0.2 * tup),     # ~headlight, slight offset
+            "Fill": (fwd - 0.6 * right + 0.4 * tup),      # gentle upper-left fill
             "Rim":  (-fwd + 0.4 * tup)}
     for name, d in dirs.items():
         obj = bpy.data.objects.get(name)

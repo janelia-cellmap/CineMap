@@ -25,14 +25,14 @@ class MaterialProfile:
     """Principled-BSDF tuning. Kept close to neuroglancer's look: flat-shaded, fairly
     matte, bright saturated color with simple lighting — not glossy/fancy (gloss +
     heavy emission wash out the crisp faceted definition)."""
-    roughness: float = 0.55      # matte-ish (low gloss, like NG)
-    specular: float = 0.15       # minimal specular
+    roughness: float = 0.7       # matte (NG meshes have no gloss)
+    specular: float = 0.0        # fully matte — no specular hotspots
     sheen: float = 0.0
     coat: float = 0.0
     emission_strength: float = 0.02  # near-zero: shading must come from light, not self-glow
                                      # (emission lifts dark faces -> flat, kills the detail)
     edge_glow: float = 0.0       # off — the rim glow washed out the faceting
-    ao: float = 0.6              # crevice darkening for within-mesh definition
+    ao: float = 0.8              # crevice darkening -> the ridge/bump texture NG shows
     flat_shading: bool = True    # per-face normals (no smoothing) — faces go dark/light
                                  # individually -> the crisp faceted look NG has
 
@@ -40,15 +40,16 @@ class MaterialProfile:
 @dataclass
 class LightRig:
     """Three-point rig, oriented relative to the camera each frame."""
-    # Even, soft lighting like neuroglancer: strong all-directions ambient fill so no
-    # surface is pure-black, + a GENTLE key for form (not a harsh raking key that blows
-    # out tops and crushes undersides). Texture comes from flat shading + AO, not harsh
-    # shadows. Kept moderate so nothing clips under the Standard view transform.
-    key_energy: float = 2.0      # SUN irradiance (W/m^2) — gentle directional for form
-    fill_ratio: float = 0.5      # fill = key * this
-    rim_ratio: float = 0.4       # rim/back = key * this
+    # Mimic neuroglancer's mesh lighting: lightingFactor = |normal·lightDir|*directional
+    # + ambient, with the light ~along the view (a HEADLIGHT). Camera-facing surfaces are
+    # lit, grazing edges/bumps darken -> texture; ambient keeps nothing pure-black. So:
+    # a head-on key + strong ambient, NOT an angled raking key (which blew tops/crushed
+    # undersides). Texture comes from the normals + flat shading + AO.
+    key_energy: float = 2.6      # SUN irradiance (W/m^2), ~the directional term
+    fill_ratio: float = 0.25     # small off-axis fill for a touch of dimension
+    rim_ratio: float = 0.0       # NG has no rim
     camera_relative: bool = True
-    ambient: float = 0.45        # gray ambient fill from all directions (even, NG-like)
+    ambient: float = 0.3         # ambient term (gray fill from all directions)
 
 
 @dataclass
