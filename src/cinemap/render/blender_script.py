@@ -19,11 +19,6 @@ import sys
 import bpy
 from mathutils import Matrix, Vector
 
-# an object casts a shadow only above this effective opacity (so a layer faded to
-# near-invisible doesn't throw a solid shadow with no visible caster). Env-tunable
-# for diagnosis: CINEMAP_SHADOW_MIN=0 makes everything cast (the old behavior).
-_SHADOW_MIN = float(os.environ.get("CINEMAP_SHADOW_MIN", "0.25"))
-
 
 def _clear() -> None:
     bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -401,10 +396,12 @@ def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> N
         opacity = ov.get("opacity", 1.0)            # effective alpha = fade * Opacity(3d)
         visible = ov.get("visible", True) and opacity > 0.001
         obj.hide_render = not visible
-        # cast a shadow only when reasonably opaque — Cycles already makes a mid-opacity
-        # object's shadow proportional to its alpha; gating off the near-invisible ones
-        # (e.g. a layer faded to 0.06) avoids a solid shadow with no visible caster.
-        obj.visible_shadow = opacity > _SHADOW_MIN
+        # Always cast a shadow while visible. Cycles attenuates the shadow by the object's
+        # alpha (transparent shadows), so as a layer fades in/out its shadow ramps smoothly
+        # with opacity. A hard on/off threshold here instead caused a one-frame brightness
+        # POP whenever a layer faded through it (e.g. the segmentation reveal at ~2s):
+        # below the cutoff no shadow, above it the whole tangle self-shadowed at once.
+        obj.visible_shadow = visible
         nt = mat.node_tree
         av, sv = nt.nodes.get("cm_alpha"), nt.nodes.get("cm_silh")
         if av is not None:
