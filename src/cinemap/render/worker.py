@@ -553,10 +553,14 @@ class RenderWorker:
             kfs = kfs[a : b + 1]
         self._kfs = kfs   # the exact keyframes these frames came from (for the director)
         self._progress(0.05, "interpolating keyframes")
-        # director (Phase 3): glide to a gentle start/stop (ease the first/last
-        # transition, linear through the middle so a rotation doesn't pause at every
-        # keyframe); off => linear (video_tool-faithful). Same frame count/duration.
-        frames = build_frames(kfs, self.job.settings.fps, smooth_ends=self._auto_direct)
+        # Timing matches neuroglancer's video_tool exactly (per-transition frame counts
+        # and t-values). NG interpolates LINEARLY (constant velocity), so we default to
+        # linear too — video_tool-faithful. The director's optional cinematic ease of the
+        # first/last transition (smooth_camera) is opt-in, since it changes the velocity
+        # profile of the opening/closing glide and so reads as different timing vs NG.
+        from . import director as _director
+        smooth = self._auto_direct and _director.DirectorSettings().smooth_camera
+        frames = build_frames(kfs, self.job.settings.fps, smooth_ends=smooth)
         if not frames:
             raise ValueError("no keyframes to render")
 

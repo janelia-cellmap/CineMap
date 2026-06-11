@@ -53,19 +53,19 @@ class MaterialProfile:
 @dataclass
 class LightRig:
     """Three-point rig, oriented relative to the camera each frame."""
-    # "Drama" look: off-axis RAKING key (see _update_lights) + rim + VERY low ambient =>
-    # deep, dramatic directional intra-mesh shadows. Warm key + cool fill/rim/ambient give
-    # a studio warm-lit / cool-shadow color contrast. AgX (+ Punchy tone) rolls the bright
-    # raking highlights off, so the strong key gives contrast without clipping to neon.
-    key_energy: float = 8.5      # SUN irradiance (W/m^2) — strong raking key
+    # Non-dramatic ("lighter rake") default: off-axis RAKING key (see _update_lights) +
+    # rim + moderate ambient => directional intra-mesh shadows with brighter, more even
+    # fill (neurons read vivid, closer to neuroglancer; not as dark as the "drama" look).
+    # AgX rolls the bright raking highlights off (no clipping). Neutral light colors.
+    key_energy: float = 7.5      # SUN irradiance (W/m^2) — raking key
     fill_ratio: float = 0.3      # off-axis fill softens the shadow side
-    rim_ratio: float = 0.8       # rim separates silhouettes from the dark background
+    rim_ratio: float = 0.5       # rim separates silhouettes from the dark background
     camera_relative: bool = True
-    ambient: float = 0.10        # very low ambient => deep, dramatic shadows
-    key_color: tuple = (1.0, 0.88, 0.72)     # warm key
-    fill_color: tuple = (0.72, 0.82, 1.0)    # cool fill
-    rim_color: tuple = (0.78, 0.85, 1.0)     # cool rim
-    ambient_color: tuple = (0.85, 0.9, 1.0)  # cool ambient (cool shadows)
+    ambient: float = 0.18        # moderate ambient => defined shadows but not too dark
+    key_color: tuple = (1.0, 1.0, 1.0)
+    fill_color: tuple = (1.0, 1.0, 1.0)
+    rim_color: tuple = (1.0, 1.0, 1.0)
+    ambient_color: tuple = (1.0, 1.0, 1.0)
     # Optional 2nd back/edge light on the OPPOSITE side from the rim, in a contrasting
     # color -> cinematic two-tone edge separation (off by default; set kick_ratio > 0).
     kick_ratio: float = 0.0
@@ -107,11 +107,13 @@ class DirectorSettings:
     dof: DepthOfField = field(default_factory=DepthOfField)
     emphasis: Emphasis = field(default_factory=Emphasis)
     bloom: Bloom = field(default_factory=Bloom)
-    smooth_camera: bool = True   # Phase 3: ease into/out of keyframes (vs linear)
-    # AgX rolls the bright raking highlights off instead of clipping to neon; the "Punchy"
-    # look deepens midtone contrast for the dramatic, rich look (no blowout: 0% clipped).
+    smooth_camera: bool = False  # cinematic ease of the FIRST/LAST transition. Off by
+                                 # default: neuroglancer's video_tool is pure linear, so
+                                 # linear keeps our timing/motion exactly NG-faithful.
+    # AgX rolls the bright raking highlights off instead of clipping to neon. Plain AgX
+    # (no "Punchy") keeps the lighter, more even non-dramatic look closer to neuroglancer.
     view_transform: str = "AgX"
-    view_look: str = "AgX - Punchy"
+    view_look: str = ""
 
 
 def _frame_starts(keyframes, fps: int) -> tuple[list[int], int]:
