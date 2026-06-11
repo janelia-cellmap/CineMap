@@ -57,8 +57,10 @@ class LightRig:
     # rim + moderate ambient => directional intra-mesh shadows with brighter, more even
     # fill (neurons read vivid, closer to neuroglancer; not as dark as the "drama" look).
     # AgX rolls the bright raking highlights off (no clipping). Neutral light colors.
-    key_energy: float = 7.5      # SUN irradiance (W/m^2) — raking key
-    fill_ratio: float = 0.3      # off-axis fill softens the shadow side
+    key_energy: float = 7.5      # SUN irradiance (W/m^2) — raking key (the directional style)
+    fill_ratio: float = 0.5      # CAMERA-FRONT fill (see _update_lights): lifts the shadow
+                                 # side so nothing the viewer sees goes mysteriously dark
+                                 # (NG-like visibility) while the raking key keeps the depth
     rim_ratio: float = 0.5       # rim separates silhouettes from the dark background
     camera_relative: bool = True
     ambient: float = 0.18        # moderate ambient => defined shadows but not too dark

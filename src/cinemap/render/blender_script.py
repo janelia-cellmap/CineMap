@@ -212,10 +212,23 @@ def _update_lights(frame: dict, rig: dict) -> None:
     # camera-facing surfaces are lit and grazing edges/bumps darken (texture via the
     # normals), evenly across the frame — not a raking key that blows tops / crushes
     # undersides. A small off-axis fill adds a touch of dimension; ambient fills the rest.
-    dirs = {"Key":  (0.4 * fwd + 0.85 * right - 0.7 * tup),   # off-axis raking key ->
-            "Fill": (0.4 * fwd - 0.7 * right + 0.3 * tup),    # strong intra-mesh shadows
-            "Rim":  (-0.8 * fwd + 0.7 * right + 0.4 * tup),   # back-right edge light
-            "Kick": (-0.8 * fwd - 0.7 * right + 0.4 * tup)}   # back-left (opposing) kicker
+    if rig.get("headlight"):
+        # neuroglancer's exact model: light points straight down the view axis, so the
+        # surfaces you see are the lit ones and any cast shadow falls BEHIND the geometry
+        # (hidden) -> no visible shadow, evenly lit. Tiny offsets keep it from being dead-flat.
+        dirs = {"Key":  (fwd + 0.05 * right - 0.05 * tup),
+                "Fill": (fwd - 0.2 * right + 0.1 * tup),
+                "Rim":  (fwd + 0.1 * tup),
+                "Kick": (fwd - 0.1 * right)}
+    else:
+        # Hybrid: raking KEY gives the directional "rake" modeling (the liked style), while
+        # the FILL is a CAMERA-FRONT headlight that lifts the shadow side so nothing the
+        # viewer is looking at goes mysteriously dark (NG-like even visibility) and the
+        # off-angle shadow patches are washed up. Rim/kick separate silhouettes.
+        dirs = {"Key":  (0.4 * fwd + 0.85 * right - 0.7 * tup),   # off-axis raking key
+                "Fill": (fwd + 0.05 * right),                     # camera-front fill (lift)
+                "Rim":  (-0.8 * fwd + 0.7 * right + 0.4 * tup),   # back-right edge light
+                "Kick": (-0.8 * fwd - 0.7 * right + 0.4 * tup)}   # back-left (opposing) kicker
     for name, d in dirs.items():
         obj = bpy.data.objects.get(name)
         if obj and d.length > 1e-9:
