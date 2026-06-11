@@ -364,30 +364,8 @@ def _import_meshes(scene_spec: dict) -> dict:
         nt.links.new(silh_v.outputs[0], powr.inputs[1])      # exponent = silhouette power
         nt.links.new(alpha_v.outputs[0], mul.inputs[0])
         nt.links.new(powr.outputs[0], mul.inputs[1])
-        # Shadow rays see a STEEPER alpha (alpha**shadow_power) than camera rays, so a
-        # faint/transparent layer (e.g. neurons faded to 0.06) casts ~no shadow and doesn't
-        # throw a stray dark patch on the opaque object behind it, while a fully opaque
-        # layer still casts a full shadow (keeps the rake depth). Smooth in opacity -> no
-        # reveal pop. Selected per-ray via Light Path "Is Shadow Ray".
-        alpha_out = mul.outputs[0]
-        sp = prof.get("shadow_opacity_power", 1.0)
-        if sp and sp > 1.0 and "Alpha" in bsdf.inputs:
-            spow = nt.nodes.new("ShaderNodeMath"); spow.operation = "POWER"
-            spow.inputs[1].default_value = sp
-            nt.links.new(mul.outputs[0], spow.inputs[0])           # alpha**shadow_power
-            lpath = nt.nodes.new("ShaderNodeLightPath")
-            sdiff = nt.nodes.new("ShaderNodeMath"); sdiff.operation = "SUBTRACT"
-            nt.links.new(spow.outputs[0], sdiff.inputs[0])
-            nt.links.new(mul.outputs[0], sdiff.inputs[1])          # shadow_alpha - cam_alpha
-            sscale = nt.nodes.new("ShaderNodeMath"); sscale.operation = "MULTIPLY"
-            nt.links.new(lpath.outputs["Is Shadow Ray"], sscale.inputs[0])
-            nt.links.new(sdiff.outputs[0], sscale.inputs[1])
-            sadd = nt.nodes.new("ShaderNodeMath"); sadd.operation = "ADD"; sadd.use_clamp = True
-            nt.links.new(mul.outputs[0], sadd.inputs[0])           # cam_alpha + is_shadow*(..)
-            nt.links.new(sscale.outputs[0], sadd.inputs[1])
-            alpha_out = sadd.outputs[0]
         if "Alpha" in bsdf.inputs:
-            nt.links.new(alpha_out, bsdf.inputs["Alpha"])
+            nt.links.new(mul.outputs[0], bsdf.inputs["Alpha"])
 
         # Fresnel edge-glow: grazing edges emit their own color (a soft rim glow that
         # makes structures read as 'lit' against the dark background, esp. with bloom).

@@ -43,10 +43,6 @@ class MaterialProfile:
     # infeasible here). Real object outlines would need a compositor object-ID edge pass.
     edge_darken: float = 0.0
     edge_power: float = 2.5      # rim tightness (only used when edge_darken > 0)
-    shadow_opacity_power: float = 2.0  # shadow rays see alpha**this, so faint/transparent
-                                 # layers cast ~no shadow (no stray shadow on objects behind
-                                 # a near-invisible one) while opaque layers cast full
-                                 # shadows (keeps the depth). Smooth -> no reveal pop.
     backface_cull: bool = False  # make back faces transparent: thin tubes/cell-bodies stop
                                  # doubling up (front+back) at low opacity -> glassier, more
                                  # see-through transparent state (closer to neuroglancer)
