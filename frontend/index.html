@@ -143,6 +143,7 @@
     <label class="msg" title="3D mesh opacity for the selected frame; lower it to reveal the EM slice + its segmentation">3D meshes</label>
     <input id="meshOp" type="range" min="0" max="1" step="0.05" value="1" style="width:90px"
       onchange="setMeshOpacity()" title="3D mesh opacity (0 = show only the segmented EM slice)" />
+    <button id="autoThumbBtn" onclick="toggleAutoThumbs()" title="render every keyframe's thumbnail in sequence so the timeline fills in">⟳ Render all</button>
     <button onclick="openPropPanel()" title="edit a layer setting on the selected keyframe and propagate it to later/earlier keyframes">✎ Propagate edit</button>
     <button id="exportBtn" class="primary" onclick="startRender('export')">⬇ Export video</button>
     <button id="blendBtn" onclick="startRender('blend')" title="bake the whole shot to a self-contained animated .blend (camera, meshes, EM slices; textures packed in)">⬇ Export .blend</button>
@@ -265,7 +266,8 @@ async function importStates(e) {
     }
     let msg = `imported ${r.count} keyframe${r.count === 1 ? '' : 's'}`;
     if (r.errors && r.errors.length) { msg += ` (${r.errors.length} skipped)`; }
-    setStatus(msg);
+    setStatus(msg + ' — auto-rendering thumbnails…');
+    autoRenderThumbs();   // fill the timeline at the bottom so you can watch them appear
   } catch (err) { setStatus('import states failed: ' + err.message); }
   e.target.value = '';
 }
@@ -349,6 +351,7 @@ function showKeyframeThumb(id) {
 // render the single keyframe to a still; show it live and keep it as the frame thumbnail
 let THUMB_JOB = null;
 async function renderThumbnail(id) {
+  AUTO_THUMBS = false;   // a manual single-thumbnail render stops the auto sweep
   if (THUMB_JOB) { api('POST', `/api/renders/${THUMB_JOB}/cancel`).catch(() => {}); }  // don't pile up
   try {
     const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`);
@@ -360,6 +363,36 @@ async function renderThumbnail(id) {
     }, true);
   } catch (e) { setStatus('thumbnail render failed: ' + e.message); }
 }
+
+// auto-render every keyframe's thumbnail in sequence (e.g. right after importing a
+// links file), so the timeline fills in at the bottom and you can watch progress.
+let AUTO_THUMBS = false;
+function renderThumbAwait(id) {
+  return new Promise(async (resolve) => {
+    try {
+      const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`);
+      THUMB_JOB = job_id;
+      attachRender(job_id, () => { if (THUMB_JOB === job_id) THUMB_JOB = null; THUMB_VER[id] = Date.now(); resolve(); }, true);
+    } catch (e) { resolve(); }   // one failure shouldn't stall the rest
+  });
+}
+async function autoRenderThumbs() {
+  if (!PID) { setStatus('open a project first'); return; }
+  const ids = KF_ORDER.slice();
+  if (!ids.length) return;
+  AUTO_THUMBS = true;
+  $('autoThumbBtn').textContent = '■ Stop';
+  for (let i = 0; i < ids.length; i++) {
+    if (!AUTO_THUMBS) { setStatus(`stopped (${i}/${ids.length} rendered)`); break; }
+    setStatus(`auto-rendering thumbnails ${i + 1}/${ids.length}…`);
+    await renderThumbAwait(ids[i]);
+    await reload();
+  }
+  if (AUTO_THUMBS) setStatus(`done — rendered ${ids.length} thumbnail(s)`);
+  AUTO_THUMBS = false;
+  $('autoThumbBtn').textContent = '⟳ Render all';
+}
+function toggleAutoThumbs() { if (AUTO_THUMBS) AUTO_THUMBS = false; else autoRenderThumbs(); }
 
 async function setMeshOpacity() {
   const id = ACTIVE_KF || LAST_KF_ID;
@@ -439,6 +472,7 @@ function heartbeat(onStall) {
 }
 
 async function startRender(mode) {
+  AUTO_THUMBS = false;   // stop any thumbnail auto-sweep before a full render
   if (!PID) { setStatus('create/open a project first'); return; }
   let fps = +$('fps').value;
   if (mode === 'preview') {
