@@ -22,18 +22,18 @@ from dataclasses import asdict, dataclass, field
 
 @dataclass
 class MaterialProfile:
-    """Principled-BSDF tuning. Kept close to neuroglancer's look: flat-shaded, fairly
-    matte, bright saturated color with simple lighting — not glossy/fancy (gloss +
-    heavy emission wash out the crisp faceted definition)."""
-    roughness: float = 0.55      # mostly matte, a hint of sheen catches the raking key
-    specular: float = 0.15       # slight specular defines the lit edges under the raking key
+    """Principled-BSDF tuning. Default is the neuVid-style beauty look: a glossy-ish
+    Principled (roughness ~0.25 + specular -> highlights) lit by the 3-point rig, which
+    gives real form-contrast (neuVid is Janelia's neuron-video tool; this mirrors its
+    material). Smooth-shaded. Paired with AgX so highlights roll off (no oversaturation)."""
+    roughness: float = 0.25      # glossy-ish (neuVid) -> specular highlights = pop/contrast
+    specular: float = 0.5        # specular highlights catch the 3-point lights
     sheen: float = 0.0
     coat: float = 0.0
-    emission_strength: float = 0.02  # near-zero: shading must come from light, not self-glow
-                                     # (emission lifts dark faces -> flat, kills the detail)
+    emission_strength: float = 0.02  # near-zero: shading comes from the lights, not self-glow
     edge_glow: float = 0.0       # off — the rim glow washed out the faceting
-    ao: float = 0.6              # ambient-occlusion strength: dark crevices (NG-like)
-    ao_distance_nm: float = 2000  # AO reach; catches crevices + where tubes contact/overlap
+    ao: float = 0.0              # neuVid uses no AO; the 3-point lighting carries the form
+    ao_distance_nm: float = 2000  # AO reach (only used if ao > 0)
     cavity: float = 0.0          # curvature (pointiness) shading: convex ridges brighten,
                                  # concave creases darken -> crisp surface contrast that
                                  # follows the geometry (sharper than AO; MeshLab-like).
@@ -46,27 +46,24 @@ class MaterialProfile:
     backface_cull: bool = False  # make back faces transparent: thin tubes/cell-bodies stop
                                  # doubling up (front+back) at low opacity -> glassier, more
                                  # see-through transparent state (closer to neuroglancer)
-    flat_shading: bool = True    # per-face normals (no smoothing) — faces go dark/light
-                                 # individually -> the crisp faceted look NG has
+    flat_shading: bool = False   # smooth (per-vertex) normals like neuVid/NG -> rounded
+                                 # form-shading on the tubes (not faceted)
 
 
 @dataclass
 class LightRig:
     """Three-point rig, oriented relative to the camera each frame."""
-    # Non-dramatic ("lighter rake") default: off-axis RAKING key (see _update_lights) +
-    # rim + moderate ambient => directional intra-mesh shadows with brighter, more even
-    # fill (neurons read vivid, closer to neuroglancer; not as dark as the "drama" look).
-    # AgX rolls the bright raking highlights off (no clipping). Neutral light colors.
-    key_energy: float = 7.5      # SUN irradiance (W/m^2) — raking key (the directional style)
-    fill_ratio: float = 0.5      # CAMERA-FRONT fill (see _update_lights): lifts the shadow
-                                 # side so nothing the viewer sees goes mysteriously dark
-                                 # (NG-like visibility) while the raking key keeps the depth
+    # neuVid-style 3-point: a gray KEY (raking) + camera-front FILL + cool RIM. Colors
+    # follow neuVid (key neutral-gray, fill slightly cool, rim cool/blue) -> a subtle
+    # warm/cool studio dimension. With AgX the glossy highlights roll off (no clipping).
+    key_energy: float = 6.0      # SUN irradiance (W/m^2)
+    fill_ratio: float = 0.6      # camera-front fill (lifts the shadow side)
     rim_ratio: float = 0.5       # rim separates silhouettes from the dark background
     camera_relative: bool = True
-    ambient: float = 0.18        # moderate ambient => defined shadows but not too dark
-    key_color: tuple = (1.0, 1.0, 1.0)
-    fill_color: tuple = (1.0, 1.0, 1.0)
-    rim_color: tuple = (1.0, 1.0, 1.0)
+    ambient: float = 0.18        # modest ambient
+    key_color: tuple = (0.8, 0.8, 0.8)     # neutral gray key (neuVid)
+    fill_color: tuple = (0.5, 0.5, 0.6)    # slightly cool fill (neuVid)
+    rim_color: tuple = (0.8, 0.84, 1.0)    # cool/blue rim (neuVid)
     ambient_color: tuple = (1.0, 1.0, 1.0)
     # Optional 2nd back/edge light on the OPPOSITE side from the rim, in a contrasting
     # color -> cinematic two-tone edge separation (off by default; set kick_ratio > 0).
