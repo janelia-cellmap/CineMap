@@ -143,11 +143,42 @@
     <label class="msg" title="3D mesh opacity for the selected frame; lower it to reveal the EM slice + its segmentation">3D meshes</label>
     <input id="meshOp" type="range" min="0" max="1" step="0.05" value="1" style="width:90px"
       onchange="setMeshOpacity()" title="3D mesh opacity (0 = show only the segmented EM slice)" />
+    <button onclick="openPropPanel()" title="edit a layer setting on the selected keyframe and propagate it to later/earlier keyframes">✎ Propagate edit</button>
     <button id="exportBtn" class="primary" onclick="startRender('export')">⬇ Export video</button>
     <button id="blendBtn" onclick="startRender('blend')" title="bake the whole shot to a self-contained animated .blend (camera, meshes, EM slices; textures packed in)">⬇ Export .blend</button>
   </div>
   <div id="timeline"></div>
 </footer>
+
+<div id="propPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #3a3f47;border-radius:8px;padding:12px 14px;width:330px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.9">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <b>✎ Propagate layer edit</b>
+    <span onclick="$('propPanel').style.display='none'" style="cursor:pointer;opacity:.7">✕</span>
+  </div>
+  <div class="msg" id="propKf" style="margin:2px 0 6px"></div>
+  <label class="msg">Layer</label><select id="propLayer" onchange="propLayerChanged()" style="width:100%"></select>
+  <label class="msg">Field</label>
+  <select id="propField" onchange="propFieldChanged()" style="width:100%">
+    <option value="segment_color">segment color</option>
+    <option value="default_color">default color (all segments)</option>
+    <option value="object_alpha">opacity (3d)</option>
+    <option value="silhouette">silhouette (3d)</option>
+    <option value="saturation">saturation</option>
+    <option value="color_seed">color seed</option>
+    <option value="visible">visible</option>
+  </select>
+  <div id="propSegWrap"><label class="msg">Segment</label><select id="propSeg" style="width:100%"></select></div>
+  <label class="msg">New value</label> <span id="propValInput"></span>
+  <label class="msg">Apply to</label>
+  <select id="propDir" style="width:100%">
+    <option value="right">this + later →</option>
+    <option value="left">this + earlier ←</option>
+    <option value="all">all keyframes</option>
+    <option value="this">this keyframe only</option>
+  </select>
+  <label class="msg" title="only change keyframes whose value currently matches this one (find &amp; replace) — won't clobber deliberate changes"><input type="checkbox" id="propMatch" checked /> replace only where it currently matches</label>
+  <div style="margin-top:8px"><button class="primary" onclick="applyPropagate()">Apply</button> <span id="propMsg" class="msg"></span></div>
+</div>
 
 <script>
 let PID = null;
@@ -583,6 +614,69 @@ function attachRender(job_id, afterDone, light) {
   ws.onerror = () => finish('error');
   ws.onclose = () => finish('error');   // never leave the UI stuck if the socket drops
   hb.kick();   // arm the watchdog even if the socket never opens
+}
+
+// ---- propagate layer edits across keyframes ----
+let PROP_LAYERS = [];
+async function openPropPanel() {
+  const id = ACTIVE_KF || LAST_KF_ID;
+  if (!PID || !id) { setStatus('click a keyframe to select it first'); return; }
+  try {
+    const r = await api('GET', `/api/projects/${PID}/keyframes/${id}/layers`);
+    PROP_LAYERS = r.layers || [];
+  } catch (e) { setStatus('could not load layers: ' + e.message); return; }
+  if (!PROP_LAYERS.length) { setStatus('this keyframe has no mesh layers'); return; }
+  $('propKf').textContent = 'editing keyframe ' + id;
+  $('propLayer').innerHTML = PROP_LAYERS.map((l, i) => `<option value="${i}">${l.mesh_name}</option>`).join('');
+  $('propMsg').textContent = '';
+  propLayerChanged();
+  $('propPanel').style.display = 'block';
+}
+const curPropLayer = () => PROP_LAYERS[+$('propLayer').value];
+function propLayerChanged() {
+  const l = curPropLayer(); if (!l) return;
+  $('propSeg').innerHTML = (l.segment_ids || []).map(s => `<option value="${s}">${s}</option>`).join('');
+  propFieldChanged();
+}
+function rgbToHex(c) {
+  if (!c) return '#3333ff';
+  const h = c.map(v => Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0'));
+  return '#' + h.join('');
+}
+const hexToRgb = (h) => { h = h.replace('#', ''); return [0, 2, 4].map(i => parseInt(h.substr(i, 2), 16) / 255); };
+function propFieldChanged() {
+  const f = $('propField').value, l = curPropLayer();
+  $('propSegWrap').style.display = f === 'segment_color' ? 'block' : 'none';
+  let html;
+  if (f === 'segment_color' || f === 'default_color') {
+    html = `<input type="color" id="propVal" value="${rgbToHex(f === 'default_color' ? l.default_color : null)}">`;
+  } else if (f === 'visible') {
+    html = `<select id="propVal"><option value="true">true</option><option value="false">false</option></select>`;
+  } else if (f === 'color_seed') {
+    html = `<input type="number" id="propVal" step="1" value="${l ? l.color_seed : 0}" style="width:90px">`;
+  } else {  // object_alpha, silhouette, saturation
+    const v = l && l[f] != null ? l[f] : 1;
+    html = `<input type="number" id="propVal" step="0.05" min="0" value="${v}" style="width:90px">`;
+  }
+  $('propValInput').innerHTML = html;
+}
+async function applyPropagate() {
+  const id = ACTIVE_KF || LAST_KF_ID, l = curPropLayer(); if (!l) return;
+  const f = $('propField').value, raw = $('propVal').value;
+  let value, segment_id = null;
+  if (f === 'segment_color') { value = hexToRgb(raw); segment_id = +$('propSeg').value; }
+  else if (f === 'default_color') value = hexToRgb(raw);
+  else if (f === 'visible') value = raw === 'true';
+  else if (f === 'color_seed') value = parseInt(raw, 10);
+  else value = parseFloat(raw);
+  try {
+    const r = await api('POST', `/api/projects/${PID}/keyframes/${id}/propagate`,
+      { mesh_name: l.mesh_name, field: f, value, segment_id,
+        direction: $('propDir').value, match_old: $('propMatch').checked });
+    $('propMsg').textContent = `changed ${r.count} keyframe(s)`;
+    setStatus(`propagated ${f} → ${r.count} keyframe(s)`);
+    reload();
+  } catch (e) { $('propMsg').textContent = 'error: ' + e.message; }
 }
 
 refreshProjects();

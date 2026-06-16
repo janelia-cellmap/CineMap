@@ -162,6 +162,91 @@ def update_keyframe(project: Project, keyframe_id: str, **fields) -> Keyframe:
     return updated
 
 
+# per-layer settings that can be edited on a keyframe and propagated across keyframes.
+# segment_colors is handled specially (per-segment override keyed by segment id).
+_PROPAGATABLE_FIELDS = {
+    "color", "color_seed", "default_color", "object_alpha", "silhouette",
+    "visible", "saturation", "render_3d",
+}
+
+
+def _colors_equal(a, b, tol=1.0 / 512) -> bool:
+    if a is None or b is None:
+        return a is b or a == b
+    return len(a) == len(b) and all(abs(x - y) <= tol for x, y in zip(a, b))
+
+
+def _values_equal(field, a, b) -> bool:
+    if field in ("color", "default_color"):
+        return _colors_equal(a, b)
+    if field in ("object_alpha", "silhouette", "saturation"):
+        return abs(float(a) - float(b)) <= 1e-4
+    return a == b
+
+
+def propagate_layer_field(project: Project, from_keyframe_id: str, mesh_name: str,
+                          field: str, value, segment_id: int | None = None,
+                          direction: str = "right", match_old: bool = True) -> dict:
+    """Edit a layer (`mesh_name`) setting on one keyframe and propagate it to others.
+
+    `field` is a MeshInstance field, or "segment_color" (then `segment_id` selects which
+    segment's per-segment override to set). `direction`: "this" | "right" (this + later) |
+    "left" (this + earlier) | "all". With `match_old` (the default), a target keyframe is
+    changed ONLY where its current value equals the source keyframe's OLD value — so e.g.
+    "make it blue wherever it was red" won't clobber a keyframe deliberately set green.
+    The source keyframe is always updated. Returns {changed: [keyframe_id, ...]}.
+    """
+    if field != "segment_color" and field not in _PROPAGATABLE_FIELDS:
+        raise ValueError(f"field not propagatable: {field}")
+    kfs = project.keyframes
+    idx = next((i for i, k in enumerate(kfs) if k.id == from_keyframe_id), None)
+    if idx is None:
+        raise ValueError("no such keyframe")
+
+    def layer(kf):
+        return next((m for m in kf.meshes if m.mesh_name == mesh_name), None)
+
+    src = layer(kfs[idx])
+    if src is None:
+        raise ValueError(f"layer {mesh_name} not in keyframe {from_keyframe_id}")
+
+    sid = str(segment_id) if segment_id is not None else None
+    old = src.segment_colors.get(sid) if field == "segment_color" else getattr(src, field)
+
+    if direction == "this":
+        rng = {idx}
+    elif direction == "right":
+        rng = set(range(idx, len(kfs)))
+    elif direction == "left":
+        rng = set(range(0, idx + 1))
+    else:  # all
+        rng = set(range(len(kfs)))
+
+    changed: list[str] = []
+    for i in rng:
+        lyr = layer(kfs[i])
+        if lyr is None:
+            continue
+        cur = lyr.segment_colors.get(sid) if field == "segment_color" else getattr(lyr, field)
+        is_src = i == idx
+        if not is_src and match_old and not _values_equal(
+                "color" if field == "segment_color" else field, cur, old):
+            continue
+        if field == "segment_color":
+            new_overrides = dict(lyr.segment_colors)
+            new_overrides[sid] = value
+            new_meshes = [m.model_copy(update={"segment_colors": new_overrides})
+                          if m.mesh_name == mesh_name else m for m in kfs[i].meshes]
+        else:
+            new_meshes = [m.model_copy(update={field: value})
+                          if m.mesh_name == mesh_name else m for m in kfs[i].meshes]
+        kfs[i] = kfs[i].model_copy(update={"meshes": new_meshes})
+        changed.append(kfs[i].id)
+    project.keyframes = kfs
+    store.save(project)
+    return {"changed": changed, "old": old, "value": value}
+
+
 # ----------------------------- preset shot generators -----------------------------
 def _base_framing(project: Project, target, radius_nm):
     """Derive orbit target + radius from the current keyframe's camera, so presets

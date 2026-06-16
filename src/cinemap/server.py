@@ -9,6 +9,7 @@ import asyncio
 import os
 import shutil
 import threading
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -309,6 +310,46 @@ class ReorderReq(BaseModel):
 
 class MeshOpacityReq(BaseModel):
     opacity: float
+
+
+class PropagateReq(BaseModel):
+    mesh_name: str
+    field: str                       # MeshInstance field, or "segment_color"
+    value: Any = None                # new value (e.g. [r,g,b], float, int, bool)
+    segment_id: int | None = None    # for field == "segment_color"
+    direction: str = "right"         # this | right (later) | left (earlier) | all
+    match_old: bool = True           # only change keyframes currently holding the OLD value
+
+
+@app.get("/api/projects/{pid}/keyframes/{kid}/layers")
+def keyframe_layers(pid: str, kid: str):
+    """The editable per-layer settings of one keyframe (for the propagate editor)."""
+    p = store.load(pid)
+    kf = next((k for k in p.keyframes if k.id == kid), None)
+    if kf is None:
+        raise HTTPException(404, "no such keyframe")
+    return {"layers": [
+        {"mesh_name": m.mesh_name, "render_3d": m.render_3d, "visible": m.visible,
+         "color_seed": m.color_seed, "default_color": m.default_color,
+         "segment_colors": m.segment_colors, "segment_ids": m.segment_ids[:200],
+         "object_alpha": m.object_alpha, "silhouette": m.silhouette,
+         "saturation": m.saturation, "color": m.color}
+        for m in kf.meshes]}
+
+
+@app.post("/api/projects/{pid}/keyframes/{kid}/propagate")
+def propagate_layer(pid: str, kid: str, req: PropagateReq):
+    """Edit a layer setting on this keyframe and propagate it to others (replace-where-
+    matching by default), so a change (e.g. a segment's color) carries to later/earlier
+    snapshots without editing each by hand."""
+    p = store.load(pid)
+    try:
+        res = ops.propagate_layer_field(
+            p, kid, req.mesh_name, req.field, req.value, segment_id=req.segment_id,
+            direction=req.direction, match_old=req.match_old)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True, **res, "count": len(res["changed"])}
 
 
 @app.post("/api/projects/{pid}/keyframes/{kid}/mesh_opacity")
