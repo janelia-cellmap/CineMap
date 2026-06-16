@@ -184,9 +184,37 @@ def _values_equal(field, a, b) -> bool:
     return a == b
 
 
+_UNSET = object()
+
+
+def diff_layer_settings(old_meshes, new_meshes) -> list[dict]:
+    """Per-layer setting changes between two keyframe mesh lists (matched by mesh_name),
+    over the propagatable fields + per-segment colors. Each change is
+    {mesh_name, field, old, new[, segment_id]} — used to offer propagation after a
+    keyframe is updated from the neuroglancer view."""
+    old_by = {m.mesh_name: m for m in old_meshes}
+    changes: list[dict] = []
+    for nm in new_meshes:
+        om = old_by.get(nm.mesh_name)
+        if om is None:
+            continue
+        for f in ("color", "color_seed", "default_color", "object_alpha",
+                  "silhouette", "visible", "saturation"):
+            ov, nv = getattr(om, f), getattr(nm, f)
+            if not _values_equal(f, ov, nv):
+                changes.append({"mesh_name": nm.mesh_name, "field": f, "old": ov, "new": nv})
+        for sid in set(om.segment_colors) | set(nm.segment_colors):
+            ov, nv = om.segment_colors.get(sid), nm.segment_colors.get(sid)
+            if not _colors_equal(ov, nv):
+                changes.append({"mesh_name": nm.mesh_name, "field": "segment_color",
+                                "segment_id": int(sid), "old": ov, "new": nv})
+    return changes
+
+
 def propagate_layer_field(project: Project, from_keyframe_id: str, mesh_name: str,
                           field: str, value, segment_id: int | None = None,
-                          direction: str = "right", match_old: bool = True) -> dict:
+                          direction: str = "right", match_old: bool = True,
+                          match_value=_UNSET) -> dict:
     """Edit a layer (`mesh_name`) setting on one keyframe and propagate it to others.
 
     `field` is a MeshInstance field, or "segment_color" (then `segment_id` selects which
@@ -211,7 +239,13 @@ def propagate_layer_field(project: Project, from_keyframe_id: str, mesh_name: st
         raise ValueError(f"layer {mesh_name} not in keyframe {from_keyframe_id}")
 
     sid = str(segment_id) if segment_id is not None else None
-    old = src.segment_colors.get(sid) if field == "segment_color" else getattr(src, field)
+    # value to MATCH against in target keyframes. Normally the source's current value, but
+    # callers can pass an explicit match_value (e.g. after the source was already updated
+    # from the neuroglancer view, so its "current" is the new value, not the old one).
+    if match_value is not _UNSET:
+        old = match_value
+    else:
+        old = src.segment_colors.get(sid) if field == "segment_color" else getattr(src, field)
 
     if direction == "this":
         rng = {idx}

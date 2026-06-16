@@ -282,12 +282,17 @@ def get_thumbnail(pid: str, kid: str):
 @app.post("/api/projects/{pid}/keyframes/{kid}/update_from_ng")
 def update_from_ng(pid: str, kid: str):
     """Overwrite this keyframe with the current Neuroglancer state (camera + layers
-    + segments), keeping its timing — i.e. 'update current frame'."""
+    + segments), keeping its timing — i.e. 'update current frame'. Also returns the
+    per-layer setting `changes` (color/opacity/etc.) vs the previous version, so the UI
+    can offer to propagate them to other keyframes."""
     p = store.load(pid)
+    kf_old = next((k for k in p.keyframes if k.id == kid), None)
+    old_meshes = [m.model_copy(deep=True) for m in kf_old.meshes] if kf_old else []
     kf = scouting.update_keyframe_from_view(p, kid)
     if kf is None:
         raise HTTPException(404, "no such keyframe")
-    return kf.model_dump()
+    changes = ops.diff_layer_settings(old_meshes, kf.meshes)
+    return {**kf.model_dump(), "changes": changes}
 
 
 # ----------------------------- keyframes -----------------------------
@@ -319,6 +324,8 @@ class PropagateReq(BaseModel):
     segment_id: int | None = None    # for field == "segment_color"
     direction: str = "right"         # this | right (later) | left (earlier) | all
     match_old: bool = True           # only change keyframes currently holding the OLD value
+    match_value: Any = None          # explicit OLD value to match (used when the source was
+    match_value_set: bool = False    # already updated, e.g. from the NG view)
 
 
 @app.get("/api/projects/{pid}/keyframes/{kid}/layers")
@@ -343,10 +350,11 @@ def propagate_layer(pid: str, kid: str, req: PropagateReq):
     matching by default), so a change (e.g. a segment's color) carries to later/earlier
     snapshots without editing each by hand."""
     p = store.load(pid)
+    kw = {"match_value": req.match_value} if req.match_value_set else {}
     try:
         res = ops.propagate_layer_field(
             p, kid, req.mesh_name, req.field, req.value, segment_id=req.segment_id,
-            direction=req.direction, match_old=req.match_old)
+            direction=req.direction, match_old=req.match_old, **kw)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     return {"ok": True, **res, "count": len(res["changed"])}
