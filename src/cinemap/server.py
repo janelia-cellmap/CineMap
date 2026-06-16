@@ -360,6 +360,18 @@ def propagate_layer(pid: str, kid: str, req: PropagateReq):
     return {"ok": True, **res, "count": len(res["changed"])}
 
 
+@app.get("/api/projects/{pid}/keyframes/diffs")
+def keyframe_diffs(pid: str):
+    """Per-layer setting changes for each keyframe vs the PREVIOUS one (color/opacity/
+    silhouette/seed/per-segment color). Powers the timeline 'what changed' hover badges."""
+    p = store.load(pid)
+    out = []
+    for i, k in enumerate(p.keyframes):
+        changes = ops.diff_layer_settings(p.keyframes[i - 1].meshes, k.meshes) if i > 0 else []
+        out.append({"keyframe_id": k.id, "changes": changes})
+    return {"diffs": out}
+
+
 @app.post("/api/projects/{pid}/keyframes/{kid}/mesh_opacity")
 def set_mesh_opacity(pid: str, kid: str, req: MeshOpacityReq):
     """Set the 3D mesh opacity for a keyframe (0 = hidden -> EM slice + its

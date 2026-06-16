@@ -284,7 +284,26 @@ async function loadNg() {
   $('ng').src = ng_url;
 }
 
-async function reload() { renderKeyframes(await api('GET', `/api/projects/${PID}`)); }
+async function reload() {
+  const p = await api('GET', `/api/projects/${PID}`);
+  try {
+    const d = await api('GET', `/api/projects/${PID}/keyframes/diffs`);
+    KF_DIFFS = {}; (d.diffs || []).forEach(x => KF_DIFFS[x.keyframe_id] = x.changes);
+  } catch (e) { KF_DIFFS = {}; }
+  renderKeyframes(p);
+}
+let KF_DIFFS = {};
+// a small "Δn" badge per keyframe showing how many layer settings changed vs the
+// previous frame; hover lists them, click opens the propagate panel to modify.
+function diffBadge(id) {
+  const ch = KF_DIFFS[id];
+  if (!ch || !ch.length) return '';
+  const title = ('changed vs previous:\n' + ch.map(changeLabel).join('\n'))
+    .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/\n/g, '&#10;');
+  return `<span class="diffbadge" title="${title}" onclick="event.stopPropagation(); openPropForKf('${id}')"
+    style="position:absolute;top:4px;left:4px;background:#2a6f43;color:#fff;border-radius:4px;padding:0 5px;font-size:11px;line-height:16px;cursor:pointer;z-index:3">Δ${ch.length}</span>`;
+}
+function openPropForKf(id) { ACTIVE_KF = id; openPropPanel(); }
 
 let LAST_KF_ID = null, KF_ORDER = [], THUMB_VER = {};
 function renderKeyframes(p) {
@@ -307,6 +326,7 @@ function renderKeyframes(p) {
          ondragleave="this.classList.remove('drop')"
          ondrop="kfDrop(event,'${k.id}')">
       <span class="del" onclick="event.stopPropagation(); delKf('${k.id}')">✕</span>
+      ${diffBadge(k.id)}
       <div class="lbl">⠿ KF${i} · ${k.label||''}</div>
       <div class="meta">${k.slices.map(s=>s.axis+'='+Math.round(s.position_nm)).join(' ')}<br>
         ${k.meshes.map(m=>m.mesh_name).join(',')||'—'}</div>
