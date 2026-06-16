@@ -144,6 +144,7 @@
     <input id="meshOp" type="range" min="0" max="1" step="0.05" value="1" style="width:90px"
       onchange="setMeshOpacity()" title="3D mesh opacity (0 = show only the segmented EM slice)" />
     <button id="autoThumbBtn" onclick="toggleAutoThumbs()" title="render every keyframe's thumbnail in sequence so the timeline fills in">⟳ Render all</button>
+    <button onclick="openLookPanel()" title="experiment with the render look — glow, roughness, presets — and preview on the selected frame">✨ Look</button>
     <button onclick="openPropPanel()" title="edit a layer setting on the selected keyframe and propagate it to later/earlier keyframes">✎ Propagate edit</button>
     <button id="exportBtn" class="primary" onclick="startRender('export')">⬇ Export video</button>
     <button id="blendBtn" onclick="startRender('blend')" title="bake the whole shot to a self-contained animated .blend (camera, meshes, EM slices; textures packed in)">⬇ Export .blend</button>
@@ -179,6 +180,27 @@
   </select>
   <label class="msg" title="only change keyframes whose value currently matches this one (find &amp; replace) — won't clobber deliberate changes"><input type="checkbox" id="propMatch" checked /> replace only where it currently matches</label>
   <div style="margin-top:8px"><button class="primary" onclick="applyPropagate()">Apply</button> <span id="propMsg" class="msg"></span></div>
+</div>
+
+<div id="lookPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #6a5acd;border-radius:8px;padding:12px 14px;width:320px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.9">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <b>✨ Look / glow</b><span onclick="$('lookPanel').style.display='none'" style="cursor:pointer;opacity:.7">✕</span>
+  </div>
+  <label class="msg">Preset</label>
+  <select id="lookPreset" onchange="lookPresetChanged()" style="width:100%">
+    <option value="neuvid">neuVid — glossy 3-point (default)</option>
+    <option value="ng">neuroglancer — flat headlight</option>
+    <option value="rake">raking — matte directional</option>
+    <option value="drama">drama — deep shadows</option>
+  </select>
+  <label class="msg">Glow <span id="glowVal" class="msg"></span></label>
+  <input type="range" id="lookGlow" min="0" max="0.6" step="0.01" style="width:100%" oninput="$('glowVal').textContent=(+this.value).toFixed(2)">
+  <label class="msg">Roughness <span id="roughVal" class="msg"></span></label>
+  <input type="range" id="lookRough" min="0" max="1" step="0.05" style="width:100%" oninput="$('roughVal').textContent=(+this.value).toFixed(2)">
+  <label class="msg">Specular <span id="specVal" class="msg"></span></label>
+  <input type="range" id="lookSpec" min="0" max="1" step="0.05" style="width:100%" oninput="$('specVal').textContent=(+this.value).toFixed(2)">
+  <div style="margin-top:8px"><button class="primary" onclick="applyLook()">Apply &amp; preview</button> <span id="lookMsg" class="msg"></span></div>
+  <div class="msg" style="margin-top:2px">applies to all renders; previews on the selected keyframe</div>
 </div>
 
 <div id="ngPropPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #3a8f5a;border-radius:8px;padding:12px 14px;width:360px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.7">
@@ -788,6 +810,39 @@ async function applyNgPropagate() {
     reload();
     setTimeout(() => $('ngPropPanel').style.display = 'none', 1500);
   } catch (e) { $('ngPropMsg').textContent = 'error: ' + e.message; }
+}
+
+// ---- look / glow experiment panel ----
+async function openLookPanel() {
+  if (!PID) { setStatus('open a project first'); return; }
+  try {
+    const r = await api('GET', `/api/projects/${PID}/look`); const L = r.look || {};
+    $('lookPreset').value = L.preset || 'neuvid';
+    $('lookGlow').value = L.glow != null ? L.glow : 0.02;
+    $('lookRough').value = L.roughness != null ? L.roughness : 0.25;
+    $('lookSpec').value = L.specular != null ? L.specular : 0.5;
+  } catch (e) {}
+  ['glowVal', 'roughVal', 'specVal'].forEach((v, i) => $(v).textContent = (+$(['lookGlow', 'lookRough', 'lookSpec'][i]).value).toFixed(2));
+  lookPresetChanged();
+  $('lookMsg').textContent = ''; $('lookPanel').style.display = 'block';
+}
+function lookPresetChanged() {
+  const ng = $('lookPreset').value === 'ng';   // ng uses the flat emission shader (no glow/roughness)
+  ['lookGlow', 'lookRough', 'lookSpec'].forEach(id => $(id).disabled = ng);
+}
+async function applyLook() {
+  if (!PID) return;
+  const preset = $('lookPreset').value, look = { preset };
+  if (preset !== 'ng') {
+    look.glow = +$('lookGlow').value; look.roughness = +$('lookRough').value; look.specular = +$('lookSpec').value;
+  }
+  try {
+    await api('POST', `/api/projects/${PID}/look`, { look });
+    const id = ACTIVE_KF || LAST_KF_ID;
+    $('lookMsg').textContent = id ? 'applied — rendering preview…' : 'applied (select a frame to preview)';
+    setStatus(`look set (${preset})` + (id ? ' — rendering preview' : ''));
+    if (id) renderThumbnail(id);   // re-render the selected keyframe with the new look
+  } catch (e) { $('lookMsg').textContent = 'error: ' + e.message; }
 }
 
 refreshProjects();

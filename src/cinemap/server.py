@@ -360,6 +360,25 @@ def propagate_layer(pid: str, kid: str, req: PropagateReq):
     return {"ok": True, **res, "count": len(res["changed"])}
 
 
+class LookReq(BaseModel):
+    look: dict[str, Any] = {}
+
+
+@app.get("/api/projects/{pid}/look")
+def get_look(pid: str):
+    """The project's render-look overrides (preset + glow/roughness/etc.)."""
+    return {"look": store.load(pid).look or {}}
+
+
+@app.post("/api/projects/{pid}/look")
+def set_look(pid: str, req: LookReq):
+    """Set the project's render-look overrides; affects subsequent renders/thumbnails."""
+    p = store.load(pid)
+    p.look = req.look or {}
+    store.save(p)
+    return {"ok": True, "look": p.look}
+
+
 @app.get("/api/projects/{pid}/keyframes/diffs")
 def keyframe_diffs(pid: str):
     """Per-layer setting changes for each keyframe vs the PREVIOUS one (color/opacity/

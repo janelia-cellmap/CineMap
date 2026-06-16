@@ -7,7 +7,7 @@ UI and the Claude agent mutate (through operations.py).
 """
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -170,3 +170,5 @@ class Project(BaseModel):
     lighting: Lighting = Field(default_factory=Lighting)
     keyframes: list[Keyframe] = Field(default_factory=list)
     renders: list[RenderJob] = Field(default_factory=list)
+    look: dict[str, Any] = Field(default_factory=dict)  # render look overrides (preset +
+    # glow/roughness/specular/ng_shader/view) — the look-experiment panel writes this.

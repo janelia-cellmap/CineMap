@@ -490,7 +490,8 @@ class RenderWorker:
             # plain neuroglancer-faithful look). DOF focuses on the framed subject —
             # the camera's look-at, which is exactly what neuroglancer centered on.
             from . import director
-            plan = director.plan(self.project.keyframes)
+            plan = director.plan(self.project.keyframes,
+                                 director.make_settings(getattr(self.project, "look", None)))
             spec["direction"] = plan
             if plan["dof"]["enabled"]:
                 for fr in spec["frames"]:

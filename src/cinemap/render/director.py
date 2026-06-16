@@ -48,6 +48,8 @@ class MaterialProfile:
                                  # see-through transparent state (closer to neuroglancer)
     flat_shading: bool = False   # smooth (per-vertex) normals like neuVid/NG -> rounded
                                  # form-shading on the tubes (not faceted)
+    ng_shader: bool = False      # faithful neuroglancer mesh shader (emission-only headlight,
+                                 # abs(N·view)*0.8+0.2) instead of lit Principled. The "ng" look.
 
 
 @dataclass
@@ -113,6 +115,46 @@ class DirectorSettings:
     # (no "Punchy") keeps the lighter, more even non-dramatic look closer to neuroglancer.
     view_transform: str = "AgX"
     view_look: str = ""
+
+
+def make_settings(look: dict | None = None) -> "DirectorSettings":
+    """Build DirectorSettings from a project `look` dict: an optional `preset`
+    (neuvid | ng | rake | drama) sets a starting look, then explicit per-knob overrides
+    (glow, edge_glow, roughness, specular, ng_shader, view_transform/look) apply on top.
+    Lets the UI experiment with textures/glow/looks without code changes. Empty -> the
+    default (neuVid-style) look."""
+    s = DirectorSettings()
+    look = look or {}
+    preset = (look.get("preset") or "").lower()
+    m, lr = s.material, s.lighting
+    if preset == "ng":                       # faithful neuroglancer flat headlight shader
+        m.ng_shader = True; m.flat_shading = False; m.ao = 0.0
+        s.view_transform = "Standard"; s.view_look = ""
+    elif preset == "rake":                    # raking key + camera fill, matte
+        m.ng_shader = False; m.roughness = 0.55; m.specular = 0.15; m.ao = 0.6
+        m.ao_distance_nm = 2000; m.flat_shading = True
+        lr.key_energy = 7.5; lr.fill_ratio = 0.5; lr.rim_ratio = 0.5; lr.ambient = 0.18
+        lr.key_color = lr.fill_color = lr.rim_color = lr.ambient_color = (1.0, 1.0, 1.0)
+        s.view_transform = "AgX"; s.view_look = ""
+    elif preset == "drama":                   # deep raking shadows + warm/cool + punchy
+        m.ng_shader = False; m.roughness = 0.55; m.specular = 0.05; m.ao = 0.75
+        m.ao_distance_nm = 1800; m.flat_shading = True
+        lr.key_energy = 8.5; lr.fill_ratio = 0.3; lr.rim_ratio = 0.8; lr.ambient = 0.10
+        lr.key_color = (1.0, 0.88, 0.72); lr.fill_color = (0.72, 0.82, 1.0)
+        lr.rim_color = (0.78, 0.85, 1.0); lr.ambient_color = (0.85, 0.9, 1.0)
+        s.view_transform = "AgX"; s.view_look = "AgX - Punchy"
+    # else: neuvid (the defaults) — no change
+    # explicit per-knob overrides on top of the preset
+    if look.get("roughness") is not None: m.roughness = float(look["roughness"])
+    if look.get("specular") is not None: m.specular = float(look["specular"])
+    if look.get("glow") is not None:      # one "glow" knob -> emission + edge glow
+        m.emission_strength = float(look["glow"]); m.edge_glow = float(look["glow"])
+    if look.get("edge_glow") is not None: m.edge_glow = float(look["edge_glow"])
+    if look.get("emission_strength") is not None: m.emission_strength = float(look["emission_strength"])
+    if look.get("ng_shader") is not None: m.ng_shader = bool(look["ng_shader"])
+    if look.get("view_transform"): s.view_transform = look["view_transform"]
+    if look.get("view_look") is not None: s.view_look = look["view_look"]
+    return s
 
 
 def _frame_starts(keyframes, fps: int) -> tuple[list[int], int]:
