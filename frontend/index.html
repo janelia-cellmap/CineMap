@@ -193,6 +193,7 @@
     <option value="left">this + earlier ←</option>
     <option value="all">all keyframes</option>
   </select>
+  <label class="msg" title="checked: only change keyframes whose value currently matches the old one (preserves keyframes you set differently). unchecked: force the new value into every keyframe in range."><input type="checkbox" id="ngPropMatch" checked /> replace only where it matches (uncheck = overwrite all)</label>
   <div style="margin-top:8px">
     <button class="primary" onclick="applyNgPropagate()">Propagate</button>
     <button onclick="$('ngPropPanel').style.display='none'">Skip</button>
@@ -719,13 +720,13 @@ function showNgPropPrompt(kid, changes) {
   $('ngPropPanel').style.display = 'block';
 }
 async function applyNgPropagate() {
-  const dir = $('ngPropDir').value;
+  const dir = $('ngPropDir').value, matchOnly = $('ngPropMatch').checked;
   let total = 0;
   try {
     for (const c of NG_CHANGES) {
       const r = await api('POST', `/api/projects/${PID}/keyframes/${NG_PROP_KID}/propagate`,
         { mesh_name: c.mesh_name, field: c.field, value: c.new, segment_id: c.segment_id ?? null,
-          direction: dir, match_old: true, match_value: c.old, match_value_set: true });
+          direction: dir, match_old: matchOnly, match_value: c.old, match_value_set: true });
       total += (r.count || 1) - 1;   // exclude the source keyframe itself
     }
     $('ngPropMsg').textContent = `propagated to ${total} other keyframe(s)`;
