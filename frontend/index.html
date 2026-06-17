@@ -60,6 +60,10 @@
   .kf .meta { color:var(--mut); position:absolute; bottom:6px; left:6px; right:6px; }
   .kf .del { position:absolute; top:4px; right:6px; color:var(--mut); cursor:pointer; }
   .msg { font-size:12px; color:var(--mut); }
+  /* hover a before/after thumbnail to blow it up so you can actually compare */
+  #lookCompare img { transition: transform .12s ease; cursor: zoom-in; }
+  #lookCompare img:hover { transform: scale(3.4); transform-origin: right bottom; z-index: 200;
+    position: relative; box-shadow: 0 0 0 2px var(--accent), 0 8px 30px rgba(0,0,0,.7); }
 </style>
 </head>
 <body>
@@ -192,6 +196,15 @@
     <option value="ng">neuroglancer — flat headlight</option>
     <option value="rake">raking — matte directional</option>
     <option value="drama">drama — deep shadows</option>
+  </select>
+  <label class="msg">Material</label>
+  <select id="lookMat" onchange="lookMatChanged()" style="width:100%">
+    <option value="glossy">glossy (default)</option>
+    <option value="matte">matte</option>
+    <option value="metallic">metallic</option>
+    <option value="waxy">waxy / sheen</option>
+    <option value="glassy">glassy / translucent</option>
+    <option value="glow">glow / emissive</option>
   </select>
   <label class="msg">Glow <span id="glowVal" class="msg"></span></label>
   <input type="range" id="lookGlow" min="0" max="0.6" step="0.01" style="width:100%" oninput="$('glowVal').textContent=(+this.value).toFixed(2)">
@@ -822,13 +835,32 @@ async function applyNgPropagate() {
 
 // ---- look / glow experiment panel ----
 let PREV_LOOK = null, PREV_IMG = null;
+// material "type" presets — set the Principled knobs (the look panel exposes glow/
+// roughness/specular sliders; metallic/transmission/sheen come from the type).
+const MAT_STYLES = {
+  glossy:   { roughness: 0.25, specular: 0.5, metallic: 0,   transmission: 0,    sheen: 0,   glow: 0.02 },
+  matte:    { roughness: 0.9,  specular: 0.1, metallic: 0,   transmission: 0,    sheen: 0,   glow: 0.02 },
+  metallic: { roughness: 0.3,  specular: 0.5, metallic: 1.0, transmission: 0,    sheen: 0,   glow: 0.02 },
+  waxy:     { roughness: 0.5,  specular: 0.3, metallic: 0,   transmission: 0,    sheen: 1.0, glow: 0.02 },
+  glassy:   { roughness: 0.1,  specular: 0.5, metallic: 0,   transmission: 0.85, sheen: 0,   glow: 0.02 },
+  glow:     { roughness: 0.4,  specular: 0.4, metallic: 0,   transmission: 0,    sheen: 0,   glow: 0.4 },
+};
+function syncLookVals() {
+  ['glowVal', 'roughVal', 'specVal'].forEach((v, i) => $(v).textContent = (+$(['lookGlow', 'lookRough', 'lookSpec'][i]).value).toFixed(2));
+}
+function lookMatChanged() {
+  const s = MAT_STYLES[$('lookMat').value]; if (!s) return;
+  $('lookGlow').value = s.glow; $('lookRough').value = s.roughness; $('lookSpec').value = s.specular;
+  syncLookVals();
+}
 function setLookControls(L) {
   L = L || {};
   $('lookPreset').value = L.preset || 'neuvid';
+  $('lookMat').value = L.material || 'glossy';
   $('lookGlow').value = L.glow != null ? L.glow : 0.02;
   $('lookRough').value = L.roughness != null ? L.roughness : 0.25;
   $('lookSpec').value = L.specular != null ? L.specular : 0.5;
-  ['glowVal', 'roughVal', 'specVal'].forEach((v, i) => $(v).textContent = (+$(['lookGlow', 'lookRough', 'lookSpec'][i]).value).toFixed(2));
+  syncLookVals();
   lookPresetChanged();
 }
 async function openLookPanel() {
@@ -839,8 +871,8 @@ async function openLookPanel() {
   $('lookPanel').style.display = 'block';
 }
 function lookPresetChanged() {
-  const ng = $('lookPreset').value === 'ng';   // ng uses the flat emission shader (no glow/roughness)
-  ['lookGlow', 'lookRough', 'lookSpec'].forEach(id => $(id).disabled = ng);
+  const ng = $('lookPreset').value === 'ng';   // ng uses the flat emission shader (no material knobs)
+  ['lookMat', 'lookGlow', 'lookRough', 'lookSpec'].forEach(id => $(id).disabled = ng);
 }
 // snapshot the selected keyframe's current thumbnail to a data URL (so the 'before'
 // survives the file being overwritten by the new-look render)
@@ -860,7 +892,12 @@ function captureThumb(id) {
 }
 function lookFromControls() {
   const preset = $('lookPreset').value, look = { preset };
-  if (preset !== 'ng') { look.glow = +$('lookGlow').value; look.roughness = +$('lookRough').value; look.specular = +$('lookSpec').value; }
+  if (preset !== 'ng') {
+    const s = MAT_STYLES[$('lookMat').value] || {};
+    look.material = $('lookMat').value;
+    look.glow = +$('lookGlow').value; look.roughness = +$('lookRough').value; look.specular = +$('lookSpec').value;
+    look.metallic = s.metallic || 0; look.transmission = s.transmission || 0; look.sheen = s.sheen || 0;
+  }
   return look;
 }
 async function applyLook() {

@@ -280,6 +280,8 @@ def _import_meshes(scene_spec: dict) -> dict:
                 node.inputs[key].default_value = val
         _set_in(bsdf, "Roughness", prof.get("roughness", 0.35))
         _set_in(bsdf, "Specular IOR Level", prof.get("specular", 0.5))
+        _set_in(bsdf, "Metallic", prof.get("metallic", 0.0))
+        _set_in(bsdf, "Transmission Weight", prof.get("transmission", 0.0))
         _set_in(bsdf, "Sheen Weight", prof.get("sheen", 0.0))
         _set_in(bsdf, "Coat Weight", prof.get("coat", 0.0))
         has_colors = bool(getattr(obj.data, "color_attributes", None)) and len(obj.data.color_attributes) > 0
@@ -352,15 +354,43 @@ def _import_meshes(scene_spec: dict) -> dict:
             nt.links.new(color_out, edmix.inputs[1])
             nt.links.new(esub.outputs[0], edmix.inputs[2])       # color * factor (broadcast)
             color_out = edmix.outputs[0]
-        nt.links.new(color_out, bsdf.inputs["Base Color"])
-        if "Emission Color" in bsdf.inputs:
-            nt.links.new(color_out, bsdf.inputs["Emission Color"])
-        # Emission strength via a value node so the director can pulse it per frame
-        # (the appear/highlight glow) by overriding cm_emit; base = the material floor.
-        emit_v = nt.nodes.new("ShaderNodeValue"); emit_v.name = "cm_emit"
-        emit_v.outputs[0].default_value = prof.get("emission_strength", 0.15)
-        if "Emission Strength" in bsdf.inputs:
-            nt.links.new(emit_v.outputs[0], bsdf.inputs["Emission Strength"])
+        if prof.get("ng_shader"):
+            # Faithful port of neuroglancer's mesh GLSL: per fragment,
+            #   lightingFactor = abs(dot(normal, viewDir)) * 0.8 + 0.2
+            #   color = lightingFactor * baseColor
+            # A HEADLIGHT (viewDir) from geometry, emission-only (no external lights), so
+            # it's exactly NG: vivid (factor<=1 -> never clips/oversaturates), camera-relative
+            # shading, no cast shadows. Base Color black so lights/world don't add. NOTE: no
+            # cm_emit node here -> _set_mesh_state can't reset Emission Strength (it stays 1).
+            geo = nt.nodes.new("ShaderNodeNewGeometry")
+            dotp = nt.nodes.new("ShaderNodeVectorMath"); dotp.operation = "DOT_PRODUCT"
+            nt.links.new(geo.outputs["Normal"], dotp.inputs[0])
+            nt.links.new(geo.outputs["Incoming"], dotp.inputs[1])   # viewDir (toward camera)
+            absd = nt.nodes.new("ShaderNodeMath"); absd.operation = "ABSOLUTE"
+            nt.links.new(dotp.outputs["Value"], absd.inputs[0])
+            fac = nt.nodes.new("ShaderNodeMath"); fac.operation = "MULTIPLY_ADD"
+            fac.inputs[1].default_value = 0.8                       # directionalLighting
+            fac.inputs[2].default_value = 0.2                       # ambientLighting
+            nt.links.new(absd.outputs[0], fac.inputs[0])
+            emis = nt.nodes.new("ShaderNodeVectorMath"); emis.operation = "SCALE"
+            nt.links.new(color_out, emis.inputs[0])
+            nt.links.new(fac.outputs["Value"], emis.inputs["Scale"])
+            bsdf.inputs["Base Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+            if "Emission Color" in bsdf.inputs:
+                nt.links.new(emis.outputs["Vector"], bsdf.inputs["Emission Color"])
+            if "Emission Strength" in bsdf.inputs:
+                bsdf.inputs["Emission Strength"].default_value = 1.0
+            _set_in(bsdf, "Roughness", 1.0); _set_in(bsdf, "Specular IOR Level", 0.0)
+        else:
+            nt.links.new(color_out, bsdf.inputs["Base Color"])
+            if "Emission Color" in bsdf.inputs:
+                nt.links.new(color_out, bsdf.inputs["Emission Color"])
+            # Emission strength via a value node so the director can pulse it per frame
+            # (the appear/highlight glow) by overriding cm_emit; base = the material floor.
+            emit_v = nt.nodes.new("ShaderNodeValue"); emit_v.name = "cm_emit"
+            emit_v.outputs[0].default_value = prof.get("emission_strength", 0.15)
+            if "Emission Strength" in bsdf.inputs:
+                nt.links.new(emit_v.outputs[0], bsdf.inputs["Emission Strength"])
 
         # neuroglancer 3D render state: Alpha = object_alpha * facing^silhouette, where
         # `facing` is Blender's LayerWeight Facing output = 0 head-on, 1 at grazing
@@ -430,7 +460,7 @@ def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> N
         # with opacity. A hard on/off threshold here instead caused a one-frame brightness
         # POP whenever a layer faded through it (e.g. the segmentation reveal at ~2s):
         # below the cutoff no shadow, above it the whole tangle self-shadowed at once.
-        obj.visible_shadow = visible
+        obj.visible_shadow = visible and not os.environ.get("CINEMAP_NO_CAST_SHADOWS")
         nt = mat.node_tree
         av, sv = nt.nodes.get("cm_alpha"), nt.nodes.get("cm_silh")
         if av is not None:

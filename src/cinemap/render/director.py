@@ -28,7 +28,9 @@ class MaterialProfile:
     material). Smooth-shaded. Paired with AgX so highlights roll off (no oversaturation)."""
     roughness: float = 0.25      # glossy-ish (neuVid) -> specular highlights = pop/contrast
     specular: float = 0.5        # specular highlights catch the 3-point lights
-    sheen: float = 0.0
+    metallic: float = 0.0        # 0 = dielectric (default); 1 = metal (shiny, tinted reflection)
+    transmission: float = 0.0    # 0 = opaque; >0 = glassy/translucent
+    sheen: float = 0.0           # soft velvety edge sheen (waxy/clay look)
     coat: float = 0.0
     emission_strength: float = 0.02  # near-zero: shading comes from the lights, not self-glow
     edge_glow: float = 0.0       # off — the rim glow washed out the faceting
@@ -147,6 +149,10 @@ def make_settings(look: dict | None = None) -> "DirectorSettings":
     # explicit per-knob overrides on top of the preset
     if look.get("roughness") is not None: m.roughness = float(look["roughness"])
     if look.get("specular") is not None: m.specular = float(look["specular"])
+    if look.get("metallic") is not None: m.metallic = float(look["metallic"])
+    if look.get("transmission") is not None: m.transmission = float(look["transmission"])
+    if look.get("sheen") is not None: m.sheen = float(look["sheen"])
+    if look.get("coat") is not None: m.coat = float(look["coat"])
     if look.get("glow") is not None:      # one "glow" knob -> emission + edge glow
         m.emission_strength = float(look["glow"]); m.edge_glow = float(look["glow"])
     if look.get("edge_glow") is not None: m.edge_glow = float(look["edge_glow"])
