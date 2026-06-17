@@ -104,18 +104,25 @@ class RenderWorker:
         from PIL import Image
 
         center, half = region
-        key = (sl.em_name, sl.axis, round(sl.position_nm),
+        normal = getattr(sl, "normal", None)
+        key = (sl.em_name, sl.axis, round(sl.position_nm), tuple(normal) if normal else None,
                tuple(round(c) for c in center), round(half), self._em_target_px,
                tuple((u, tuple(sorted(ids)), lc.cache_key()) for u, ids, lc in seg_overlays))
         if key in self._slice_cache:
             return self._slice_cache[key]
 
-        res = self._em_vol().read_slice(sl.axis, sl.position_nm, level=sl.scale_level,
-                                        target_px=self._em_target_px, region=region)
+        if normal:   # oblique plane: resample the tilted plane through the projected focus
+            n = np.asarray(normal, float); n = n / (np.linalg.norm(n) or 1.0)
+            c = np.asarray(center, float)
+            cproj = c + (sl.position_nm - float(np.dot(c, n))) * n
+            res = self._em_vol().read_oblique_slice(normal, cproj, half, target_px=self._em_target_px)
+        else:
+            res = self._em_vol().read_slice(sl.axis, sl.position_nm, level=sl.scale_level,
+                                            target_px=self._em_target_px, region=region)
         rgb = np.repeat(res.image[:, :, None].astype(np.float64), 3, axis=2)  # grayscale EM
         H, W = rgb.shape[:2]
 
-        for label_zarr, ids, lc in seg_overlays:
+        for label_zarr, ids, lc in ([] if normal else seg_overlays):  # seg overlay: axis-aligned only
             if not ids:
                 continue
             lres = self._label_vol(label_zarr).read_slice(sl.axis, sl.position_nm,
@@ -459,6 +466,7 @@ class RenderWorker:
                     cl = getattr(m, "clip", None)
                     if cl:
                         ov["clip"] = {"axis": cl["axis"], "side": cl["side"],
+                                      "normal": cl.get("normal"),
                                       "position_bu": cl["position_nm"] / self.nm_per_bu}
                         mesh_specs[uid]["clip"] = True   # tell the material to build clip nodes
                     overrides[uid] = ov

@@ -280,7 +280,12 @@ def _apply_clip(nt, clip, f=None) -> None:
     {axis, position_bu, side} or None. No-op on materials without clip nodes."""
     if nt.nodes.get("cm_clip_on") is None:
         return
-    wx, wy, wz = _CLIP_AXIS_W.get((clip or {}).get("axis", "z"), (0.0, 0.0, 1.0))
+    nrm = (clip or {}).get("normal")
+    if nrm:   # oblique: the dot-product weights ARE the (unit) plane normal
+        mag = (nrm[0] ** 2 + nrm[1] ** 2 + nrm[2] ** 2) ** 0.5 or 1.0
+        wx, wy, wz = nrm[0] / mag, nrm[1] / mag, nrm[2] / mag
+    else:
+        wx, wy, wz = _CLIP_AXIS_W.get((clip or {}).get("axis", "z"), (0.0, 0.0, 1.0))
     vals = {"cm_clip_wx": wx, "cm_clip_wy": wy, "cm_clip_wz": wz,
             "cm_clip_pos": float((clip or {}).get("position_bu", 0.0)),
             "cm_clip_side": float((clip or {}).get("side", 1)),

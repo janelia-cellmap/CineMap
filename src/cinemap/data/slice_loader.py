@@ -152,6 +152,50 @@ class EMVolume:
         sub = np.asarray(arr[z0:z1, y0:y1, x0:x1].read().result())
         return sub, (z0, y0, x0), tuple(sc), tuple(tr)
 
+    @staticmethod
+    def plane_basis(normal_xyz):
+        """Orthonormal in-plane basis (U, V) and unit normal for an oblique plane."""
+        n = np.asarray(normal_xyz, float)
+        n = n / (np.linalg.norm(n) or 1.0)
+        ref = np.array([0.0, 0.0, 1.0]) if abs(n[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        u = np.cross(ref, n); u /= (np.linalg.norm(u) or 1.0)
+        v = np.cross(n, u)
+        return u, v, n
+
+    def read_oblique_slice(self, normal_xyz, point_xyz, half_nm: float,
+                           target_px: int = 640, target_voxels: int = 24_000_000) -> SliceResult:
+        """Resample a tilted plane (unit `normal` through `point`) over a 2*half_nm
+        square patch. Reads the bounding-box subvolume at a level bounded by
+        target_voxels, then nearest-samples the plane grid (fast; fine for EM)."""
+        u, v, n = self.plane_basis(normal_xyz)
+        p = np.asarray(point_xyz, float)
+        px = max(8, int(target_px))
+        s = np.linspace(-half_nm, half_nm, px)
+        su, sv = np.meshgrid(s, s)                                  # (px,px)
+        world = p[None, None, :] + su[..., None] * u + sv[..., None] * v   # (px,px,3) xyz nm
+        flat = world.reshape(-1, 3)
+        wmin, wmax = flat.min(0), flat.max(0)
+        bbox = ((wmin[0], wmin[1], wmin[2]), (wmax[0], wmax[1], wmax[2]))
+        level = self.pick_level_for_box(bbox, target_voxels)
+        sub, (z0, y0, x0), sc, tr = self.read_box(bbox, level)      # sub is z,y,x
+        sub = np.asarray(sub).astype(np.uint8)
+        fx = (world[..., 0] - tr[2]) / sc[2] - x0
+        fy = (world[..., 1] - tr[1]) / sc[1] - y0
+        fz = (world[..., 2] - tr[0]) / sc[0] - z0
+        oob = ((fz < 0) | (fz > sub.shape[0] - 1) | (fy < 0) | (fy > sub.shape[1] - 1)
+               | (fx < 0) | (fx > sub.shape[2] - 1))
+        iz = np.clip(np.round(fz).astype(int), 0, sub.shape[0] - 1)
+        iy = np.clip(np.round(fy).astype(int), 0, sub.shape[1] - 1)
+        ix = np.clip(np.round(fx).astype(int), 0, sub.shape[2] - 1)
+        img = sub[iz, iy, ix]
+        img[oob] = 0
+        origin = p - half_nm * u - half_nm * v   # corner at su=-half, sv=-half (rows=v, cols=u)
+        return SliceResult(
+            image=img, axis="oblique", position_nm=float(np.dot(p, n)),
+            origin_nm=tuple(origin), u_nm=tuple(2 * half_nm * u), v_nm=tuple(2 * half_nm * v),
+            scale_level=level,
+        )
+
     def pick_level(self, extent_nm: float, target_px: int = 1600) -> int:
         """Coarsest level that still gives >= target_px across `extent_nm`."""
         best = 0

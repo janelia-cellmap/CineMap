@@ -66,6 +66,7 @@ class FrameSlice:
     position_nm: float
     scale_level: int | None
     opacity: float
+    normal: list[float] | None = None   # oblique plane normal (xyz); None = axis-aligned
 
 
 @dataclass
@@ -112,16 +113,17 @@ def _clip_dict(c) -> dict | None:
     """A keyframe ClipPlane -> the render-side clip dict, or None when disabled."""
     if c is None or not getattr(c, "enabled", False):
         return None
-    return {"axis": c.axis, "position_nm": c.position_nm, "side": c.side}
+    return {"axis": c.axis, "position_nm": c.position_nm, "side": c.side, "normal": c.normal}
 
 
 def _lerp_clip(ca, cb, t: float) -> dict | None:
-    """Interpolate a cutaway between two keyframes. When both clip the same axis/side
-    the plane scrolls (position lerps); otherwise snap to the target's clip so the
+    """Interpolate a cutaway between two keyframes. When both clip the same axis/side/
+    normal the plane scrolls (offset lerps); otherwise snap to the target's clip so the
     cut doesn't jump through an interpolated mismatch."""
     da, db = _clip_dict(ca), _clip_dict(cb)
-    if da and db and da["axis"] == db["axis"] and da["side"] == db["side"]:
-        return {"axis": db["axis"], "side": db["side"],
+    if (da and db and da["axis"] == db["axis"] and da["side"] == db["side"]
+            and da["normal"] == db["normal"]):
+        return {"axis": db["axis"], "side": db["side"], "normal": db["normal"],
                 "position_nm": da["position_nm"] * (1 - t) + db["position_nm"] * t}
     return db if t >= 0.5 else da
 
@@ -135,17 +137,20 @@ def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
     for key in dict.fromkeys(list(a_sl) + list(b_sl)):
         sa, sb = a_sl.get(key), b_sl.get(key)
         if sa and sb:
+            # plane offset scrolls; normal snaps to target if it differs (same on a scan)
+            same_n = sa.normal == sb.normal
             fs.slices.append(FrameSlice(
                 key[0], key[1],
                 sa.position_nm + (sb.position_nm - sa.position_nm) * t,
                 sb.scale_level,
                 (sa.opacity if sa.visible else 0.0) * (1 - t) + (sb.opacity if sb.visible else 0.0) * t,
+                normal=(sb.normal if (same_n or t >= 0.5) else sa.normal),
             ))
         else:  # appearing or disappearing -> fade
             s = sa or sb
             base = (s.opacity if s.visible else 0.0)
             op = base * (1 - t) if sa else base * t
-            fs.slices.append(FrameSlice(key[0], key[1], s.position_nm, s.scale_level, op))
+            fs.slices.append(FrameSlice(key[0], key[1], s.position_nm, s.scale_level, op, normal=s.normal))
     # meshes matched by (layer name + exact segment set): a different segment set
     # is different geometry, so it cross-fades (old set fades out, new fades in)
     def mkey(m):

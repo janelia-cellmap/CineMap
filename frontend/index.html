@@ -256,7 +256,7 @@
   <label class="msg">Frames <span id="planeNVal" class="msg">12</span></label>
   <input type="range" id="planeN" min="2" max="48" step="1" value="12" style="width:100%" oninput="$('planeNVal').textContent=this.value">
   <div style="margin-top:8px"><button class="primary" onclick="applyPlaneScan()">Add scan</button> <span id="planeMsg" class="msg"></span></div>
-  <div class="msg" style="margin-top:2px">Tip: paste a neuroglancer x,y,z (nm) into From/To — it uses the axis value.</div>
+  <div class="msg" style="margin-top:2px">Tip: a single nm value scans along the axis. Paste a full <b>x,y,z</b> (nm) into <i>both</i> From and To for an <b>oblique</b> scan along that line (the axis dropdown is ignored).</div>
 </div>
 
 <div id="lookZoom" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.82);align-items:center;justify-content:center;gap:18px;pointer-events:none">
@@ -548,24 +548,27 @@ async function openPlanePanel() {
   $('planeMsg').textContent = ''; $('planePanel').style.display='block';
 }
 function planeModeChanged() { $('planeCull').style.display = $('planeMode').value==='slice' ? 'none' : 'block'; }
-// accept a bare depth in nm, or a pasted "x, y, z" coord (uses the chosen axis's value)
-function planeDepth(str, axis) {
-  const nums = (str||'').trim().split(/[\s,]+/).map(parseFloat).filter(isFinite);
-  if (nums.length >= 3) return nums[{x:0,y:1,z:2}[axis]];
-  if (nums.length === 1) return nums[0];
-  return null;
+// parse a box: full "x, y, z" -> [x,y,z] (oblique), single number -> scalar depth nm
+function planeNums(str) {
+  return (str||'').trim().split(/[\s,]+/).map(parseFloat).filter(isFinite);
 }
 async function applyPlaneScan() {
   if(!PID) return;
   const axis = $('planeAxis').value, mode = $('planeMode').value;
-  const start_nm = planeDepth($('planeFrom').value, axis);
-  const stop_nm  = planeDepth($('planeTo').value, axis);
   const mesh_name = (mode!=='slice' && $('planeLayer').value) ? $('planeLayer').value : null;
   const side = (mode!=='slice') ? parseInt($('planeSide').value,10) : 1;
   const n = parseInt($('planeN').value,10) || 12;
+  const fn = planeNums($('planeFrom').value), tn = planeNums($('planeTo').value);
+  const body = {axis, mode, mesh_name, side, n};
+  if (fn.length >= 3 && tn.length >= 3) {        // oblique scan along an arbitrary line
+    body.from_xyz = fn.slice(0,3); body.to_xyz = tn.slice(0,3);
+  } else {                                        // axis-aligned: scalar depth (or axis comp)
+    body.start_nm = fn.length ? fn[Math.min(fn.length-1,{x:0,y:1,z:2}[axis])] : null;
+    body.stop_nm  = tn.length ? tn[Math.min(tn.length-1,{x:0,y:1,z:2}[axis])] : null;
+  }
   $('planeMsg').textContent = 'adding…';
-  const r = await api('POST', `/api/projects/${PID}/plane_move`, {axis, mode, start_nm, stop_nm, mesh_name, side, n});
-  $('planeMsg').textContent = `added ${r.added} frames`;
+  const r = await api('POST', `/api/projects/${PID}/plane_move`, body);
+  $('planeMsg').textContent = `added ${r.added} frames` + (body.from_xyz ? ' (oblique)' : '');
   reload();
 }
 

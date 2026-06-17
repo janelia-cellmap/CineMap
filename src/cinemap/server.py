@@ -79,6 +79,8 @@ class PlaneMoveReq(BaseModel):
     mode: str = "slice"          # 'slice' | 'cull' | 'both'
     start_nm: float | None = None
     stop_nm: float | None = None
+    from_xyz: list[float] | None = None   # oblique scan: A -> B points (nm)
+    to_xyz: list[float] | None = None
     n: int = 12
     mesh_name: str | None = None
     side: int = 1
@@ -454,7 +456,8 @@ def sweep_clip(pid: str, req: SweepClipReq):
 def plane_move(pid: str, req: PlaneMoveReq):
     p = store.load(pid)
     kfs = ops.plane_move(p, axis=req.axis, mode=req.mode, start_nm=req.start_nm,
-                         stop_nm=req.stop_nm, n=req.n, mesh_name=req.mesh_name, side=req.side)
+                         stop_nm=req.stop_nm, from_xyz=req.from_xyz, to_xyz=req.to_xyz,
+                         n=req.n, mesh_name=req.mesh_name, side=req.side)
     return {"added": len(kfs)}
 
 

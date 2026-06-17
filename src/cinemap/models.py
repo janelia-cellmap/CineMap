@@ -57,7 +57,10 @@ class Camera(BaseModel):
 class SlicePlane(BaseModel):
     em_name: str = "em"
     axis: Axis = "z"
-    position_nm: float = 0.0
+    position_nm: float = 0.0           # offset of the plane = dot(point, normal)
+    # None => axis-aligned plane (perpendicular to `axis`). A unit xyz vector =>
+    # an oblique plane with that normal (the EM is resampled on the tilted plane).
+    normal: Optional[list[float]] = None
     scale_level: Optional[int] = None  # None => auto-pick from on-screen extent
     opacity: float = 1.0
     visible: bool = True
@@ -68,8 +71,9 @@ class ClipPlane(BaseModel):
     plane is made transparent in the 3D render, revealing what's inside/behind.
     Independent of EM slices, and applied per layer (cut the cell, keep the mitos)."""
     axis: Axis = "z"
-    position_nm: float = 0.0
-    side: int = 1          # +1 hides the +axis side of the plane; -1 hides the -axis side
+    position_nm: float = 0.0          # offset of the plane = dot(point, normal)
+    normal: Optional[list[float]] = None  # unit xyz; None => axis-aligned (e_axis)
+    side: int = 1          # +1 hides the +normal side of the plane; -1 hides the other
     enabled: bool = False
 
 

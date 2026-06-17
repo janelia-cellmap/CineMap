@@ -348,41 +348,71 @@ def _plane_default_range(project: Project, base: Keyframe, ax_i: int,
     return lo - pad, hi + pad
 
 
+def _unit(v):
+    import math as _m
+    n = _m.sqrt(sum(c * c for c in v)) or 1.0
+    return [c / n for c in v]
+
+
+def _dominant_axis(normal) -> str:
+    return ["x", "y", "z"][max(range(3), key=lambda i: abs(normal[i]))]
+
+
 def plane_move(project: Project, axis: str = "z", mode: str = "slice",
                start_nm: float | None = None, stop_nm: float | None = None,
+               from_xyz: list[float] | None = None, to_xyz: list[float] | None = None,
                n: int = 12, mesh_name: str | None = None, side: int = 1,
                duration_per_kf_s: float = 0.4) -> list[Keyframe]:
-    """Lay down keyframes for an axis-aligned plane scanning start_nm -> stop_nm with the
-    current camera held fixed. `mode` controls what the plane does at each depth:
-      - 'slice': show the EM cross-section there
-      - 'cull' : cut away `mesh_name` (or all 3D layers) on `side` of the plane
-      - 'both' : both at the same moving plane
-    start/stop default to the involved layer's bounds (or the EM volume). For 'cull',
-    side<0 reverses the reveal direction."""
-    ax_i = {"x": 0, "y": 1, "z": 2}[axis]
+    """Lay down keyframes for a plane scanning from a start to a stop with the camera
+    held fixed. Two ways to specify the path:
+      - axis-aligned: `axis` + scalar `start_nm`/`stop_nm` (default = the involved
+        layer's bounds). The plane stays perpendicular to `axis`.
+      - oblique:      `from_xyz` -> `to_xyz` (full points). The plane normal is the
+        travel direction, so it sweeps face-first along an arbitrary line.
+    `mode`: 'slice' (EM cross-section), 'cull' (cut a layer on `side`), or 'both'."""
     base = project.keyframes[-1] if project.keyframes else None
     if base is None:
         raise ValueError("plane_move needs an existing keyframe to scan from")
     do_slice, do_cull = mode in ("slice", "both"), mode in ("cull", "both")
-    lo, hi = _plane_default_range(project, base, ax_i, mesh_name if do_cull else None)
-    a = lo if start_nm is None else float(start_nm)
-    b = hi if stop_nm is None else float(stop_nm)
-    if do_cull and side < 0 and start_nm is None and stop_nm is None:
-        a, b = b, a   # reverse the reveal direction when using the default range
     em_name = project.manifest.em.name if project.manifest.em else "em"
+
+    oblique = from_xyz is not None and to_xyz is not None
+    if oblique:
+        a_pt, b_pt = [float(c) for c in from_xyz], [float(c) for c in to_xyz]
+        normal = _unit([b_pt[i] - a_pt[i] for i in range(3)])
+        axis = _dominant_axis(normal)
+        def point_at(t):  # along the A->B line
+            return [a_pt[i] + (b_pt[i] - a_pt[i]) * t for i in range(3)]
+    else:
+        ax_i = {"x": 0, "y": 1, "z": 2}[axis]
+        lo, hi = _plane_default_range(project, base, ax_i, mesh_name if do_cull else None)
+        a = lo if start_nm is None else float(start_nm)
+        b = hi if stop_nm is None else float(stop_nm)
+        if do_cull and side < 0 and start_nm is None and stop_nm is None:
+            a, b = b, a   # reverse the reveal direction when using the default range
+        normal = None
+        focus = list(base.camera.look_at_nm)
+        def point_at(t):  # axis-aligned: move the axis coord, keep the camera focus elsewhere
+            p = list(focus); p[ax_i] = a + (b - a) * t; return p
+
     new = []
     for i in range(n):
-        pos = a + (b - a) * i / max(1, n - 1)
+        t = i / max(1, n - 1)
+        pt = point_at(t)
+        offset = (sum(normal[j] * pt[j] for j in range(3)) if normal
+                  else pt[{"x": 0, "y": 1, "z": 2}[axis]])
         meshes = []
         for msh in base.meshes:
             mc = msh.model_copy(deep=True)
             if do_cull and (mesh_name is None or msh.mesh_name == mesh_name):
-                mc.clip = ClipPlane(axis=axis, position_nm=pos, side=side, enabled=True)
+                mc.clip = ClipPlane(axis=axis, position_nm=offset, normal=normal,
+                                    side=side, enabled=True)
             meshes.append(mc)
-        slices = ([SlicePlane(em_name=em_name, axis=axis, position_nm=pos, visible=True)]
+        slices = ([SlicePlane(em_name=em_name, axis=axis, position_nm=offset,
+                              normal=normal, visible=True)]
                   if do_slice else [s.model_copy() for s in base.slices])
         new.append(Keyframe(
-            id=_uid("kf"), label=f"{mode} {axis}={int(pos)}nm",
+            id=_uid("kf"), label=f"{mode} {axis}={int(offset)}nm{' (oblique)' if normal else ''}",
             camera=base.camera.model_copy(), slices=slices,
             meshes=meshes, duration_in_s=duration_per_kf_s,
         ))
