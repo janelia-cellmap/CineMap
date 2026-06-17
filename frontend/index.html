@@ -199,8 +199,16 @@
   <input type="range" id="lookRough" min="0" max="1" step="0.05" style="width:100%" oninput="$('roughVal').textContent=(+this.value).toFixed(2)">
   <label class="msg">Specular <span id="specVal" class="msg"></span></label>
   <input type="range" id="lookSpec" min="0" max="1" step="0.05" style="width:100%" oninput="$('specVal').textContent=(+this.value).toFixed(2)">
-  <div style="margin-top:8px"><button class="primary" onclick="applyLook()">Apply &amp; preview</button> <span id="lookMsg" class="msg"></span></div>
+  <div style="margin-top:8px"><button class="primary" onclick="applyLook()">Apply &amp; preview</button>
+    <button id="lookUndoBtn" onclick="undoLook()" style="display:none">↩ Undo</button>
+    <span id="lookMsg" class="msg"></span></div>
   <div class="msg" style="margin-top:2px">applies to all renders; previews on the selected keyframe</div>
+  <div id="lookCompare" style="display:none;margin-top:8px">
+    <div style="display:flex;gap:6px">
+      <div style="flex:1"><div class="msg" style="text-align:center">before</div><img id="lookBefore" style="width:100%;border-radius:4px;background:#000"></div>
+      <div style="flex:1"><div class="msg" style="text-align:center">after</div><img id="lookAfter" style="width:100%;border-radius:4px;background:#000"></div>
+    </div>
+  </div>
 </div>
 
 <div id="ngPropPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #3a8f5a;border-radius:8px;padding:12px 14px;width:360px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.7">
@@ -813,35 +821,78 @@ async function applyNgPropagate() {
 }
 
 // ---- look / glow experiment panel ----
-async function openLookPanel() {
-  if (!PID) { setStatus('open a project first'); return; }
-  try {
-    const r = await api('GET', `/api/projects/${PID}/look`); const L = r.look || {};
-    $('lookPreset').value = L.preset || 'neuvid';
-    $('lookGlow').value = L.glow != null ? L.glow : 0.02;
-    $('lookRough').value = L.roughness != null ? L.roughness : 0.25;
-    $('lookSpec').value = L.specular != null ? L.specular : 0.5;
-  } catch (e) {}
+let PREV_LOOK = null, PREV_IMG = null;
+function setLookControls(L) {
+  L = L || {};
+  $('lookPreset').value = L.preset || 'neuvid';
+  $('lookGlow').value = L.glow != null ? L.glow : 0.02;
+  $('lookRough').value = L.roughness != null ? L.roughness : 0.25;
+  $('lookSpec').value = L.specular != null ? L.specular : 0.5;
   ['glowVal', 'roughVal', 'specVal'].forEach((v, i) => $(v).textContent = (+$(['lookGlow', 'lookRough', 'lookSpec'][i]).value).toFixed(2));
   lookPresetChanged();
-  $('lookMsg').textContent = ''; $('lookPanel').style.display = 'block';
+}
+async function openLookPanel() {
+  if (!PID) { setStatus('open a project first'); return; }
+  try { setLookControls((await api('GET', `/api/projects/${PID}/look`)).look || {}); } catch (e) {}
+  $('lookMsg').textContent = '';
+  $('lookCompare').style.display = 'none'; $('lookUndoBtn').style.display = 'none';
+  $('lookPanel').style.display = 'block';
 }
 function lookPresetChanged() {
   const ng = $('lookPreset').value === 'ng';   // ng uses the flat emission shader (no glow/roughness)
   ['lookGlow', 'lookRough', 'lookSpec'].forEach(id => $(id).disabled = ng);
 }
+// snapshot the selected keyframe's current thumbnail to a data URL (so the 'before'
+// survives the file being overwritten by the new-look render)
+function captureThumb(id) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const c = document.createElement('canvas');
+        c.width = img.naturalWidth || 320; c.height = img.naturalHeight || 180;
+        c.getContext('2d').drawImage(img, 0, 0); resolve(c.toDataURL('image/png'));
+      } catch (e) { resolve(null); }
+    };
+    img.onerror = () => resolve(null);
+    img.src = `/api/projects/${PID}/keyframes/${id}/thumbnail?v=${THUMB_VER[id] || 0}`;
+  });
+}
+function lookFromControls() {
+  const preset = $('lookPreset').value, look = { preset };
+  if (preset !== 'ng') { look.glow = +$('lookGlow').value; look.roughness = +$('lookRough').value; look.specular = +$('lookSpec').value; }
+  return look;
+}
 async function applyLook() {
   if (!PID) return;
-  const preset = $('lookPreset').value, look = { preset };
-  if (preset !== 'ng') {
-    look.glow = +$('lookGlow').value; look.roughness = +$('lookRough').value; look.specular = +$('lookSpec').value;
-  }
+  const id = ACTIVE_KF || LAST_KF_ID;
+  // capture BEFORE (look + current thumbnail) so we can compare + undo
+  try { PREV_LOOK = (await api('GET', `/api/projects/${PID}/look`)).look || {}; } catch (e) { PREV_LOOK = {}; }
+  PREV_IMG = id ? await captureThumb(id) : null;
+  const look = lookFromControls();
   try {
     await api('POST', `/api/projects/${PID}/look`, { look });
+    if (!id) { $('lookMsg').textContent = 'applied (select a frame to preview)'; setStatus(`look set (${look.preset})`); return; }
+    $('lookMsg').textContent = 'rendering preview…'; setStatus(`look set (${look.preset}) — rendering preview`);
+    await renderThumbAwait(id); await reload();
+    $('lookBefore').src = PREV_IMG || '';
+    $('lookBefore').style.visibility = PREV_IMG ? 'visible' : 'hidden';
+    $('lookAfter').src = `/api/projects/${PID}/keyframes/${id}/thumbnail?v=${THUMB_VER[id] || Date.now()}`;
+    $('lookCompare').style.display = 'block';
+    $('lookUndoBtn').style.display = '';
+    $('lookMsg').textContent = 'done — before vs after below';
+  } catch (e) { $('lookMsg').textContent = 'error: ' + e.message; }
+}
+async function undoLook() {
+  if (!PID || PREV_LOOK == null) return;
+  try {
+    await api('POST', `/api/projects/${PID}/look`, { look: PREV_LOOK });
+    setLookControls(PREV_LOOK);
     const id = ACTIVE_KF || LAST_KF_ID;
-    $('lookMsg').textContent = id ? 'applied — rendering preview…' : 'applied (select a frame to preview)';
-    setStatus(`look set (${preset})` + (id ? ' — rendering preview' : ''));
-    if (id) renderThumbnail(id);   // re-render the selected keyframe with the new look
+    $('lookMsg').textContent = 'reverted — rendering…'; setStatus('look reverted');
+    if (id) { await renderThumbAwait(id); await reload(); }
+    $('lookUndoBtn').style.display = 'none'; $('lookCompare').style.display = 'none';
+    $('lookMsg').textContent = 'reverted';
   } catch (e) { $('lookMsg').textContent = 'error: ' + e.message; }
 }
 
