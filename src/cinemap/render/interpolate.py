@@ -81,6 +81,7 @@ class FrameMesh:
     saturation: float = 1.0     # NG layer saturation (0 = grayscale)
     object_alpha: float = 1.0   # NG "Opacity (3d)"
     silhouette: float = 0.0     # NG "Silhouette (3d)"
+    clip: dict | None = None    # cutaway plane {axis, position_nm, side} or None
 
 
 @dataclass
@@ -105,6 +106,24 @@ class FrameState:
     slices: list[FrameSlice] = field(default_factory=list)
     meshes: list[FrameMesh] = field(default_factory=list)
     annotations: list[FrameAnnotation] = field(default_factory=list)
+
+
+def _clip_dict(c) -> dict | None:
+    """A keyframe ClipPlane -> the render-side clip dict, or None when disabled."""
+    if c is None or not getattr(c, "enabled", False):
+        return None
+    return {"axis": c.axis, "position_nm": c.position_nm, "side": c.side}
+
+
+def _lerp_clip(ca, cb, t: float) -> dict | None:
+    """Interpolate a cutaway between two keyframes. When both clip the same axis/side
+    the plane scrolls (position lerps); otherwise snap to the target's clip so the
+    cut doesn't jump through an interpolated mismatch."""
+    da, db = _clip_dict(ca), _clip_dict(cb)
+    if da and db and da["axis"] == db["axis"] and da["side"] == db["side"]:
+        return {"axis": db["axis"], "side": db["side"],
+                "position_nm": da["position_nm"] * (1 - t) + db["position_nm"] * t}
+    return db if t >= 0.5 else da
 
 
 def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
@@ -144,14 +163,16 @@ def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
             op = (ma.opacity if ma.visible else 0.0) * (1 - t) + (mb.opacity if mb.visible else 0.0) * t
             oa = ma.object_alpha * (1 - t) + mb.object_alpha * t       # Opacity (3d) lerps
             si = ma.silhouette * (1 - t) + mb.silhouette * t           # Silhouette (3d) lerps
+            clip = _lerp_clip(ma.clip, mb.clip, t)                     # cutaway scrolls
             fs.meshes.append(FrameMesh(name, ids, mb.color, op, mb.render_3d,
-                                       object_alpha=oa, silhouette=si, **cc))
+                                       object_alpha=oa, silhouette=si, clip=clip, **cc))
         else:
             m = ma or mb
             base = (m.opacity if m.visible else 0.0)
             op = base * (1 - t) if ma else base * t   # ma-only fades out; mb-only fades in
             fs.meshes.append(FrameMesh(name, ids, m.color, op, m.render_3d,
-                                       object_alpha=m.object_alpha, silhouette=m.silhouette, **cc))
+                                       object_alpha=m.object_alpha, silhouette=m.silhouette,
+                                       clip=_clip_dict(m.clip), **cc))
     # annotations matched by layer name; geometry is identical frame-to-frame, so
     # only opacity fades (appearing/disappearing layers fade in/out).
     a_an = {an.name: an for an in a.annotations}

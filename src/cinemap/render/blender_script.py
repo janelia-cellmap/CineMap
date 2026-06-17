@@ -235,6 +235,64 @@ def _update_lights(frame: dict, rig: dict) -> None:
             obj.rotation_euler = d.normalized().to_track_quat("-Z", "Y").to_euler()
 
 
+_CLIP_AXIS_W = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
+
+
+def _build_clip_nodes(nt, surf):
+    """Add cutaway nodes that make `surf` transparent on the hidden side of an
+    axis-aligned plane. Returns the new surface socket (a Mix Shader). The plane is
+    driven by value nodes cm_clip_{wx,wy,wz,pos,side,on} set per frame by _apply_clip:
+    selected-axis world coord = X*wx + Y*wy + Z*wz; hide where (coord-pos)*side > 0."""
+    def V(name, val):
+        n = nt.nodes.new("ShaderNodeValue"); n.name = name
+        n.outputs[0].default_value = val
+        return n.outputs[0]
+
+    def M(op, a, b):
+        n = nt.nodes.new("ShaderNodeMath"); n.operation = op
+        nt.links.new(a, n.inputs[0])
+        if hasattr(b, "default_value") or not isinstance(b, (int, float)):
+            nt.links.new(b, n.inputs[1])
+        else:
+            n.inputs[1].default_value = b
+        return n.outputs[0]
+
+    geo = nt.nodes.new("ShaderNodeNewGeometry")
+    sep = nt.nodes.new("ShaderNodeSeparateXYZ")
+    nt.links.new(geo.outputs["Position"], sep.inputs[0])
+    wx, wy, wz = V("cm_clip_wx", 0.0), V("cm_clip_wy", 0.0), V("cm_clip_wz", 1.0)
+    axc = M("ADD", M("ADD", M("MULTIPLY", sep.outputs["X"], wx),
+                            M("MULTIPLY", sep.outputs["Y"], wy)),
+                   M("MULTIPLY", sep.outputs["Z"], wz))   # selected-axis world coord (BU)
+    pos_v, side_v, on_v = V("cm_clip_pos", 0.0), V("cm_clip_side", 1.0), V("cm_clip_on", 0.0)
+    signed = M("MULTIPLY", M("SUBTRACT", axc, pos_v), side_v)   # >0 on the hidden side
+    hide = M("MULTIPLY", M("GREATER_THAN", signed, 0.0), on_v)  # 1 -> transparent (gated)
+    transp = nt.nodes.new("ShaderNodeBsdfTransparent")
+    mix = nt.nodes.new("ShaderNodeMixShader"); mix.name = "cm_clip_mix"
+    nt.links.new(hide, mix.inputs[0])
+    nt.links.new(surf, mix.inputs[1])
+    nt.links.new(transp.outputs[0], mix.inputs[2])
+    return mix.outputs[0]
+
+
+def _apply_clip(nt, clip, f=None) -> None:
+    """Set (and optionally keyframe) the cm_clip_* value nodes from a clip dict
+    {axis, position_bu, side} or None. No-op on materials without clip nodes."""
+    if nt.nodes.get("cm_clip_on") is None:
+        return
+    wx, wy, wz = _CLIP_AXIS_W.get((clip or {}).get("axis", "z"), (0.0, 0.0, 1.0))
+    vals = {"cm_clip_wx": wx, "cm_clip_wy": wy, "cm_clip_wz": wz,
+            "cm_clip_pos": float((clip or {}).get("position_bu", 0.0)),
+            "cm_clip_side": float((clip or {}).get("side", 1)),
+            "cm_clip_on": 1.0 if clip else 0.0}
+    for nm, val in vals.items():
+        n = nt.nodes.get(nm)
+        if n is not None:
+            n.outputs[0].default_value = float(val)
+            if f is not None:
+                n.outputs[0].keyframe_insert("default_value", frame=f)
+
+
 def _import_meshes(scene_spec: dict) -> dict:
     """Import each mesh once; return name -> (object, material).
 
@@ -424,21 +482,28 @@ def _import_meshes(scene_spec: dict) -> dict:
             nt.links.new(egw.outputs[0], eadd.inputs[1])
             nt.links.new(eadd.outputs[0], bsdf.inputs["Emission Strength"])
 
+        out_node = nt.nodes.get("Material Output") or next(
+            (n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None)
+        surf = bsdf.outputs[0]
         # Optional backface culling (Cycles): mix in a Transparent BSDF on back faces, so
         # a tube/cell-body shows only its front surface instead of front+back stacking.
         # At low opacity that halves the alpha build-up -> glassier, see-through transparent
         # state closer to neuroglancer (instead of dense clusters piling up to opaque).
-        if prof.get("backface_cull"):
-            out_node = nt.nodes.get("Material Output") or next(
-                (n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None)
-            if out_node is not None:
-                geo_bf = nt.nodes.new("ShaderNodeNewGeometry")
-                transp = nt.nodes.new("ShaderNodeBsdfTransparent")
-                bfmix = nt.nodes.new("ShaderNodeMixShader")
-                nt.links.new(geo_bf.outputs["Backfacing"], bfmix.inputs[0])  # 1 on back
-                nt.links.new(bsdf.outputs[0], bfmix.inputs[1])               # front -> shaded
-                nt.links.new(transp.outputs[0], bfmix.inputs[2])             # back -> clear
-                nt.links.new(bfmix.outputs[0], out_node.inputs["Surface"])
+        if prof.get("backface_cull") and out_node is not None:
+            geo_bf = nt.nodes.new("ShaderNodeNewGeometry")
+            transp = nt.nodes.new("ShaderNodeBsdfTransparent")
+            bfmix = nt.nodes.new("ShaderNodeMixShader")
+            nt.links.new(geo_bf.outputs["Backfacing"], bfmix.inputs[0])  # 1 on back
+            nt.links.new(surf, bfmix.inputs[1])                          # front -> shaded
+            nt.links.new(transp.outputs[0], bfmix.inputs[2])             # back -> clear
+            surf = bfmix.outputs[0]
+        # Optional cutaway clip plane (per layer, animatable): hide geometry on the chosen
+        # side of an axis-aligned plane by mixing in a Transparent BSDF, revealing what's
+        # inside/behind. Plane params are driven per frame by the cm_clip_* value nodes.
+        if m.get("clip") and out_node is not None:
+            surf = _build_clip_nodes(nt, surf)
+        if out_node is not None:
+            nt.links.new(surf, out_node.inputs["Surface"])
 
         mat.blend_method = "BLEND"
         obj.data.materials.clear()
@@ -474,6 +539,7 @@ def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> N
             ev.outputs[0].default_value = base_emit + ov.get("emphasis", 0.0)
         if av is None and "Alpha" in nt.nodes["Principled BSDF"].inputs:
             nt.nodes["Principled BSDF"].inputs["Alpha"].default_value = opacity
+        _apply_clip(nt, ov.get("clip"))
 
 
 _slice_objs: list = []
@@ -674,6 +740,7 @@ def _keyframe_meshes(meshes: dict, overrides: dict, f: int) -> None:
         if sv is not None:
             sv.outputs[0].default_value = silh
             sv.outputs[0].keyframe_insert("default_value", frame=f)
+        _apply_clip(nt, ov.get("clip") if ov else None, f)
 
 
 def export_blend(spec: dict) -> None:

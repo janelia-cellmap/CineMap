@@ -96,6 +96,7 @@
     <div class="controls">
       <button onclick="orbit()">Orbit 360°</button>
       <button onclick="sweep()">Sweep z-slice</button>
+      <button onclick="cutaway()" title="Fixed view; sweep a clip plane through a layer to cut it away and reveal what's inside. Pick a layer + axis.">Cutaway sweep</button>
       <label>w</label><input id="w" value="1280" />
       <label>h</label><input id="h" value="720" />
       <label>fps</label><input id="fps" value="30" />
@@ -505,6 +506,27 @@ async function addKeyframe() { if(!PID)return; await api('POST', `/api/projects/
 async function delKf(id)     { await api('DELETE', `/api/projects/${PID}/keyframes/${id}`); reload(); }
 async function orbit()       { if(!PID)return; setStatus('adding orbit…'); await api('POST', `/api/projects/${PID}/orbit`, {degrees:360,n:12}); reload(); setStatus('orbit added'); }
 async function sweep()       { if(!PID)return; await api('POST', `/api/projects/${PID}/sweep_slice`, {axis:'z',n:12}); reload(); }
+async function cutaway() {
+  if(!PID) return;
+  // offer the 3D mesh layers from the last keyframe to choose which one to cut away
+  const proj = await api('GET', `/api/projects/${PID}`);
+  const kfs = (proj && proj.keyframes) || [];
+  const last = kfs[kfs.length-1];
+  const layers = last ? [...new Set(last.meshes.filter(m=>m.render_3d!==false && (m.segment_ids||[]).length).map(m=>m.mesh_name))] : [];
+  let mesh_name = null;
+  if (layers.length > 1) {
+    const pick = prompt(`Cutaway which layer? (blank = all)\n${layers.map((l,i)=>`${i+1}. ${l}`).join('\n')}`, '1');
+    if (pick === null) return;
+    const idx = parseInt(pick,10);
+    mesh_name = (idx>=1 && idx<=layers.length) ? layers[idx-1] : null;
+  } else if (layers.length === 1) { mesh_name = layers[0]; }
+  const axis = (prompt('Cutaway axis (x/y/z):', 'z') || 'z').trim().toLowerCase();
+  if (!['x','y','z'].includes(axis)) return;
+  const side = (prompt('Direction — 1 = reveal one way, -1 = the other:', '1') || '1').trim()==='-1' ? -1 : 1;
+  setStatus('adding cutaway…');
+  await api('POST', `/api/projects/${PID}/sweep_clip`, {mesh_name, axis, n:12, side});
+  reload(); setStatus('cutaway added');
+}
 
 let JOB = null;
 function renderingUI(on, mode) {

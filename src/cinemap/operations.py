@@ -16,6 +16,7 @@ from .data.manifest import analyze_state
 from .data.slice_loader import get_volume
 from .models import (
     Camera,
+    ClipPlane,
     Keyframe,
     MeshInstance,
     Project,
@@ -342,6 +343,55 @@ def sweep_slice(project: Project, axis: str = "z", n: int = 12,
             duration_in_s=duration_per_kf_s,
         )
         new.append(kf)
+    project.keyframes.extend(new)
+    store.save(project)
+    return new
+
+
+def sweep_clip(project: Project, mesh_name: str | None = None, axis: str = "z",
+               n: int = 12, side: int = 1, duration_per_kf_s: float = 0.4) -> list[Keyframe]:
+    """Cutaway sweep: hold the current camera fixed and sweep a clip plane through the
+    volume so a layer is progressively cut away, revealing what's inside/behind. Applies
+    to `mesh_name` only (per-layer); if None, clips every 3D mesh layer."""
+    ax_i = {"x": 0, "y": 1, "z": 2}[axis]
+    base = project.keyframes[-1] if project.keyframes else None
+    if base is None:
+        raise ValueError("sweep_clip needs an existing keyframe to sweep from")
+    # sweep across the actual bounds of the layer(s) being cut, not the whole EM volume
+    targets = [m for m in base.meshes
+               if (mesh_name is None or m.mesh_name == mesh_name) and m.segment_ids]
+    lo = hi = None
+    for m in targets:
+        src = next((s for s in project.manifest.meshes if s.name == m.mesh_name), None)
+        bb = mesh_bbox_nm(src.mesh_url, m.segment_ids) if src else None
+        if not bb:
+            continue
+        c, r = bb
+        l, h = c[ax_i] - r, c[ax_i] + r
+        lo = l if lo is None else min(lo, l)
+        hi = h if hi is None else max(hi, h)
+    if lo is None:   # fall back to the EM volume extent if no mesh bounds resolved
+        center, size = volume_extent_nm(project)
+        lo, hi = center[ax_i] - 0.55 * size[ax_i], center[ax_i] + 0.55 * size[ax_i]
+    pad = (hi - lo) * 0.1 or 1000.0   # pad so the endpoints fully hide / fully reveal
+    lo, hi = lo - pad, hi + pad
+    if side < 0:
+        lo, hi = hi, lo   # reverse the reveal direction
+    new = []
+    for i in range(n):
+        pos = lo + (hi - lo) * i / max(1, n - 1)
+        meshes = []
+        for msh in base.meshes:
+            mc = msh.model_copy(deep=True)
+            if mesh_name is None or msh.mesh_name == mesh_name:
+                mc.clip = ClipPlane(axis=axis, position_nm=pos, side=side, enabled=True)
+            meshes.append(mc)
+        new.append(Keyframe(
+            id=_uid("kf"), label=f"cutaway {axis}={int(pos)}nm",
+            camera=base.camera.model_copy(),
+            slices=[s.model_copy() for s in base.slices],
+            meshes=meshes, duration_in_s=duration_per_kf_s,
+        ))
     project.keyframes.extend(new)
     store.save(project)
     return new

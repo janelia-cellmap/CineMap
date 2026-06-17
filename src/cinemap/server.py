@@ -67,6 +67,13 @@ class SweepReq(BaseModel):
     n: int = 12
 
 
+class SweepClipReq(BaseModel):
+    mesh_name: str | None = None
+    axis: str = "z"
+    n: int = 12
+    side: int = 1
+
+
 class RenderReq(BaseModel):
     width: int = 1280
     height: int = 720
@@ -423,6 +430,13 @@ def orbit(pid: str, req: OrbitReq):
 def sweep(pid: str, req: SweepReq):
     p = store.load(pid)
     kfs = ops.sweep_slice(p, axis=req.axis, n=req.n)
+    return {"added": len(kfs)}
+
+
+@app.post("/api/projects/{pid}/sweep_clip")
+def sweep_clip(pid: str, req: SweepClipReq):
+    p = store.load(pid)
+    kfs = ops.sweep_clip(p, mesh_name=req.mesh_name, axis=req.axis, n=req.n, side=req.side)
     return {"added": len(kfs)}
 
 

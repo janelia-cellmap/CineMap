@@ -63,6 +63,16 @@ class SlicePlane(BaseModel):
     visible: bool = True
 
 
+class ClipPlane(BaseModel):
+    """A cutaway plane for a single mesh layer: geometry on the hidden side of the
+    plane is made transparent in the 3D render, revealing what's inside/behind.
+    Independent of EM slices, and applied per layer (cut the cell, keep the mitos)."""
+    axis: Axis = "z"
+    position_nm: float = 0.0
+    side: int = 1          # +1 hides the +axis side of the plane; -1 hides the -axis side
+    enabled: bool = False
+
+
 class MeshInstance(BaseModel):
     mesh_name: str
     segment_ids: list[int] = Field(default_factory=list)
@@ -81,6 +91,7 @@ class MeshInstance(BaseModel):
     # neuroglancer 3D mesh render state (per keyframe -> can change frame to frame)
     object_alpha: float = 1.0   # NG "Opacity (3d)"  (objectAlpha)
     silhouette: float = 0.0     # NG "Silhouette (3d)" (meshSilhouetteRendering)
+    clip: Optional[ClipPlane] = None   # cutaway plane (render-only; per layer)
 
 
 class AnnotationInstance(BaseModel):

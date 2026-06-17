@@ -456,6 +456,11 @@ class RenderWorker:
                     }
                     if is_hero and emph_glow > 0.0:
                         ov["emphasis"] = emph_glow       # brief emission glow on the hero
+                    cl = getattr(m, "clip", None)
+                    if cl:
+                        ov["clip"] = {"axis": cl["axis"], "side": cl["side"],
+                                      "position_bu": cl["position_nm"] / self.nm_per_bu}
+                        mesh_specs[uid]["clip"] = True   # tell the material to build clip nodes
                     overrides[uid] = ov
             for an in fr.annotations:
                 uid = self._ann_uid(an)
