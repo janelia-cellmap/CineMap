@@ -30,8 +30,9 @@ class MaterialProfile:
     specular: float = 0.5        # specular highlights catch the 3-point lights
     metallic: float = 0.0        # 0 = dielectric (default); 1 = metal (shiny, tinted reflection)
     transmission: float = 0.0    # 0 = opaque; >0 = glassy/translucent
-    sheen: float = 0.0           # soft velvety edge sheen (waxy/clay look)
-    coat: float = 0.0
+    subsurface: float = 0.0      # subsurface scattering — soft inner glow (jade/wax/skin)
+    sheen: float = 0.0           # soft velvety edge sheen (waxy/velvet look)
+    coat: float = 0.0            # clearcoat — a glossy lacquer layer (ceramic/car paint)
     emission_strength: float = 0.02  # near-zero: shading comes from the lights, not self-glow
     edge_glow: float = 0.0       # off — the rim glow washed out the faceting
     ao: float = 0.0              # neuVid uses no AO; the 3-point lighting carries the form
@@ -151,6 +152,7 @@ def make_settings(look: dict | None = None) -> "DirectorSettings":
     if look.get("specular") is not None: m.specular = float(look["specular"])
     if look.get("metallic") is not None: m.metallic = float(look["metallic"])
     if look.get("transmission") is not None: m.transmission = float(look["transmission"])
+    if look.get("subsurface") is not None: m.subsurface = float(look["subsurface"])
     if look.get("sheen") is not None: m.sheen = float(look["sheen"])
     if look.get("coat") is not None: m.coat = float(look["coat"])
     if look.get("glow") is not None:      # one "glow" knob -> emission + edge glow

@@ -60,10 +60,8 @@
   .kf .meta { color:var(--mut); position:absolute; bottom:6px; left:6px; right:6px; }
   .kf .del { position:absolute; top:4px; right:6px; color:var(--mut); cursor:pointer; }
   .msg { font-size:12px; color:var(--mut); }
-  /* hover a before/after thumbnail to blow it up so you can actually compare */
-  #lookCompare img { transition: transform .12s ease; cursor: zoom-in; }
-  #lookCompare img:hover { transform: scale(3.4); transform-origin: right bottom; z-index: 200;
-    position: relative; box-shadow: 0 0 0 2px var(--accent), 0 8px 30px rgba(0,0,0,.7); }
+  /* hover the before/after strip -> big side-by-side overlay (see #lookZoom) */
+  #lookCompare { cursor: zoom-in; }
 </style>
 </head>
 <body>
@@ -200,10 +198,15 @@
   <label class="msg">Material</label>
   <select id="lookMat" onchange="lookMatChanged()" style="width:100%">
     <option value="glossy">glossy (default)</option>
-    <option value="matte">matte</option>
+    <option value="matte">matte / clay</option>
+    <option value="plastic">plastic</option>
     <option value="metallic">metallic</option>
-    <option value="waxy">waxy / sheen</option>
-    <option value="glassy">glassy / translucent</option>
+    <option value="chrome">chrome / mirror</option>
+    <option value="ceramic">ceramic (clearcoat)</option>
+    <option value="waxy">waxy / velvet (sheen)</option>
+    <option value="subsurface">subsurface / jade</option>
+    <option value="glassy">glass (clear)</option>
+    <option value="frosted">frosted glass</option>
     <option value="glow">glow / emissive</option>
   </select>
   <label class="msg">Glow <span id="glowVal" class="msg"></span></label>
@@ -216,12 +219,17 @@
     <button id="lookUndoBtn" onclick="undoLook()" style="display:none">↩ Undo</button>
     <span id="lookMsg" class="msg"></span></div>
   <div class="msg" style="margin-top:2px">applies to all renders; previews on the selected keyframe</div>
-  <div id="lookCompare" style="display:none;margin-top:8px">
+  <div id="lookCompare" style="display:none;margin-top:8px" onmouseenter="showLookZoom()" onmouseleave="hideLookZoom()" title="hover to enlarge both">
     <div style="display:flex;gap:6px">
       <div style="flex:1"><div class="msg" style="text-align:center">before</div><img id="lookBefore" style="width:100%;border-radius:4px;background:#000"></div>
       <div style="flex:1"><div class="msg" style="text-align:center">after</div><img id="lookAfter" style="width:100%;border-radius:4px;background:#000"></div>
     </div>
   </div>
+</div>
+
+<div id="lookZoom" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.82);align-items:center;justify-content:center;gap:18px;pointer-events:none">
+  <div style="text-align:center"><div style="color:#bbb;margin-bottom:6px;font-size:14px">before</div><img id="zoomBefore" style="max-width:45vw;max-height:82vh;border-radius:6px;background:#000"></div>
+  <div style="text-align:center"><div style="color:#bbb;margin-bottom:6px;font-size:14px">after</div><img id="zoomAfter" style="max-width:45vw;max-height:82vh;border-radius:6px;background:#000"></div>
 </div>
 
 <div id="ngPropPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #3a8f5a;border-radius:8px;padding:12px 14px;width:360px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.7">
@@ -838,12 +846,17 @@ let PREV_LOOK = null, PREV_IMG = null;
 // material "type" presets — set the Principled knobs (the look panel exposes glow/
 // roughness/specular sliders; metallic/transmission/sheen come from the type).
 const MAT_STYLES = {
-  glossy:   { roughness: 0.25, specular: 0.5, metallic: 0,   transmission: 0,    sheen: 0,   glow: 0.02 },
-  matte:    { roughness: 0.9,  specular: 0.1, metallic: 0,   transmission: 0,    sheen: 0,   glow: 0.02 },
-  metallic: { roughness: 0.3,  specular: 0.5, metallic: 1.0, transmission: 0,    sheen: 0,   glow: 0.02 },
-  waxy:     { roughness: 0.5,  specular: 0.3, metallic: 0,   transmission: 0,    sheen: 1.0, glow: 0.02 },
-  glassy:   { roughness: 0.1,  specular: 0.5, metallic: 0,   transmission: 0.85, sheen: 0,   glow: 0.02 },
-  glow:     { roughness: 0.4,  specular: 0.4, metallic: 0,   transmission: 0,    sheen: 0,   glow: 0.4 },
+  glossy:     { roughness: 0.25, specular: 0.5, glow: 0.02 },
+  matte:      { roughness: 0.9,  specular: 0.1, glow: 0.02 },
+  plastic:    { roughness: 0.4,  specular: 0.6, glow: 0.02 },
+  metallic:   { roughness: 0.3,  specular: 0.5, metallic: 1.0, glow: 0.02 },
+  chrome:     { roughness: 0.05, specular: 0.5, metallic: 1.0, glow: 0.02 },
+  ceramic:    { roughness: 0.25, specular: 0.5, coat: 1.0, glow: 0.02 },
+  waxy:       { roughness: 0.5,  specular: 0.3, sheen: 1.0, glow: 0.02 },
+  subsurface: { roughness: 0.45, specular: 0.4, subsurface: 1.0, glow: 0.02 },
+  glassy:     { roughness: 0.0,  specular: 0.5, transmission: 1.0, glow: 0.02 },
+  frosted:    { roughness: 0.4,  specular: 0.5, transmission: 0.7, glow: 0.02 },
+  glow:       { roughness: 0.4,  specular: 0.4, glow: 0.4 },
 };
 function syncLookVals() {
   ['glowVal', 'roughVal', 'specVal'].forEach((v, i) => $(v).textContent = (+$(['lookGlow', 'lookRough', 'lookSpec'][i]).value).toFixed(2));
@@ -896,7 +909,8 @@ function lookFromControls() {
     const s = MAT_STYLES[$('lookMat').value] || {};
     look.material = $('lookMat').value;
     look.glow = +$('lookGlow').value; look.roughness = +$('lookRough').value; look.specular = +$('lookSpec').value;
-    look.metallic = s.metallic || 0; look.transmission = s.transmission || 0; look.sheen = s.sheen || 0;
+    look.metallic = s.metallic || 0; look.transmission = s.transmission || 0;
+    look.subsurface = s.subsurface || 0; look.sheen = s.sheen || 0; look.coat = s.coat || 0;
   }
   return look;
 }
@@ -920,6 +934,12 @@ async function applyLook() {
     $('lookMsg').textContent = 'done — before vs after below';
   } catch (e) { $('lookMsg').textContent = 'error: ' + e.message; }
 }
+function showLookZoom() {
+  if (!$('lookAfter').src) return;
+  $('zoomBefore').src = $('lookBefore').src || ''; $('zoomAfter').src = $('lookAfter').src;
+  $('lookZoom').style.display = 'flex';
+}
+function hideLookZoom() { $('lookZoom').style.display = 'none'; }
 async function undoLook() {
   if (!PID || PREV_LOOK == null) return;
   try {

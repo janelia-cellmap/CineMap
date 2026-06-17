@@ -282,6 +282,7 @@ def _import_meshes(scene_spec: dict) -> dict:
         _set_in(bsdf, "Specular IOR Level", prof.get("specular", 0.5))
         _set_in(bsdf, "Metallic", prof.get("metallic", 0.0))
         _set_in(bsdf, "Transmission Weight", prof.get("transmission", 0.0))
+        _set_in(bsdf, "Subsurface Weight", prof.get("subsurface", 0.0))
         _set_in(bsdf, "Sheen Weight", prof.get("sheen", 0.0))
         _set_in(bsdf, "Coat Weight", prof.get("coat", 0.0))
         has_colors = bool(getattr(obj.data, "color_attributes", None)) and len(obj.data.color_attributes) > 0
