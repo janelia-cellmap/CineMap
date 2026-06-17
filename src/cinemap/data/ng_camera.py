@@ -33,9 +33,29 @@ def _vox(voxel_nm):
     return np.array(voxel_nm, dtype=float)
 
 
+def _xyz_perm(state: dict) -> list[int]:
+    """Indices into the NG dimension-ordered arrays (position / voxel / world vectors)
+    that reorder them to (x, y, z). Neuroglancer lists `dimensions` in an arbitrary
+    order — often z,y,x — and `position`/`projectionOrientation` follow that order, but
+    our world frame (and the precomputed meshes) are x,y,z. For an x,y,z state this is
+    the identity, so it's backward-compatible."""
+    dims = list((state.get("dimensions") or {}).keys())
+    if len(dims) < 3:
+        return [0, 1, 2]
+
+    def idx(ax, default):
+        for i, d in enumerate(dims):
+            if d == ax or d[:1].lower() == ax:
+                return i
+        return default
+    return [idx("x", 0), idx("y", 1), idx("z", 2)]
+
+
 def ng_to_camera(state: dict, voxel_nm, fov_deg: float = NG_FOV_DEG) -> Camera:
+    perm = _xyz_perm(state)
     pos_vox = np.array(state.get("position") or [0, 0, 0], dtype=float)
-    look_at = pos_vox * _vox(voxel_nm)
+    # position & voxel are in NG dimension order; multiply elementwise, then reorder to xyz
+    look_at = (pos_vox * _vox(voxel_nm))[perm]
     q = state.get("projectionOrientation") or [0.0, 0.0, 0.0, 1.0]
     scale = float(state.get("projectionScale", 10000.0))
 
@@ -44,8 +64,10 @@ def ng_to_camera(state: dict, voxel_nm, fov_deg: float = NG_FOV_DEG) -> Camera:
     # Its 3D view is Y-DOWN (screen up = -Y) and the camera looks along +Z in view
     # space (so depth ordering matches: closer objects sit in front). Verified by
     # matching rendered frames — including depth — to neuroglancer's video_tool output.
-    fwd = rot.apply([0.0, 0.0, 1.0])
-    up = rot.apply([0.0, -1.0, 0.0])
+    # the orientation maps view->world in NG's dimension order; reorder the world
+    # vectors to xyz so the camera matches the (x,y,z) mesh world.
+    fwd = rot.apply([0.0, 0.0, 1.0])[perm]
+    up = rot.apply([0.0, -1.0, 0.0])[perm]
 
     # NG: visible extent at the focus = projectionScale*voxel; dist back-computed from
     # the vertical FOV. (Exactly NG's (projectionScale/2)/tan(fovy/2) * voxel.)
@@ -58,8 +80,11 @@ def ng_to_camera(state: dict, voxel_nm, fov_deg: float = NG_FOV_DEG) -> Camera:
 
 def camera_to_ng(camera: Camera, voxel_nm, base_state: dict | None = None) -> dict:
     state = dict(base_state or {})
-    look_at = np.array(camera.look_at_nm, dtype=float)
-    state["position"] = (look_at / _vox(voxel_nm)).tolist()
+    perm = _xyz_perm(state)
+    inv = list(np.argsort(perm))            # reorder an (x,y,z) vector back to NG dim order
+    look_at = np.array(camera.look_at_nm, dtype=float)   # xyz
+    vox = _vox(voxel_nm)                     # NG dimension order
+    state["position"] = (look_at[inv] / vox).tolist()    # xyz -> dim order, then to voxels
 
     fwd = look_at - np.array(camera.position_nm, dtype=float)
     dist = float(np.linalg.norm(fwd)) or 1.0
@@ -71,6 +96,7 @@ def camera_to_ng(camera: Camera, voxel_nm, base_state: dict | None = None) -> di
     up = up - np.dot(up, fwd) * fwd
     nu = np.linalg.norm(up)
     up = up / nu if nu > 1e-9 else np.array([0.0, -1.0, 0.0])
+    fwd, up = fwd[inv], up[inv]              # xyz -> NG dim order for the orientation
     c2 = fwd
     c1 = -up
     c0 = np.cross(c1, c2)
