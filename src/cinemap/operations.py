@@ -325,76 +325,82 @@ def make_orbit(project: Project, degrees: float = 360.0, n: int = 12,
     return new
 
 
-def sweep_slice(project: Project, axis: str = "z", n: int = 12,
-                duration_per_kf_s: float = 0.4) -> list[Keyframe]:
-    center, size = volume_extent_nm(project)
-    ax_i = {"x": 0, "y": 1, "z": 2}[axis]
-    base = project.keyframes[-1] if project.keyframes else None
-    cam = base.camera if base else frame_camera(center, 0.5 * max(size))
-    em_name = project.manifest.em.name if project.manifest.em else "em"
-    new = []
-    for i in range(n):
-        pos = size[ax_i] * (0.2 + 0.6 * i / max(1, n - 1))
-        kf = Keyframe(
-            id=_uid("kf"), label=f"slice {axis}={int(pos)}nm",
-            camera=cam.model_copy(),
-            slices=[SlicePlane(em_name=em_name, axis=axis, position_nm=pos)],
-            meshes=[m.model_copy() for m in (base.meshes if base else [])],
-            duration_in_s=duration_per_kf_s,
-        )
-        new.append(kf)
-    project.keyframes.extend(new)
-    store.save(project)
-    return new
-
-
-def sweep_clip(project: Project, mesh_name: str | None = None, axis: str = "z",
-               n: int = 12, side: int = 1, duration_per_kf_s: float = 0.4) -> list[Keyframe]:
-    """Cutaway sweep: hold the current camera fixed and sweep a clip plane through the
-    volume so a layer is progressively cut away, revealing what's inside/behind. Applies
-    to `mesh_name` only (per-layer); if None, clips every 3D mesh layer."""
-    ax_i = {"x": 0, "y": 1, "z": 2}[axis]
-    base = project.keyframes[-1] if project.keyframes else None
-    if base is None:
-        raise ValueError("sweep_clip needs an existing keyframe to sweep from")
-    # sweep across the actual bounds of the layer(s) being cut, not the whole EM volume
-    targets = [m for m in base.meshes
-               if (mesh_name is None or m.mesh_name == mesh_name) and m.segment_ids]
+def _plane_default_range(project: Project, base: Keyframe, ax_i: int,
+                         mesh_name: str | None) -> tuple[float, float]:
+    """Default scan range along an axis = the bounds of the mesh layer(s) involved
+    (so the plane scans across the actual structure, not empty volume), padded; falls
+    back to the EM volume extent when no mesh bounds resolve."""
     lo = hi = None
-    for m in targets:
+    for m in base.meshes:
+        if (mesh_name is not None and m.mesh_name != mesh_name) or not m.segment_ids:
+            continue
         src = next((s for s in project.manifest.meshes if s.name == m.mesh_name), None)
         bb = mesh_bbox_nm(src.mesh_url, m.segment_ids) if src else None
         if not bb:
             continue
         c, r = bb
-        l, h = c[ax_i] - r, c[ax_i] + r
-        lo = l if lo is None else min(lo, l)
-        hi = h if hi is None else max(hi, h)
-    if lo is None:   # fall back to the EM volume extent if no mesh bounds resolved
+        lo = c[ax_i] - r if lo is None else min(lo, c[ax_i] - r)
+        hi = c[ax_i] + r if hi is None else max(hi, c[ax_i] + r)
+    if lo is None:
         center, size = volume_extent_nm(project)
         lo, hi = center[ax_i] - 0.55 * size[ax_i], center[ax_i] + 0.55 * size[ax_i]
-    pad = (hi - lo) * 0.1 or 1000.0   # pad so the endpoints fully hide / fully reveal
-    lo, hi = lo - pad, hi + pad
-    if side < 0:
-        lo, hi = hi, lo   # reverse the reveal direction
+    pad = (hi - lo) * 0.1 or 1000.0
+    return lo - pad, hi + pad
+
+
+def plane_move(project: Project, axis: str = "z", mode: str = "slice",
+               start_nm: float | None = None, stop_nm: float | None = None,
+               n: int = 12, mesh_name: str | None = None, side: int = 1,
+               duration_per_kf_s: float = 0.4) -> list[Keyframe]:
+    """Lay down keyframes for an axis-aligned plane scanning start_nm -> stop_nm with the
+    current camera held fixed. `mode` controls what the plane does at each depth:
+      - 'slice': show the EM cross-section there
+      - 'cull' : cut away `mesh_name` (or all 3D layers) on `side` of the plane
+      - 'both' : both at the same moving plane
+    start/stop default to the involved layer's bounds (or the EM volume). For 'cull',
+    side<0 reverses the reveal direction."""
+    ax_i = {"x": 0, "y": 1, "z": 2}[axis]
+    base = project.keyframes[-1] if project.keyframes else None
+    if base is None:
+        raise ValueError("plane_move needs an existing keyframe to scan from")
+    do_slice, do_cull = mode in ("slice", "both"), mode in ("cull", "both")
+    lo, hi = _plane_default_range(project, base, ax_i, mesh_name if do_cull else None)
+    a = lo if start_nm is None else float(start_nm)
+    b = hi if stop_nm is None else float(stop_nm)
+    if do_cull and side < 0 and start_nm is None and stop_nm is None:
+        a, b = b, a   # reverse the reveal direction when using the default range
+    em_name = project.manifest.em.name if project.manifest.em else "em"
     new = []
     for i in range(n):
-        pos = lo + (hi - lo) * i / max(1, n - 1)
+        pos = a + (b - a) * i / max(1, n - 1)
         meshes = []
         for msh in base.meshes:
             mc = msh.model_copy(deep=True)
-            if mesh_name is None or msh.mesh_name == mesh_name:
+            if do_cull and (mesh_name is None or msh.mesh_name == mesh_name):
                 mc.clip = ClipPlane(axis=axis, position_nm=pos, side=side, enabled=True)
             meshes.append(mc)
+        slices = ([SlicePlane(em_name=em_name, axis=axis, position_nm=pos, visible=True)]
+                  if do_slice else [s.model_copy() for s in base.slices])
         new.append(Keyframe(
-            id=_uid("kf"), label=f"cutaway {axis}={int(pos)}nm",
-            camera=base.camera.model_copy(),
-            slices=[s.model_copy() for s in base.slices],
+            id=_uid("kf"), label=f"{mode} {axis}={int(pos)}nm",
+            camera=base.camera.model_copy(), slices=slices,
             meshes=meshes, duration_in_s=duration_per_kf_s,
         ))
     project.keyframes.extend(new)
     store.save(project)
     return new
+
+
+def sweep_slice(project: Project, axis: str = "z", n: int = 12,
+                duration_per_kf_s: float = 0.4) -> list[Keyframe]:
+    return plane_move(project, axis=axis, mode="slice", n=n,
+                      duration_per_kf_s=duration_per_kf_s)
+
+
+def sweep_clip(project: Project, mesh_name: str | None = None, axis: str = "z",
+               n: int = 12, side: int = 1, duration_per_kf_s: float = 0.4) -> list[Keyframe]:
+    return plane_move(project, axis=axis, mode="cull", n=n, mesh_name=mesh_name,
+                      side=side, duration_per_kf_s=duration_per_kf_s)
 
 
 # ----------------------------- render -----------------------------

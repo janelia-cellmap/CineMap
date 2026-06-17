@@ -74,6 +74,16 @@ class SweepClipReq(BaseModel):
     side: int = 1
 
 
+class PlaneMoveReq(BaseModel):
+    axis: str = "z"
+    mode: str = "slice"          # 'slice' | 'cull' | 'both'
+    start_nm: float | None = None
+    stop_nm: float | None = None
+    n: int = 12
+    mesh_name: str | None = None
+    side: int = 1
+
+
 class RenderReq(BaseModel):
     width: int = 1280
     height: int = 720
@@ -437,6 +447,14 @@ def sweep(pid: str, req: SweepReq):
 def sweep_clip(pid: str, req: SweepClipReq):
     p = store.load(pid)
     kfs = ops.sweep_clip(p, mesh_name=req.mesh_name, axis=req.axis, n=req.n, side=req.side)
+    return {"added": len(kfs)}
+
+
+@app.post("/api/projects/{pid}/plane_move")
+def plane_move(pid: str, req: PlaneMoveReq):
+    p = store.load(pid)
+    kfs = ops.plane_move(p, axis=req.axis, mode=req.mode, start_nm=req.start_nm,
+                         stop_nm=req.stop_nm, n=req.n, mesh_name=req.mesh_name, side=req.side)
     return {"added": len(kfs)}
 
 
