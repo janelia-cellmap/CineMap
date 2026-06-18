@@ -507,8 +507,11 @@ def _import_meshes(scene_spec: dict) -> dict:
         # Optional cutaway clip plane (per layer, animatable): hide geometry on the chosen
         # side of an axis-aligned plane by mixing in a Transparent BSDF, revealing what's
         # inside/behind. Plane params are driven per frame by the cm_clip_* value nodes.
-        if m.get("clip") and out_node is not None:
-            surf = _build_clip_nodes(nt, surf)
+        if m.get("clip"):
+            # geometric cutaway: keep a pristine copy of the geometry; each frame we
+            # rebuild the object as this mesh sliced at the clip plane and capped (filled
+            # cross-section) — a true solid cut, not a shader transparency trick.
+            _orig_mesh[obj.name] = obj.data.copy()
         if out_node is not None:
             nt.links.new(surf, out_node.inputs["Surface"])
 
@@ -519,12 +522,62 @@ def _import_meshes(scene_spec: dict) -> dict:
     return out
 
 
+_orig_mesh: dict = {}      # obj.name -> pristine (unclipped) mesh datablock
+_clip_state: dict = {}     # obj.name -> last applied clip signature (skip redundant rebuilds)
+
+
+def _geometric_clip(obj, clip) -> None:
+    """Rebuild obj's mesh as the pristine geometry sliced at the clip plane, with the
+    cut capped — a solid cross-section cutaway. `clip`=None restores the full mesh.
+    Operates in the object's local space (vertices are nm), so uses position_nm."""
+    import bmesh
+    orig = _orig_mesh.get(obj.name)
+    if orig is None:
+        return
+    sig = None if not clip else (round(clip.get("position_nm", 0.0), 1), clip.get("side"),
+                                 tuple(clip["normal"]) if clip.get("normal") else clip.get("axis"))
+    if _clip_state.get(obj.name) == sig:
+        return                                     # unchanged this frame -> no rebuild
+    _clip_state[obj.name] = sig
+    bm = bmesh.new()
+    bm.from_mesh(orig)                             # always start from the pristine mesh
+    if clip:
+        nrm = clip.get("normal")
+        if nrm:
+            mag = (nrm[0] ** 2 + nrm[1] ** 2 + nrm[2] ** 2) ** 0.5 or 1.0
+            n = Vector((nrm[0] / mag, nrm[1] / mag, nrm[2] / mag))
+        else:
+            n = {"x": Vector((1, 0, 0)), "y": Vector((0, 1, 0)),
+                 "z": Vector((0, 0, 1))}[clip.get("axis", "z")]
+        side = 1.0 if float(clip.get("side", 1)) >= 0 else -1.0
+        co = n * float(clip.get("position_nm", 0.0))
+        geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
+        res = bmesh.ops.bisect_plane(bm, geom=geom, dist=1e-4,
+                                     plane_co=co, plane_no=n * side, clear_outer=True)
+        cut = [e for e in res.get("geom_cut", []) if isinstance(e, bmesh.types.BMEdge)]
+        if cut:
+            # the cut edges are coplanar (the clip plane) -> triangle_fill caps the whole
+            # cross-section, handling multiple/concave loops; holes_fill is a fallback.
+            try:
+                bmesh.ops.triangle_fill(bm, edges=cut, use_beauty=True, normal=n * side)
+            except Exception:  # noqa: BLE001
+                try:
+                    bmesh.ops.holes_fill(bm, edges=cut, sides=0)
+                except Exception:  # noqa: BLE001
+                    pass
+        bm.normal_update()
+    bm.to_mesh(obj.data)
+    bm.free()
+
+
 def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> None:
     for mid, (obj, mat) in meshes.items():
         ov = overrides.get(mid)
         if ov is None:  # not referenced this frame -> hidden (belongs to another keyframe)
             obj.hide_render = True
             continue
+        if obj.name in _orig_mesh:
+            _geometric_clip(obj, ov.get("clip"))   # solid cutaway, rebuilt per frame
         opacity = ov.get("opacity", 1.0)            # effective alpha = fade * Opacity(3d)
         visible = ov.get("visible", True) and opacity > 0.001
         obj.hide_render = not visible

@@ -470,8 +470,9 @@ class RenderWorker:
                     if cl:
                         ov["clip"] = {"axis": cl["axis"], "side": cl["side"],
                                       "normal": cl.get("normal"),
+                                      "position_nm": cl["position_nm"],
                                       "position_bu": cl["position_nm"] / self.nm_per_bu}
-                        mesh_specs[uid]["clip"] = True   # tell the material to build clip nodes
+                        mesh_specs[uid]["clip"] = True   # geometric cutaway (slice + cap)
                     overrides[uid] = ov
             for an in fr.annotations:
                 uid = self._ann_uid(an)
