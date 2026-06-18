@@ -75,6 +75,7 @@ class MeshLoader:
             self.mesh_url.rsplit("/", 1) if "/" in self.mesh_url else ("", self.mesh_url))
         self._cv = None
         self._manual = None   # lazily: does this source need our model-space draco decode?
+        self._raw_cache: dict = {}   # seg_id -> (index_bytes, data_bytes), fetched once
         # persistent on-disk cache of RAW (uncolored) per-(segment, LOD) geometry,
         # keyed by (mesh_url, seg, lod) — so re-rendering at a different quality/zoom
         # only downloads the genuinely-new finer LODs and reuses the rest.
@@ -157,6 +158,21 @@ class MeshLoader:
             m = self.cv.mesh.get(int(seg_id))
         return m[seg_id] if isinstance(m, dict) else m
 
+    def _raw_manifest_data(self, seg_id: int):
+        """(index_bytes, data_bytes) for a segment, fetched once and cached on the loader.
+        The LOD picker decodes several LODs of the same segment, so caching the raw bytes
+        avoids re-downloading the (possibly large) data file per LOD — the slow path that
+        could time out and drop big segments when many load at once."""
+        seg_id = int(seg_id)
+        hit = self._raw_cache.get(seg_id)
+        if hit is None:
+            idx = urllib.request.urlopen(_http(f"{self.mesh_url}/{seg_id}.index"), timeout=60).read()
+            data = urllib.request.urlopen(_http(f"{self.mesh_url}/{seg_id}"), timeout=180).read()
+            hit = (idx, data)
+            if len(self._raw_cache) < 256:        # bound memory across a many-segment layer
+                self._raw_cache[seg_id] = hit
+        return hit
+
     def _draco_manual(self, seg_id: int, lod: int = 0) -> trimesh.Trimesh:
         """Decode one LOD of an unsharded multilod mesh whose draco points are already in
         absolute model space (grid_origin-relative): vertex = grid_origin + points. The
@@ -165,13 +181,12 @@ class MeshLoader:
         import struct
 
         import DracoPy
-        idx = urllib.request.urlopen(_http(f"{self.mesh_url}/{int(seg_id)}.index"), timeout=30).read()
+        idx, data = self._raw_manifest_data(seg_id)
         o = 12                                                 # skip chunk_shape (unused here)
         go = np.array(struct.unpack("<3f", idx[o:o + 12])); o += 12
         nl = struct.unpack("<I", idx[o:o + 4])[0]; o += 4
         o += 4 * nl + 12 * nl                                  # lod_scales + vertex_offsets
         nfrag = struct.unpack(f"<{nl}I", idx[o:o + 4 * nl]); o += 4 * nl
-        data = urllib.request.urlopen(_http(f"{self.mesh_url}/{int(seg_id)}"), timeout=120).read()
         want = min(max(int(lod), 0), nl - 1)
         dp = 0; V = []; F = []; nv = 0
         for cur in range(nl):                                  # fragments are stored LOD0..LODn
