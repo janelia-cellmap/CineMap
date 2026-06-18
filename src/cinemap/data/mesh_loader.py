@@ -201,6 +201,44 @@ class MeshLoader:
                     F.append(np.asarray(mm.faces, np.int64) + nv); nv += len(mm.points)
         return trimesh.Trimesh(vertices=np.vstack(V), faces=np.vstack(F), process=False)
 
+    def _draco_manual_fragments(self, seg_id: int, lod: int, idxs) -> dict:
+        """Manually decode only the SELECTED fragments of `lod` for per-chunk LOD. Returns
+        {frag_index -> raw Trimesh}, where frag_index is the position among NON-EMPTY
+        fragments (matching fragment_boxes / select_fragments). Uses the same model-space
+        decode as _draco_manual (vertex = grid_origin + points) so the pieces land in the
+        correct nm space and stay aligned — cloud-volume's decode double-scales this
+        encoding and scatters them."""
+        import struct
+
+        import DracoPy
+        want_idx = {int(i) for i in (idxs or [])}
+        if not want_idx:
+            return {}
+        idx, data = self._raw_manifest_data(seg_id)
+        o = 12                                                 # skip chunk_shape
+        go = np.array(struct.unpack("<3f", idx[o:o + 12])); o += 12
+        nl = struct.unpack("<I", idx[o:o + 4])[0]; o += 4
+        o += 4 * nl + 12 * nl                                  # lod_scales + vertex_offsets
+        nfrag = struct.unpack(f"<{nl}I", idx[o:o + 4 * nl]); o += 4 * nl
+        want = min(max(int(lod), 0), nl - 1)
+        dp = 0; out: dict = {}
+        for cur in range(nl):
+            n = nfrag[cur]
+            o += 12 * n                                        # skip fragment_positions
+            fsz = struct.unpack(f"<{n}I", idx[o:o + 4 * n]); o += 4 * n
+            ni = 0                                             # index among NON-empty (per LOD)
+            for i in range(n):
+                b = data[dp:dp + fsz[i]]; dp += fsz[i]
+                if not fsz[i]:
+                    continue                                   # empty -> not counted (matches boxes)
+                if cur == want and ni in want_idx:
+                    mm = DracoPy.decode(b)
+                    out[ni] = trimesh.Trimesh(
+                        vertices=go + np.asarray(mm.points, float),
+                        faces=np.asarray(mm.faces, np.int64), process=False)
+                ni += 1
+        return out
+
     def _draco(self, seg_id: int, lod: int = 0) -> trimesh.Trimesh:
         """Precomputed mesh for `seg_id` at level-of-detail `lod` (0 = finest).
         Falls back to the finest mesh if the source isn't multi-resolution. Raw
@@ -305,14 +343,32 @@ class MeshLoader:
                 frags.append((ni, w.min(0), w.max(0), tuple(int(v) for v in p), int(offs[idx])))
                 ni += 1
             per_lod.append(frags)
-        lod_scales_nm = np.asarray(man.lod_scales, float) * scale
+        # The manifest's lod_scales are RELATIVE octree multipliers (e.g. 1,2,4,8), not
+        # nm — using them directly makes select_fragments think the coarsest LOD is already
+        # sub-pixel, so it never refines (coarse/inflated meshes). Anchor them to real
+        # geometry: measure the coarsest LOD's resolution (cheap — few verts) the same way
+        # frame mode does, and scale the relative ladder to it. Falls back to the transform
+        # scale if the probe fails.
+        rel = np.asarray(man.lod_scales, float)
+        lod_scales_nm = rel * scale
+        if len(per_lod) and rel[-1] > 0:
+            try:
+                coarse = self._draco(int(seg_id), lod=len(per_lod) - 1)
+                anchor = self._mesh_resolution_nm(coarse)        # nm at the coarsest LOD
+                if anchor > 0:
+                    lod_scales_nm = rel / rel[-1] * anchor       # relative ladder -> nm
+            except Exception:  # noqa: BLE001
+                pass
         return per_lod, lod_scales_nm
 
-    def _frag_cache_path(self, seg_id: int, lod: int, idx: int):
+    def _frag_cache_path(self, seg_id: int, lod: int, idx: int, tag: str = "cv"):
         if not self._cache_dir:
             return None
         import hashlib
-        key = hashlib.md5(f"{self.mesh_url}|{int(seg_id)}|f|{int(lod)}|{int(idx)}".encode()).hexdigest()
+        # `tag` versions the decoder (cv = cloud-volume, m = manual model-space) so a
+        # fragment cached by the wrong (scattering) decoder is never reused.
+        key = hashlib.md5(
+            f"{self.mesh_url}|{int(seg_id)}|f|{int(lod)}|{int(idx)}|{tag}".encode()).hexdigest()
         return os.path.join(self._cache_dir, f"{key}.ply")
 
     def get_fragments(self, seg_id: int, selection: dict, colorize=None) -> trimesh.Trimesh | None:
@@ -322,23 +378,43 @@ class MeshLoader:
         different zoom reuses fragments already fetched; a whole-LOD download happens
         only when some needed fragment isn't cached yet. Fine where near, coarse where
         far — like neuroglancer."""
+        # Decode the selected fragments with the SAME decoder the full-segment path uses:
+        # cloud-volume double-scales the model-space-baked encoding, so in per-chunk mode
+        # its fragments come out mis-scaled and scattered. Manual decode keeps them aligned.
+        manual = self._needs_manual_decode()
+        tag = "m" if manual else "cv"
         parts = []
         for lod, idxs in selection.items():
             idxs = sorted({int(i) for i in (idxs or [])})
             if not idxs:
                 continue
             meshes: dict[int, trimesh.Trimesh] = {}      # idx -> raw (uncolored)
-            need_fetch = False
+            need = []
             for i in idxs:
-                cp = self._frag_cache_path(seg_id, lod, i)
+                cp = self._frag_cache_path(seg_id, lod, i, tag)
                 if cp and os.path.exists(cp):
                     try:
                         meshes[i] = trimesh.load(cp, process=False)
                     except Exception:  # noqa: BLE001
-                        need_fetch = True
+                        need.append(i)
                 else:
-                    need_fetch = True
-            if need_fetch:
+                    need.append(i)
+            if need and manual:
+                try:
+                    decoded = self._draco_manual_fragments(seg_id, lod, need)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[chunk] {seg_id} lod{lod} manual frags failed: {e}")
+                    decoded = {}
+                for j, raw in decoded.items():
+                    cp = self._frag_cache_path(seg_id, lod, j, tag)
+                    if cp:
+                        try:
+                            os.makedirs(self._cache_dir, exist_ok=True)
+                            raw.export(cp)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    meshes[j] = raw
+            elif need:
                 try:
                     got = self.cv.mesh.get(int(seg_id), lod=int(lod), concat=False)
                 except Exception as e:  # noqa: BLE001
@@ -348,7 +424,7 @@ class MeshLoader:
                 for j, fm in enumerate(frags):           # cache the WHOLE lod's fragments
                     raw = trimesh.Trimesh(vertices=np.asarray(fm.vertices, dtype=np.float64),
                                           faces=np.asarray(fm.faces, dtype=np.int64), process=False)
-                    cp = self._frag_cache_path(seg_id, lod, j)
+                    cp = self._frag_cache_path(seg_id, lod, j, tag)
                     if cp:
                         try:
                             os.makedirs(self._cache_dir, exist_ok=True)

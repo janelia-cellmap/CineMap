@@ -338,7 +338,9 @@ class RenderWorker:
                 sig = tuple(sorted(
                     (s, tuple(sorted((L, tuple(sorted(ix))) for L, ix in sel.items())))
                     for s, sel in seg_sel.items()))
-                uid = f"{m.mesh_name}_{hashlib.md5((ckey + '|' + str(sig)).encode()).hexdigest()[:10]}"
+                # `frag2` versions the per-chunk decoder: bump to invalidate combined chunk
+                # assets built before the manual-fragment fix (cloud-volume scattered them).
+                uid = f"{m.mesh_name}_{hashlib.md5((ckey + '|' + str(sig) + '|frag2').encode()).hexdigest()[:10]}"
                 per[m.mesh_name] = uid
                 if uid not in mesh_specs:
                     def _one(s, _ld=ld, _lc=lc, _sel=seg_sel):
