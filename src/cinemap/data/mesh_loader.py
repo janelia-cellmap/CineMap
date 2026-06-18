@@ -136,14 +136,15 @@ class MeshLoader:
             self._manual = False
             try:
                 seg = int(self.list_segments()[0])
-                ml = self._max_lod(seg)
-                if ml > 0:
-                    # a well-formed multi-LOD mesh has the SAME extent at every LOD.
-                    # This encoding makes cloud-volume scale each coarser LOD up, so the
-                    # coarsest is far bigger than the finest -> our cue to decode manually.
-                    v0 = np.asarray(self._cv_mesh(seg, 0).vertices); e0 = v0.max(0) - v0.min(0)
-                    vN = np.asarray(self._cv_mesh(seg, ml).vertices); eN = vN.max(0) - vN.min(0)
-                    self._manual = bool(np.any(eN > 1.5 * e0 + 1.0))
+                # Decode one segment's finest LOD both ways. cloud-volume mis-scales this
+                # encoding (draco stream carries the dequantization transform, so its
+                # points are already model-space); our manual decode follows the spec
+                # exactly. If they disagree (cloud-volume comes out larger), decode manually.
+                cv = np.asarray(self._cv_mesh(seg, 0).vertices)
+                mn = self._draco_manual(seg, 0).vertices
+                cve = cv.max(0) - cv.min(0)
+                mne = mn.max(0) - mn.min(0)
+                self._manual = bool(np.any(cve > 1.3 * mne + 1.0))
             except Exception:  # noqa: BLE001  (sharded / unreachable -> trust cloud-volume)
                 self._manual = False
         return self._manual
@@ -192,7 +193,9 @@ class MeshLoader:
         cache = None
         if self._cache_dir:
             import hashlib
-            key = hashlib.md5(f"{self.mesh_url}|{int(seg_id)}|{int(lod)}".encode()).hexdigest()
+            # `decode2` tags the decoder version: bumping it invalidates geometry cached
+            # by an older (buggy) decode so a re-render can't reuse stale meshes.
+            key = hashlib.md5(f"{self.mesh_url}|{int(seg_id)}|{int(lod)}|decode2".encode()).hexdigest()
             cache = os.path.join(self._cache_dir, f"{key}.ply")
             if os.path.exists(cache):
                 try:
