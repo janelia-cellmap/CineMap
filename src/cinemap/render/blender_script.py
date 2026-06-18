@@ -266,7 +266,13 @@ def _build_clip_nodes(nt, surf):
                    M("MULTIPLY", sep.outputs["Z"], wz))   # selected-axis world coord (BU)
     pos_v, side_v, on_v = V("cm_clip_pos", 0.0), V("cm_clip_side", 1.0), V("cm_clip_on", 0.0)
     signed = M("MULTIPLY", M("SUBTRACT", axc, pos_v), side_v)   # >0 on the hidden side
-    hide = M("MULTIPLY", M("GREATER_THAN", signed, 0.0), on_v)  # 1 -> transparent (gated)
+    clipped = M("MULTIPLY", M("GREATER_THAN", signed, 0.0), on_v)
+    # "Filled" cutaway: only the FRONT faces in the cut region are removed; the mesh's
+    # BACK faces there stay solid, so the camera sees the far interior wall capping the
+    # opening — a solid cross-section instead of a see-through hollow shell. (front =
+    # backfacing<0.5 -> 1 on front faces, 0 on back faces.)
+    front = M("LESS_THAN", geo.outputs["Backfacing"], 0.5)
+    hide = M("MULTIPLY", clipped, front)                        # 1 -> transparent
     transp = nt.nodes.new("ShaderNodeBsdfTransparent")
     mix = nt.nodes.new("ShaderNodeMixShader"); mix.name = "cm_clip_mix"
     nt.links.new(hide, mix.inputs[0])
