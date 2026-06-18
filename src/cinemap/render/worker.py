@@ -33,6 +33,19 @@ def _bu(p, nm_per_bu):
     return [c / nm_per_bu for c in p]
 
 
+def _clip_params(cl) -> dict | None:
+    """Normalize a layer's cutaway plane to a plain dict, or None if absent/disabled.
+    `cl` may be a ClipPlane model OR a plain dict (legacy), so read with getattr/get;
+    attribute access is required because a ClipPlane isn't subscriptable."""
+    if cl is None:
+        return None
+    g = cl.get if isinstance(cl, dict) else (lambda k, d=None: getattr(cl, k, d))
+    if not g("enabled", True):          # an explicitly-disabled plane -> no cutaway
+        return None
+    return {"axis": g("axis", "z"), "side": g("side", 1),
+            "normal": g("normal"), "position_nm": float(g("position_nm", 0.0))}
+
+
 class RenderWorker:
     # Hard ceiling on a layer's combined vertex count, regardless of mesh_detail —
     # keeps the worst case well under the GPUs' VRAM (~9 GB free on an 11 GB card).
@@ -86,7 +99,8 @@ class RenderWorker:
         # other, so the seams don't weld and the cap can't close (plus the surface cracks).
         # Whenever any layer has a clip plane, force ONE consistent LOD for the whole shot
         # so fragment boundaries line up and the cap fills cleanly.
-        if any(getattr(m, "clip", None) for kf in project.keyframes for m in kf.meshes):
+        if any(_clip_params(getattr(m, "clip", None))
+               for kf in project.keyframes for m in kf.meshes):
             self._lod_mode = "single"
         # non-destructive presentation pass (lighting rig / materials / DOF)
         self._auto_direct = bool(getattr(job.settings, "auto_direct", True))
@@ -475,12 +489,9 @@ class RenderWorker:
                     }
                     if is_hero and emph_glow > 0.0:
                         ov["emphasis"] = emph_glow       # brief emission glow on the hero
-                    cl = getattr(m, "clip", None)
+                    cl = _clip_params(getattr(m, "clip", None))
                     if cl:
-                        ov["clip"] = {"axis": cl["axis"], "side": cl["side"],
-                                      "normal": cl.get("normal"),
-                                      "position_nm": cl["position_nm"],
-                                      "position_bu": cl["position_nm"] / self.nm_per_bu}
+                        ov["clip"] = {**cl, "position_bu": cl["position_nm"] / self.nm_per_bu}
                         mesh_specs[uid]["clip"] = True   # geometric cutaway (slice + cap)
                     overrides[uid] = ov
             for an in fr.annotations:
