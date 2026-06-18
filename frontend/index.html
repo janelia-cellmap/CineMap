@@ -59,6 +59,12 @@
   .kf .lbl { font-weight:600; }
   .kf .meta { color:var(--mut); position:absolute; bottom:6px; left:6px; right:6px; }
   .kf .del { position:absolute; top:4px; right:6px; color:var(--mut); cursor:pointer; }
+  /* collapsed scan: one card with a couple peeking behind it, like a stack */
+  .kf.kfgroup { border-color:#5a5fcf; box-shadow:5px 5px 0 -1px #10161e, 6px 6px 0 -1px #5a5fcf, 10px 10px 0 -2px #10161e, 11px 11px 0 -2px #5a5fcf; margin-right:10px; }
+  .kf.kfgroup:hover { border-color:#8a8fff; }
+  .kf .stackbadge { position:absolute; top:4px; left:6px; background:#4a4fbf; color:#fff; border-radius:4px; padding:0 6px; font-size:11px; line-height:16px; z-index:3; box-shadow:0 1px 3px #0009; }
+  .kfgrouphdr { flex:0 0 22px; height:150px; display:flex; align-items:center; justify-content:center; gap:4px; writing-mode:vertical-rl; transform:rotate(180deg); font-size:11px; color:#aab0ff; cursor:pointer; border:1px dashed #5a5fcf; border-radius:6px; user-select:none; }
+  .kfgrouphdr:hover { background:#1a1d33; }
   .msg { font-size:12px; color:var(--mut); }
   /* hover the before/after strip -> big side-by-side overlay (see #lookZoom) */
   #lookCompare { cursor: zoom-in; }
@@ -388,32 +394,75 @@ function diffBadge(id) {
 }
 function openPropForKf(id) { ACTIVE_KF = id; openPropPanel(); }
 
-let LAST_KF_ID = null, KF_ORDER = [], THUMB_VER = {};
-function renderKeyframes(p) {
-  const tl = $('timeline');
-  LAST_KF_ID = p.keyframes.length ? p.keyframes[p.keyframes.length - 1].id : null;
-  KF_ORDER = p.keyframes.map(k => k.id);
-  $('kfCount').textContent = `${p.keyframes.length} frames`;
-  tl.innerHTML = p.keyframes.map((k,i) => {
-    // versioned URL: stable unless this thumbnail was just re-rendered, so the
-    // browser caches it instead of re-decoding every thumbnail on every reload
-    const bg = k.thumbnail_path
-      ? `background-image:url('/api/projects/${PID}/keyframes/${k.id}/thumbnail?v=${THUMB_VER[k.id]||0}');background-size:cover;background-position:center;`
-      : '';
-    return `
-    <div class="kf${k.thumbnail_path ? ' hasthumb' : ''}" draggable="true" data-id="${k.id}" style="${bg}"
+let LAST_KF_ID = null, KF_ORDER = [], THUMB_VER = {}, CUR = null, EXPANDED_GROUPS = new Set();
+function thumbBg(k) {
+  return k.thumbnail_path
+    ? `background-image:url('/api/projects/${PID}/keyframes/${k.id}/thumbnail?v=${THUMB_VER[k.id]||0}');background-size:cover;background-position:center;`
+    : '';
+}
+// one normal keyframe card (i = its global index, for the KF# label)
+function kfCard(k, i) {
+  return `
+    <div class="kf${k.thumbnail_path ? ' hasthumb' : ''}" draggable="true" data-id="${k.id}" style="${thumbBg(k)}"
          title="click to view · drag to reorder"
          onclick="gotoKf('${k.id}', this)"
-         ondragstart="kfDragStart(event,'${k.id}')"
-         ondragover="kfDragOver(event, this)"
-         ondragleave="this.classList.remove('drop')"
-         ondrop="kfDrop(event,'${k.id}')">
+         ondragstart="kfDragStart(event,'${k.id}')" ondragover="kfDragOver(event, this)"
+         ondragleave="this.classList.remove('drop')" ondrop="kfDrop(event,'${k.id}')">
       <span class="del" onclick="event.stopPropagation(); delKf('${k.id}')">✕</span>
       ${diffBadge(k.id)}
       <div class="lbl">⠿ KF${i} · ${k.label||''}</div>
       <div class="meta">${k.slices.map(s=>s.axis+'='+Math.round(s.position_nm)).join(' ')}<br>
         ${k.meshes.map(m=>m.mesh_name).join(',')||'—'}</div>
-    </div>`; }).join('') || '<span class="msg" style="padding:10px">no keyframes yet — Bake one from the scouting view</span>';
+    </div>`;
+}
+function renderKeyframes(p) {
+  CUR = p;
+  const tl = $('timeline');
+  LAST_KF_ID = p.keyframes.length ? p.keyframes[p.keyframes.length - 1].id : null;
+  KF_ORDER = p.keyframes.map(k => k.id);
+  const kfs = p.keyframes;
+  let html = '', i = 0, groups = 0;
+  while (i < kfs.length) {
+    const g = kfs[i].group;
+    if (g) {                                  // collect the consecutive run sharing this group
+      let j = i; while (j < kfs.length && kfs[j].group === g) j++;
+      const run = kfs.slice(i, j);
+      if (run.length > 1) {
+        groups++;
+        if (!EXPANDED_GROUPS.has(g)) {          // collapsed -> one stacked card
+          const mid = run[Math.floor(run.length/2)];
+          html += `
+          <div class="kf kfgroup${mid.thumbnail_path ? ' hasthumb' : ''}" style="${thumbBg(mid)}"
+               title="${run.length} frames — click to expand side by side" onclick="toggleGroup('${g}')">
+            <span class="del" onclick="event.stopPropagation(); delGroup('${g}')">✕</span>
+            <div class="stackbadge">▦ ${run.length}</div>
+            <div class="lbl">${kfs[i].group_label || 'scan'}</div>
+            <div class="meta">KF${i}–${j-1} · click to expand</div>
+          </div>`;
+        } else {                                // expanded -> collapse chip + each card
+          html += `<div class="kfgrouphdr" title="collapse" onclick="toggleGroup('${g}')">▾ ${kfs[i].group_label || 'scan'} · collapse</div>`;
+          run.forEach((k, r) => html += kfCard(k, i + r));
+        }
+        i = j; continue;
+      }
+    }
+    html += kfCard(kfs[i], i); i++;
+  }
+  $('kfCount').textContent = `${kfs.length} frames` + (groups ? ` · ${groups} scan${groups>1?'s':''}` : '');
+  tl.innerHTML = html || '<span class="msg" style="padding:10px">no keyframes yet — Bake one from the scouting view</span>';
+}
+function toggleGroup(g) {
+  if (EXPANDED_GROUPS.has(g)) EXPANDED_GROUPS.delete(g); else EXPANDED_GROUPS.add(g);
+  if (CUR) renderKeyframes(CUR);
+}
+async function delGroup(g) {
+  if (!CUR) return;
+  const ids = CUR.keyframes.filter(k => k.group === g).map(k => k.id);
+  if (!ids.length || !confirm(`Delete all ${ids.length} frames in this scan?`)) return;
+  const keep = KF_ORDER.filter(id => !ids.includes(id));  // reorder drops anything omitted
+  setStatus('deleting scan…');
+  await api('POST', `/api/projects/${PID}/keyframes/reorder`, { order: keep });
+  reload();
 }
 
 let DRAG_ID = null;

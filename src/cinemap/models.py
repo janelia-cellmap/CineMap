@@ -132,6 +132,10 @@ class Keyframe(BaseModel):
     easing: Literal["linear", "ease-in-out"] = "ease-in-out"
     ng_state: Optional[dict] = None  # originating scouting state (round-trip)
     thumbnail_path: Optional[str] = None
+    # keyframes produced together by a generated move (plane scan, orbit, …) share a
+    # group id + label so the timeline can collapse them into one stacked card.
+    group: Optional[str] = None
+    group_label: str = ""
 
 
 class RenderSettings(BaseModel):

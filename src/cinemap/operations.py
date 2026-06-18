@@ -309,6 +309,7 @@ def make_orbit(project: Project, degrees: float = 360.0, n: int = 12,
         dy = base.camera.position_nm[1] - target[1]
         if dx or dy:
             az0 = math.degrees(math.atan2(dy, dx))
+    gid = _uid("grp"); glabel = f"orbit {int(degrees)}° ×{n}"
     new = []
     for i in range(n):
         az = az0 + degrees * i / max(1, n - 1)
@@ -318,6 +319,7 @@ def make_orbit(project: Project, degrees: float = 360.0, n: int = 12,
             slices=[s.model_copy() for s in (base.slices if base else [])],
             meshes=[m.model_copy() for m in (base.meshes if base else [])],
             duration_in_s=duration_per_kf_s,
+            group=gid, group_label=glabel,
         )
         new.append(kf)
     project.keyframes.extend(new)
@@ -420,6 +422,8 @@ def plane_move(project: Project, axis: str = "z", mode: str = "slice",
         def point_at(t):  # axis-aligned: move the axis coord, keep the camera focus elsewhere
             p = list(focus); p[ax_i] = a + (b - a) * t; return p
 
+    gid = _uid("grp")   # shared group so the timeline collapses the scan to one card
+    glabel = f"{mode} scan {axis}{' (oblique)' if normal else ''} ×{n}"
     new = []
     for i in range(n):
         t = i / max(1, n - 1)
@@ -440,6 +444,7 @@ def plane_move(project: Project, axis: str = "z", mode: str = "slice",
             id=_uid("kf"), label=f"{mode} {axis}={int(offset)}nm{' (oblique)' if normal else ''}",
             camera=base.camera.model_copy(), slices=slices,
             meshes=meshes, duration_in_s=duration_per_kf_s,
+            group=gid, group_label=glabel,
         ))
     project.keyframes.extend(new)
     store.save(project)
