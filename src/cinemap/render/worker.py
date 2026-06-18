@@ -187,7 +187,10 @@ class RenderWorker:
         cached asset."""
         import hashlib
 
-        sig = ",".join(map(str, sorted(ids))) + "|" + str(color_key) + "|" + self._lod_tag_for(nmpp)
+        # `decode2` versions the mesh decoder: bump it to invalidate combined-layer assets
+        # cached from an older (buggy) decode so a re-render can't reuse stale geometry.
+        sig = (",".join(map(str, sorted(ids))) + "|" + str(color_key) + "|"
+               + self._lod_tag_for(nmpp) + "|decode2")
         return f"{mesh_name}_{hashlib.md5(sig.encode()).hexdigest()[:8]}"
 
     @staticmethod
