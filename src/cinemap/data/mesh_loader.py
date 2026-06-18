@@ -157,30 +157,29 @@ class MeshLoader:
         return m[seg_id] if isinstance(m, dict) else m
 
     def _draco_manual(self, seg_id: int) -> trimesh.Trimesh:
-        """Decode an unsharded multilod mesh whose draco points are already in model
-        space: vertex = grid_origin + fragment_position*chunk_shape + points (finest LOD).
-        Avoids cloud-volume's double-scaling for this encoding."""
+        """Decode an unsharded multilod mesh whose draco points are already in absolute
+        model space (grid_origin-relative): vertex = grid_origin + points, over the
+        finest LOD's fragments. Avoids cloud-volume's double-scaling for this encoding."""
         import struct
 
         import DracoPy
         idx = urllib.request.urlopen(_http(f"{self.mesh_url}/{int(seg_id)}.index"), timeout=30).read()
-        o = 0
-        cs = np.array(struct.unpack("<3f", idx[o:o + 12])); o += 12
+        o = 12                                                 # skip chunk_shape (unused here)
         go = np.array(struct.unpack("<3f", idx[o:o + 12])); o += 12
         nl = struct.unpack("<I", idx[o:o + 4])[0]; o += 4
         o += 4 * nl + 12 * nl                                  # lod_scales + vertex_offsets
         nfrag = struct.unpack(f"<{nl}I", idx[o:o + 4 * nl]); o += 4 * nl
         data = urllib.request.urlopen(_http(f"{self.mesh_url}/{int(seg_id)}"), timeout=120).read()
         n = nfrag[0]                                           # finest LOD = first in the file
-        fpos = np.array(struct.unpack(f"<{3 * n}I", idx[o:o + 12 * n])).reshape(3, n).T; o += 12 * n
-        fsz = np.array(struct.unpack(f"<{n}I", idx[o:o + 4 * n])); o += 4 * n
+        o += 12 * n                                            # skip fragment_positions
+        fsz = struct.unpack(f"<{n}I", idx[o:o + 4 * n]); o += 4 * n
         dp = 0; V = []; F = []; nv = 0
         for i in range(n):
             b = data[dp:dp + fsz[i]]; dp += fsz[i]
             if not fsz[i]:
                 continue
             mm = DracoPy.decode(b)
-            v = go + fpos[i] * cs + np.asarray(mm.points, float)   # points already model-space
+            v = go + np.asarray(mm.points, float)              # points are grid-origin-relative
             f = np.asarray(mm.faces, np.int64) + nv
             V.append(v); F.append(f); nv += len(v)
         return trimesh.Trimesh(vertices=np.vstack(V), faces=np.vstack(F), process=False)
