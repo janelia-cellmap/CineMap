@@ -511,7 +511,16 @@ def _import_meshes(scene_spec: dict) -> dict:
             # geometric cutaway: keep a pristine copy of the geometry; each frame we
             # rebuild the object as this mesh sliced at the clip plane and capped (filled
             # cross-section) — a true solid cut, not a shader transparency trick.
-            _orig_mesh[obj.name] = obj.data.copy()
+            # The cap needs CLOSED cut loops, but draco fragments are concatenated unwelded
+            # (process=False) -> ~1000s of open seam edges -> the slice produces open loops
+            # and triangle_fill can't cap (looks like no cap). Weld the pristine copy ONCE
+            # here (cheap, not per frame) so every slice yields watertight cross-sections.
+            import bmesh
+            orig = obj.data.copy()
+            bmw = bmesh.new(); bmw.from_mesh(orig)
+            bmesh.ops.remove_doubles(bmw, verts=bmw.verts[:], dist=1e-3)
+            bmw.to_mesh(orig); bmw.free()
+            _orig_mesh[obj.name] = orig
         if out_node is not None:
             nt.links.new(surf, out_node.inputs["Surface"])
 
