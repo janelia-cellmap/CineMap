@@ -12,7 +12,7 @@ import urllib.request
 from ..models import EMSource, Manifest, MeshSource
 
 _MESH_PREFIXES = ("zarr://", "zarr2://", "n5://", "precomputed://")
-_VOLUME_FMTS = (None, "zarr", "zarr2", "zarr3", "n5")  # sliceable label/EM volumes
+_VOLUME_FMTS = ("zarr", "zarr2", "zarr3", "n5")  # sliceable label/EM volume formats
 _pre_role_cache: dict[str, str] = {}
 
 
@@ -66,6 +66,12 @@ def _clean_url(u: str) -> tuple[str, str | None, str]:
         tail = tail.rstrip(":")
         if tail:
             fmt = tail
+    # A bare URL (no explicit driver) is what neuroglancer infers from the data: a
+    # `.zarr`/`.n5` path is a sliceable volume, anything else is precomputed (and may
+    # be a mesh/skeleton source — e.g. a layer's 2nd source is its multires meshes).
+    if fmt is None:
+        low = u.lower()
+        fmt = "n5" if ".n5" in low else "zarr" if ".zarr" in low else "precomputed"
     # zarr/n5 sources are volumes; precomputed sources are classified by their info.
     role = "volume" if fmt in _VOLUME_FMTS else _precomputed_role(u)
     return u, fmt, role
