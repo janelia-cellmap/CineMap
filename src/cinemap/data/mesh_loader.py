@@ -74,6 +74,7 @@ class MeshLoader:
         self.parent, self.subdir = (
             self.mesh_url.rsplit("/", 1) if "/" in self.mesh_url else ("", self.mesh_url))
         self._cv = None
+        self._manual = None   # lazily: does this source need our model-space draco decode?
         # persistent on-disk cache of RAW (uncolored) per-(segment, LOD) geometry,
         # keyed by (mesh_url, seg, lod) — so re-rendering at a different quality/zoom
         # only downloads the genuinely-new finer LODs and reuses the rest.
@@ -119,6 +120,71 @@ class MeshLoader:
     def list_segments(self) -> tuple[int, ...]:
         return tuple(_segment_ids(self.mesh_url)) if self.mesh_url else ()
 
+    def _manifest_bits(self) -> int:
+        try:
+            return int(self.cv.mesh.meta.info.get("vertex_quantization_bits", 16))
+        except Exception:  # noqa: BLE001
+            return 16
+
+    def _needs_manual_decode(self) -> bool:
+        """Some multilod exports bake the dequantization transform into the draco stream,
+        so the decoded points are already in model space (range ~chunk_shape) instead of
+        the standard integer range [0, 2^bits). cloud-volume assumes integers and re-scales
+        by chunk_shape -> double-scaling that balloons coarse LODs. Detect it by sampling
+        one fragment: points beyond the quantization range mean it's the model-space kind."""
+        if self._manual is None:
+            self._manual = False
+            try:
+                seg = int(self.list_segments()[0])
+                ml = self._max_lod(seg)
+                if ml > 0:
+                    # a well-formed multi-LOD mesh has the SAME extent at every LOD.
+                    # This encoding makes cloud-volume scale each coarser LOD up, so the
+                    # coarsest is far bigger than the finest -> our cue to decode manually.
+                    v0 = np.asarray(self._cv_mesh(seg, 0).vertices); e0 = v0.max(0) - v0.min(0)
+                    vN = np.asarray(self._cv_mesh(seg, ml).vertices); eN = vN.max(0) - vN.min(0)
+                    self._manual = bool(np.any(eN > 1.5 * e0 + 1.0))
+            except Exception:  # noqa: BLE001  (sharded / unreachable -> trust cloud-volume)
+                self._manual = False
+        return self._manual
+
+    def _cv_mesh(self, seg_id: int, lod: int = 0):
+        """Raw cloud-volume mesh for a segment at a LOD (no manual-decode dispatch)."""
+        try:
+            m = self.cv.mesh.get(int(seg_id), lod=lod) if lod else self.cv.mesh.get(int(seg_id))
+        except TypeError:  # source has no LOD support
+            m = self.cv.mesh.get(int(seg_id))
+        return m[seg_id] if isinstance(m, dict) else m
+
+    def _draco_manual(self, seg_id: int) -> trimesh.Trimesh:
+        """Decode an unsharded multilod mesh whose draco points are already in model
+        space: vertex = grid_origin + fragment_position*chunk_shape + points (finest LOD).
+        Avoids cloud-volume's double-scaling for this encoding."""
+        import struct
+
+        import DracoPy
+        idx = urllib.request.urlopen(_http(f"{self.mesh_url}/{int(seg_id)}.index"), timeout=30).read()
+        o = 0
+        cs = np.array(struct.unpack("<3f", idx[o:o + 12])); o += 12
+        go = np.array(struct.unpack("<3f", idx[o:o + 12])); o += 12
+        nl = struct.unpack("<I", idx[o:o + 4])[0]; o += 4
+        o += 4 * nl + 12 * nl                                  # lod_scales + vertex_offsets
+        nfrag = struct.unpack(f"<{nl}I", idx[o:o + 4 * nl]); o += 4 * nl
+        data = urllib.request.urlopen(_http(f"{self.mesh_url}/{int(seg_id)}"), timeout=120).read()
+        n = nfrag[0]                                           # finest LOD = first in the file
+        fpos = np.array(struct.unpack(f"<{3 * n}I", idx[o:o + 12 * n])).reshape(3, n).T; o += 12 * n
+        fsz = np.array(struct.unpack(f"<{n}I", idx[o:o + 4 * n])); o += 4 * n
+        dp = 0; V = []; F = []; nv = 0
+        for i in range(n):
+            b = data[dp:dp + fsz[i]]; dp += fsz[i]
+            if not fsz[i]:
+                continue
+            mm = DracoPy.decode(b)
+            v = go + fpos[i] * cs + np.asarray(mm.points, float)   # points already model-space
+            f = np.asarray(mm.faces, np.int64) + nv
+            V.append(v); F.append(f); nv += len(v)
+        return trimesh.Trimesh(vertices=np.vstack(V), faces=np.vstack(F), process=False)
+
     def _draco(self, seg_id: int, lod: int = 0) -> trimesh.Trimesh:
         """Precomputed mesh for `seg_id` at level-of-detail `lod` (0 = finest).
         Falls back to the finest mesh if the source isn't multi-resolution. Raw
@@ -133,11 +199,15 @@ class MeshLoader:
                     return trimesh.load(cache, process=False)
                 except Exception:  # noqa: BLE001  (corrupt cache entry -> re-fetch)
                     pass
-        try:
-            m = self.cv.mesh.get(int(seg_id), lod=lod) if lod else self.cv.mesh.get(int(seg_id))
-        except TypeError:  # source has no LOD support -> finest only
-            m = self.cv.mesh.get(int(seg_id))
-        mesh = m[seg_id] if isinstance(m, dict) else m
+        if self._needs_manual_decode():
+            out = self._draco_manual(seg_id)   # always finest LOD (correct + consistent)
+            if cache:
+                try:
+                    os.makedirs(self._cache_dir, exist_ok=True); out.export(cache)
+                except Exception:  # noqa: BLE001
+                    pass
+            return out
+        mesh = self._cv_mesh(seg_id, lod)
         out = trimesh.Trimesh(
             vertices=np.asarray(mesh.vertices, dtype=np.float64),
             faces=np.asarray(mesh.faces, dtype=np.int64),
