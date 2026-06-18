@@ -584,7 +584,7 @@ function toggleClaude() {
 }
 async function addKeyframe() { if(!PID)return; await api('POST', `/api/projects/${PID}/keyframes`); reload(); }
 async function delKf(id)     { await api('DELETE', `/api/projects/${PID}/keyframes/${id}`); reload(); }
-async function orbit()       { if(!PID)return; setStatus('adding orbit…'); await api('POST', `/api/projects/${PID}/orbit`, {degrees:360,n:12}); reload(); setStatus('orbit added'); }
+async function orbit()       { if(!PID)return; setStatus('adding orbit…'); const r = await api('POST', `/api/projects/${PID}/orbit`, {degrees:360,n:12}); await reload(); if (r.thumb_id) renderThumbnail(r.thumb_id); setStatus('orbit added'); }
 async function openPlanePanel() {
   if(!PID) return;
   $('lookPanel').style.display='none'; $('propPanel').style.display='none';
@@ -617,7 +617,9 @@ async function applyPlaneScan() {
   $('planeMsg').textContent = 'adding…';
   const r = await api('POST', `/api/projects/${PID}/plane_move`, body);
   $('planeMsg').textContent = `added ${r.added} frames` + (oblique ? ' (oblique)' : '');
-  reload();
+  await reload();
+  // render the representative (middle) frame so the collapsed/stacked scan card isn't blank
+  if (r.thumb_id) renderThumbnail(r.thumb_id);
 }
 
 let JOB = null;

@@ -433,25 +433,34 @@ def reorder_keyframes(pid: str, req: ReorderReq):
     return {"ok": True, "count": len(p.keyframes)}
 
 
+def _scan_resp(kfs):
+    """Response for a generated scan/orbit. Also names the representative (middle)
+    keyframe so the client can render just that one thumbnail — the collapsed/stacked
+    timeline card shows the middle frame, so without this a fresh scan's card is blank."""
+    mid = kfs[len(kfs) // 2] if kfs else None
+    return {"added": len(kfs), "group": getattr(mid, "group", None),
+            "thumb_id": getattr(mid, "id", None)}
+
+
 @app.post("/api/projects/{pid}/orbit")
 def orbit(pid: str, req: OrbitReq):
     p = store.load(pid)
     kfs = ops.make_orbit(p, degrees=req.degrees, n=req.n, elevation_deg=req.elevation_deg)
-    return {"added": len(kfs)}
+    return _scan_resp(kfs)
 
 
 @app.post("/api/projects/{pid}/sweep_slice")
 def sweep(pid: str, req: SweepReq):
     p = store.load(pid)
     kfs = ops.sweep_slice(p, axis=req.axis, n=req.n)
-    return {"added": len(kfs)}
+    return _scan_resp(kfs)
 
 
 @app.post("/api/projects/{pid}/sweep_clip")
 def sweep_clip(pid: str, req: SweepClipReq):
     p = store.load(pid)
     kfs = ops.sweep_clip(p, mesh_name=req.mesh_name, axis=req.axis, n=req.n, side=req.side)
-    return {"added": len(kfs)}
+    return _scan_resp(kfs)
 
 
 @app.post("/api/projects/{pid}/plane_move")
@@ -461,7 +470,7 @@ def plane_move(pid: str, req: PlaneMoveReq):
                          stop_nm=req.stop_nm, from_xyz=req.from_xyz, to_xyz=req.to_xyz,
                          from_ng=req.from_ng, to_ng=req.to_ng,
                          n=req.n, mesh_name=req.mesh_name, side=req.side)
-    return {"added": len(kfs)}
+    return _scan_resp(kfs)
 
 
 # ----------------------------- render -----------------------------
