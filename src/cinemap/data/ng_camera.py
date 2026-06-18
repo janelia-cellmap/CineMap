@@ -69,6 +69,18 @@ def _voxel_nm_from_state(state: dict, fallback):
     return out if len(out) >= 3 else fallback
 
 
+def handedness_flipped(state: dict) -> bool:
+    """True when the NG->xyz axis permutation is a reflection (odd), e.g. a z,y,x view.
+    Reordering the camera to xyz then flips image chirality vs neuroglancer, so the
+    render must reintroduce the reflection (a mirrored camera matrix) to match NG."""
+    p = list(_xyz_perm(state))
+    swaps = 0
+    for i in range(len(p)):
+        while p[i] != i:
+            j = p[i]; p[i], p[j] = p[j], p[i]; swaps += 1
+    return swaps % 2 == 1
+
+
 def ng_to_camera(state: dict, voxel_nm, fov_deg: float = NG_FOV_DEG) -> Camera:
     perm = _xyz_perm(state)
     voxel_nm = _voxel_nm_from_state(state, voxel_nm)

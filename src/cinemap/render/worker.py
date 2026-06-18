@@ -481,6 +481,7 @@ class RenderWorker:
                     "look_at_bu": _bu(fr.look_at_nm, self.nm_per_bu),
                     "fov_rad": math.radians(fr.fov_deg),
                     "up": fr.up,
+                    "flip_handed": self._flip_handed,
                 },
                 "slices": slices,
                 "mesh_overrides": overrides,
@@ -566,6 +567,12 @@ class RenderWorker:
             a, b = self.job.kf_range
             kfs = kfs[a : b + 1]
         self._kfs = kfs   # the exact keyframes these frames came from (for the director)
+        # Whether this dataset's NG axis order is a reflection (e.g. z,y,x): the camera
+        # is reordered to xyz, which flips image chirality, so the render mirrors the
+        # camera to match neuroglancer. Constant per dataset -> read once from any kf.
+        from ..data.ng_camera import handedness_flipped
+        st0 = next((k.ng_state for k in self.project.keyframes if k.ng_state), None)
+        self._flip_handed = bool(st0 and handedness_flipped(st0))
         self._progress(0.05, "interpolating keyframes")
         # Timing matches neuroglancer's video_tool exactly (per-transition frame counts
         # and t-values). NG interpolates LINEARLY (constant velocity), so we default to

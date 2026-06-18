@@ -642,7 +642,15 @@ def _set_camera(frame: dict) -> None:
     y = up - up.dot(z) * z                           # up, orthogonalized to z
     y = y.normalized() if y.length > 1e-9 else Vector((0.0, 0.0, 1.0))
     x = y.cross(z)                                    # right (right-handed: x = y × z)
-    cam.rotation_euler = Matrix((x, y, z)).transposed().to_euler()
+    if frame["camera"].get("flip_handed"):
+        # z,y,x datasets: reordering the camera to xyz reflects chirality, so mirror the
+        # camera (negated right -> det -1 matrix) to reproduce neuroglancer's view. A
+        # reflection isn't a rotation, so set matrix_world directly (rotation_euler can't).
+        basis = Matrix((-x, y, z)).transposed()
+        m = basis.to_4x4(); m.translation = cam.location
+        cam.matrix_world = m
+    else:
+        cam.rotation_euler = Matrix((x, y, z)).transposed().to_euler()
     # subtle depth-of-field on the framed subject: focus at the look-at (what
     # neuroglancer centered on). Faithful — only far/near context softens slightly.
     dof = frame["camera"].get("dof")
