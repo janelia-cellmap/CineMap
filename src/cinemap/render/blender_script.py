@@ -574,13 +574,21 @@ def _geometric_clip(obj, clip) -> None:
                                      plane_co=co, plane_no=n * side, clear_outer=True)
         cut = [e for e in res.get("geom_cut", []) if isinstance(e, bmesh.types.BMEdge)]
         if cut:
-            # the cut edges are coplanar (the clip plane) -> triangle_fill caps the whole
-            # cross-section, handling multiple/concave loops; holes_fill is a fallback.
+            # Cap the cross-section by filling each cut boundary loop INDEPENDENTLY.
+            # holes_fill closes every loop (one face per loop) -> a complete, watertight
+            # cap even with many separate, concave cells. (triangle_fill does ONE global 2D
+            # triangulation of all loops at once and leaves big gaps when there are many
+            # complex cross-sections — the torn/partial caps.) Then triangulate the new cap
+            # faces so concave n-gons shade cleanly.
             try:
-                bmesh.ops.triangle_fill(bm, edges=cut, use_beauty=True, normal=n * side)
-            except Exception:  # noqa: BLE001
+                before = set(bm.faces)
+                bmesh.ops.holes_fill(bm, edges=cut, sides=0)
+                newf = [f for f in bm.faces if f not in before]
+                if newf:
+                    bmesh.ops.triangulate(bm, faces=newf)
+            except Exception:  # noqa: BLE001 (degenerate loop -> fall back to global fill)
                 try:
-                    bmesh.ops.holes_fill(bm, edges=cut, sides=0)
+                    bmesh.ops.triangle_fill(bm, edges=cut, use_beauty=True, normal=n * side)
                 except Exception:  # noqa: BLE001
                     pass
         bm.normal_update()
