@@ -74,7 +74,7 @@ class RenderWorker:
         # setting can't recreate the multi-GB mesh that stalled asset prep / OOM'd the
         # GPU. The OOM-retry loop in run() halves this and rebuilds if Cycles runs out.
         detail = max(0.25, min(float(getattr(job.settings, "mesh_detail", 1.0) or 1.0), 8.0))
-        base_budget = 1_200_000 if draft else 5_000_000
+        base_budget = 3_000_000 if draft else 5_000_000
         self._mesh_budget = min(int(base_budget * detail), self.MESH_BUDGET_CEILING)
         self._nm_per_px = None  # finest on-screen scale across frames (set per build)
         # mesh LOD strategy: "single" (one build), "frame" (per-frame adaptive, like
