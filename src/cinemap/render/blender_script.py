@@ -518,7 +518,16 @@ def _import_meshes(scene_spec: dict) -> dict:
             import bmesh
             orig = obj.data.copy()
             bmw = bmesh.new(); bmw.from_mesh(orig)
+            # Weld coincident seam vertices at a tight tolerance — larger ones collapse
+            # thin neurites and CREATE boundary edges, so this is intentionally small.
             bmesh.ops.remove_doubles(bmw, verts=bmw.verts[:], dist=1e-3)
+            # Then close any tiny leftover artifact holes (a few stray boundary edges) so
+            # the cross-section is fully watertight and caps solid even where pieces nearly
+            # meet. Genuine large openings have many edges and are left alone.
+            try:
+                bmesh.ops.holes_fill(bmw, edges=bmw.edges[:], sides=8)
+            except Exception:  # noqa: BLE001
+                pass
             bmw.to_mesh(orig); bmw.free()
             _orig_mesh[obj.name] = orig
         if out_node is not None:

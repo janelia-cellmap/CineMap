@@ -81,6 +81,13 @@ class RenderWorker:
         # neuroglancer; free on orbits), or "chunk" (per-chunk spatial — not yet
         # implemented, treated as "frame").
         self._lod_mode = getattr(job.settings, "lod_mode", "frame") or "frame"
+        # A cutaway needs a watertight cross-section to cap. Mixed LODs (per-chunk, and
+        # per-frame's zoom buckets) place non-matching fragment boundaries next to each
+        # other, so the seams don't weld and the cap can't close (plus the surface cracks).
+        # Whenever any layer has a clip plane, force ONE consistent LOD for the whole shot
+        # so fragment boundaries line up and the cap fills cleanly.
+        if any(getattr(m, "clip", None) for kf in project.keyframes for m in kf.meshes):
+            self._lod_mode = "single"
         # non-destructive presentation pass (lighting rig / materials / DOF)
         self._auto_direct = bool(getattr(job.settings, "auto_direct", True))
 
