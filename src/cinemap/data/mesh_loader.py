@@ -156,10 +156,11 @@ class MeshLoader:
             m = self.cv.mesh.get(int(seg_id))
         return m[seg_id] if isinstance(m, dict) else m
 
-    def _draco_manual(self, seg_id: int) -> trimesh.Trimesh:
-        """Decode an unsharded multilod mesh whose draco points are already in absolute
-        model space (grid_origin-relative): vertex = grid_origin + points, over the
-        finest LOD's fragments. Avoids cloud-volume's double-scaling for this encoding."""
+    def _draco_manual(self, seg_id: int, lod: int = 0) -> trimesh.Trimesh:
+        """Decode one LOD of an unsharded multilod mesh whose draco points are already in
+        absolute model space (grid_origin-relative): vertex = grid_origin + points. The
+        same formula holds at every LOD (coarser LODs are simply lower-poly), so this
+        supports LOD selection; avoids cloud-volume's double-scaling for this encoding."""
         import struct
 
         import DracoPy
@@ -170,18 +171,18 @@ class MeshLoader:
         o += 4 * nl + 12 * nl                                  # lod_scales + vertex_offsets
         nfrag = struct.unpack(f"<{nl}I", idx[o:o + 4 * nl]); o += 4 * nl
         data = urllib.request.urlopen(_http(f"{self.mesh_url}/{int(seg_id)}"), timeout=120).read()
-        n = nfrag[0]                                           # finest LOD = first in the file
-        o += 12 * n                                            # skip fragment_positions
-        fsz = struct.unpack(f"<{n}I", idx[o:o + 4 * n]); o += 4 * n
+        want = min(max(int(lod), 0), nl - 1)
         dp = 0; V = []; F = []; nv = 0
-        for i in range(n):
-            b = data[dp:dp + fsz[i]]; dp += fsz[i]
-            if not fsz[i]:
-                continue
-            mm = DracoPy.decode(b)
-            v = go + np.asarray(mm.points, float)              # points are grid-origin-relative
-            f = np.asarray(mm.faces, np.int64) + nv
-            V.append(v); F.append(f); nv += len(v)
+        for cur in range(nl):                                  # fragments are stored LOD0..LODn
+            n = nfrag[cur]
+            o += 12 * n                                        # skip fragment_positions
+            fsz = struct.unpack(f"<{n}I", idx[o:o + 4 * n]); o += 4 * n
+            for i in range(n):
+                b = data[dp:dp + fsz[i]]; dp += fsz[i]
+                if cur == want and fsz[i]:
+                    mm = DracoPy.decode(b)
+                    V.append(go + np.asarray(mm.points, float))  # grid-origin-relative
+                    F.append(np.asarray(mm.faces, np.int64) + nv); nv += len(mm.points)
         return trimesh.Trimesh(vertices=np.vstack(V), faces=np.vstack(F), process=False)
 
     def _draco(self, seg_id: int, lod: int = 0) -> trimesh.Trimesh:
@@ -199,7 +200,7 @@ class MeshLoader:
                 except Exception:  # noqa: BLE001  (corrupt cache entry -> re-fetch)
                     pass
         if self._needs_manual_decode():
-            out = self._draco_manual(seg_id)   # always finest LOD (correct + consistent)
+            out = self._draco_manual(seg_id, lod)   # correct decode at the requested LOD
             if cache:
                 try:
                     os.makedirs(self._cache_dir, exist_ok=True); out.export(cache)
