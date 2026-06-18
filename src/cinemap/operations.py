@@ -358,9 +358,32 @@ def _dominant_axis(normal) -> str:
     return ["x", "y", "z"][max(range(3), key=lambda i: abs(normal[i]))]
 
 
+def _ng_coords_to_nm(base: Keyframe, project: Project, axis: str,
+                     from_ng, to_ng):
+    """Convert neuroglancer-unit coords (as shown in NG, in its dimension order) to nm,
+    using the base keyframe's NG grid. A triple -> an (x,y,z) nm point; a single value
+    -> a scalar depth (nm) along `axis`. Returns (from_xyz, to_xyz, start_nm, stop_nm)."""
+    from .data.ng_camera import _voxel_nm_from_state, _xyz_perm
+    st = base.ng_state or {}
+    vox = _voxel_nm_from_state(st, project.manifest.voxel_size_nm)  # nm/unit, dim order
+    perm = _xyz_perm(st)
+
+    def pt(vals):
+        scaled = [float(vals[i]) * vox[i] for i in range(3)]        # dim order -> nm
+        return [scaled[perm[0]], scaled[perm[1]], scaled[perm[2]]]  # -> x, y, z
+
+    if from_ng and to_ng and len(from_ng) >= 3 and len(to_ng) >= 3:
+        return pt(from_ng), pt(to_ng), None, None
+    sc = vox[perm[{"x": 0, "y": 1, "z": 2}[axis]]]                  # nm/unit on this axis
+    a = float(from_ng[0]) * sc if from_ng else None
+    b = float(to_ng[0]) * sc if to_ng else None
+    return None, None, a, b
+
+
 def plane_move(project: Project, axis: str = "z", mode: str = "slice",
                start_nm: float | None = None, stop_nm: float | None = None,
                from_xyz: list[float] | None = None, to_xyz: list[float] | None = None,
+               from_ng: list[float] | None = None, to_ng: list[float] | None = None,
                n: int = 12, mesh_name: str | None = None, side: int = 1,
                duration_per_kf_s: float = 0.4) -> list[Keyframe]:
     """Lay down keyframes for a plane scanning from a start to a stop with the camera
@@ -373,6 +396,8 @@ def plane_move(project: Project, axis: str = "z", mode: str = "slice",
     base = project.keyframes[-1] if project.keyframes else None
     if base is None:
         raise ValueError("plane_move needs an existing keyframe to scan from")
+    if from_ng is not None or to_ng is not None:   # neuroglancer-unit coords -> nm
+        from_xyz, to_xyz, start_nm, stop_nm = _ng_coords_to_nm(base, project, axis, from_ng, to_ng)
     do_slice, do_cull = mode in ("slice", "both"), mode in ("cull", "both")
     em_name = project.manifest.em.name if project.manifest.em else "em"
 
