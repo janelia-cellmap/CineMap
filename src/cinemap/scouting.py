@@ -177,13 +177,15 @@ def _annotations_from_view(project: Project, st: dict) -> list[AnnotationInstanc
     the serialized state. Layers backed only by a precomputed source (no inline
     `annotations`) are skipped for now."""
     from .data import annotations as _ann
+    from .data.ng_camera import _voxel_nm_from_state, _xyz_perm
 
-    vox = project.manifest.voxel_size_nm
+    vox = _voxel_nm_from_state(st, project.manifest.voxel_size_nm)  # NG grid, dim order
+    perm = _xyz_perm(st)
     out: list[AnnotationInstance] = []
     for layer in st.get("layers", []):
         if layer.get("type") != "annotation":
             continue
-        prims = _ann.parse_inline(layer, vox)
+        prims = _ann.parse_inline(layer, vox, perm)
         if not _ann.has_geometry(prims):
             continue
         out.append(AnnotationInstance(
