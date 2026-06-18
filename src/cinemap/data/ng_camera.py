@@ -51,8 +51,27 @@ def _xyz_perm(state: dict) -> list[int]:
     return [idx("x", 0), idx("y", 1), idx("z", 2)]
 
 
+_UNIT_TO_NM = {"m": 1e9, "cm": 1e7, "mm": 1e6, "um": 1e3, "µm": 1e3, "nm": 1.0, "pm": 1e-3}
+
+
+def _voxel_nm_from_state(state: dict, fallback):
+    """Voxel size (nm) per NG dimension, in the state's dimension order. The NG
+    `position` is in these units, so this is the authoritative scale — the manifest's
+    voxel size can differ from the units a given neuroglancer view is displayed in
+    (e.g. a 16 nm EM shown on a 1 nm grid), which would scale the camera wrong."""
+    dims = state.get("dimensions") or {}
+    out = []
+    for spec in dims.values():
+        try:
+            out.append(float(spec[0]) * _UNIT_TO_NM.get(spec[1], 1e9))
+        except (TypeError, IndexError, ValueError):
+            return fallback
+    return out if len(out) >= 3 else fallback
+
+
 def ng_to_camera(state: dict, voxel_nm, fov_deg: float = NG_FOV_DEG) -> Camera:
     perm = _xyz_perm(state)
+    voxel_nm = _voxel_nm_from_state(state, voxel_nm)
     pos_vox = np.array(state.get("position") or [0, 0, 0], dtype=float)
     # position & voxel are in NG dimension order; multiply elementwise, then reorder to xyz
     look_at = (pos_vox * _vox(voxel_nm))[perm]
@@ -83,7 +102,7 @@ def camera_to_ng(camera: Camera, voxel_nm, base_state: dict | None = None) -> di
     perm = _xyz_perm(state)
     inv = list(np.argsort(perm))            # reorder an (x,y,z) vector back to NG dim order
     look_at = np.array(camera.look_at_nm, dtype=float)   # xyz
-    vox = _vox(voxel_nm)                     # NG dimension order
+    vox = _vox(_voxel_nm_from_state(state, voxel_nm))    # NG dimension order
     state["position"] = (look_at[inv] / vox).tolist()    # xyz -> dim order, then to voxels
 
     fwd = look_at - np.array(camera.position_nm, dtype=float)
