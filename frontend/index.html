@@ -286,6 +286,7 @@
   </div>
   <label class="msg" title="How long the scan/cutaway takes on screen. Frames are filled in automatically from this and the fps — you set time, not frame count.">Duration (s)</label>
   <input id="planeDur" type="number" min="0.1" step="0.1" value="4" style="width:100%">
+  <label class="chk" title="Ping-pong: sweep from start to end, then back — e.g. cut in to reveal, then close back up. Same duration."><input id="planeMirror" type="checkbox"> mirror (forward + back)</label>
   <div style="margin-top:8px"><button class="primary" onclick="applyPlaneScan()"><span id="planeAddLbl">Add scan</span></button> <span id="planeMsg" class="msg"></span></div>
   <div class="msg" style="margin-top:2px">Tip: copy a position straight from neuroglancer. A single value scans along the axis; a full <b>x,y,z</b> in <i>both</i> boxes = an <b>oblique</b> scan along that line (axis ignored). Converted to nm via this view's grid.</div>
 </div>
@@ -309,6 +310,7 @@
     <option value="ease-in-out">ease in-out (smooth start/stop)</option>
     <option value="ease-in">ease in</option><option value="ease-out">ease out</option>
   </select>
+  <label class="chk" title="ping-pong: sweep forward then back, ending where it started"><input id="swMirror" type="checkbox"> mirror (forward + back)</label>
   <label class="msg" id="swRangeLbl" title="Where the cutting plane starts and ends. For an oblique cut these are offsets measured ALONG the cut direction (not x/y/z corners), so they look different from what you typed in.">Cut range (start → end)</label>
   <div style="display:flex;gap:6px;align-items:center">
     <input id="swFrom" type="number" step="1" style="width:42%"><input id="swTo" type="number" step="1" style="width:42%">
@@ -603,6 +605,7 @@ function openSweepEdit(id) {
   $('swSideRow').style.display = isSlice ? 'none' : 'block';   // 'side' only meaningful for a cut
   $('swStart').value = s.start_s; $('swDur').value = s.duration_s;
   $('swSide').value = String(s.side); $('swEase').value = s.easing || 'linear';
+  $('swMirror').checked = !!s.mirror;
   $('swFrom').value = Math.round(s.from_nm); $('swTo').value = Math.round(s.to_nm);
   $('swMsg').textContent = '';
   $('lookPanel').style.display='none'; $('planePanel').style.display='none'; $('propPanel').style.display='none';
@@ -612,6 +615,7 @@ async function saveSweepEdit() {
   if (!PID || !EDIT_SWEEP_ID) return;
   const body = { start_s:+$('swStart').value, duration_s:+$('swDur').value,
                  side:parseInt($('swSide').value,10), easing:$('swEase').value,
+                 mirror:$('swMirror').checked,
                  from_nm:+$('swFrom').value, to_nm:+$('swTo').value };
   await api('PUT', `/api/projects/${PID}/sweeps/${EDIT_SWEEP_ID}`, body);
   $('sweepPanel').style.display='none';
@@ -811,7 +815,7 @@ async function applyPlaneScan() {
   const dur = parseFloat($('planeDur')?.value) || 4;
   const layer = $('planeLayer').value;
   const mk = async (kind) => {
-    const body = { kind, axis, side, easing: 'linear', duration_s: dur };
+    const body = { kind, axis, side, easing: 'linear', duration_s: dur, mirror: $('planeMirror').checked };
     if (kind === 'cutaway') { body.layer = layer; LAST_CUT_LAYER = layer; }
     if (fn.length) body.from_ng = fn;
     if (tn.length) body.to_ng = tn;

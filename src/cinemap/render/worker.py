@@ -43,6 +43,16 @@ def _ease(t: float, mode: str) -> float:
     return t
 
 
+def _sweep_progress(sw, t: float) -> float:
+    """Eased progress (0..1) of a sweep at global time `t`. With mirror=True it ping-pongs
+    (0->1 over the first half, 1->0 over the second) so the cut/slice goes forward THEN back
+    and ends where it started."""
+    u = min(1.0, max(0.0, (t - sw.start_s) / (sw.duration_s or 1e-9)))
+    if getattr(sw, "mirror", False):
+        u = u * 2 if u < 0.5 else (1 - u) * 2
+    return _ease(u, sw.easing)
+
+
 def _clip_params(cl) -> dict | None:
     """Normalize a layer's cutaway plane to a plain dict, or None if absent/disabled.
     `cl` may be a ClipPlane model OR a plain dict (legacy), so read with getattr/get;
@@ -237,10 +247,8 @@ class RenderWorker:
                 continue
             if t < sw.start_s:
                 continue                          # before it starts -> mesh is whole
-            # progress clamps to 1 after the end, so the cut HOLDS open once finished
-            # (doesn't snap back to whole), and animates during [start, start+duration].
-            p = _ease(min(1.0, (t - sw.start_s) / (sw.duration_s or 1e-9)), sw.easing)
-            pos = sw.from_nm + (sw.to_nm - sw.from_nm) * p
+            # holds open after the end (progress clamps to 1); mirror ping-pongs back.
+            pos = sw.from_nm + (sw.to_nm - sw.from_nm) * _sweep_progress(sw, t)
             return {"axis": sw.axis, "side": sw.side, "normal": sw.normal,
                     "position_nm": float(pos)}
         return None
@@ -257,8 +265,7 @@ class RenderWorker:
                 continue
             if t < sw.start_s:
                 continue
-            p = _ease(min(1.0, (t - sw.start_s) / (sw.duration_s or 1e-9)), sw.easing)
-            pos = sw.from_nm + (sw.to_nm - sw.from_nm) * p
+            pos = sw.from_nm + (sw.to_nm - sw.from_nm) * _sweep_progress(sw, t)
             out.append(FrameSlice(sw.em_name or default_em, sw.axis, float(pos), 0,
                                   float(sw.opacity), normal=sw.normal))
         return out

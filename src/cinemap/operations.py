@@ -358,7 +358,7 @@ def _plane_default_range(project: Project, base: Keyframe, ax_i: int,
 def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, side: int = 1,
               from_nm=None, to_nm=None, start_s=None, duration_s=None,
               from_ng=None, to_ng=None, easing: str = "linear",
-              kind: str = "cutaway", em_name: str = "") -> Sweep:
+              kind: str = "cutaway", em_name: str = "", mirror: bool = False) -> Sweep:
     """Add an independent plane sweep on its OWN timeline (decoupled from the camera).
     kind='cutaway' slides a mesh layer's clip plane; kind='slice' sweeps an EM cross-section.
     Slides from `from_nm` to `to_nm` over [start_s, start_s+duration_s]. Defaults: the full
@@ -397,7 +397,7 @@ def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, s
                side=int(side), from_nm=float(from_nm), to_nm=float(to_nm),
                start_s=float(start_s if start_s is not None else 0.0),
                duration_s=float(duration_s if duration_s is not None else total),
-               easing=easing)
+               easing=easing, mirror=bool(mirror))
     project.sweeps.append(sw)
     store.save(project)
     return sw

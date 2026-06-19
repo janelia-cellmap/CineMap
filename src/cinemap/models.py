@@ -201,6 +201,7 @@ class Sweep(BaseModel):
     duration_s: float = 2.0
     easing: Literal["linear", "ease-in-out", "ease-in", "ease-out"] = "linear"
     opacity: float = 1.0                   # EM slice overlay strength (slice kind)
+    mirror: bool = False                   # ping-pong: sweep from->to then back to->from
     enabled: bool = True
 
 

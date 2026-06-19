@@ -506,6 +506,7 @@ class SweepReqNew(BaseModel):
     start_s: float | None = None
     duration_s: float | None = None
     easing: str = "linear"
+    mirror: bool = False
 
 
 @app.post("/api/projects/{pid}/sweeps")
@@ -517,7 +518,8 @@ def add_sweep(pid: str, req: SweepReqNew):
                        axis=req.axis, side=req.side,
                        from_ng=req.from_ng, to_ng=req.to_ng,
                        from_nm=req.from_nm, to_nm=req.to_nm,
-                       start_s=req.start_s, duration_s=req.duration_s, easing=req.easing)
+                       start_s=req.start_s, duration_s=req.duration_s, easing=req.easing,
+                       mirror=req.mirror)
     return sw.model_dump()
 
 
@@ -529,6 +531,7 @@ class SweepPatch(BaseModel):
     from_nm: float | None = None
     to_nm: float | None = None
     axis: str | None = None
+    mirror: bool | None = None
     enabled: bool | None = None
 
 
