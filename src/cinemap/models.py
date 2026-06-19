@@ -214,6 +214,25 @@ class Sweep(BaseModel):
     enabled: bool = True
 
 
+class RenderPrefs(BaseModel):
+    """The UI's render-control choices, persisted on the project so they survive a
+    reload and travel with export/import. These are PREFERENCES (resolution, quality,
+    director, LOD, bounding box, preview ratio) — not the transient per-job flags
+    (still/draft/export_blend) which are decided per render. None on a project that
+    has never rendered, so old projects keep the UI defaults until first use."""
+    width: int = 1280
+    height: int = 720
+    fps: int = 30
+    samples: int = 48
+    mesh_detail: float = 1.0
+    mesh_from_labels: bool = False
+    auto_direct: bool = True
+    lod_mode: str = "frame"
+    show_bbox: bool = False
+    bbox_color: list[float] = Field(default_factory=lambda: [0.62, 0.66, 0.74])
+    preview_ratio: int = 10
+
+
 class Project(BaseModel):
     id: str
     name: str
@@ -226,3 +245,4 @@ class Project(BaseModel):
     renders: list[RenderJob] = Field(default_factory=list)
     look: dict[str, Any] = Field(default_factory=dict)  # render look overrides (preset +
     # glow/roughness/specular/ng_shader/view) — the look-experiment panel writes this.
+    render_prefs: Optional[RenderPrefs] = None  # last-used render-control settings (UI)

@@ -32,7 +32,7 @@ from pydantic import BaseModel
 from . import config, operations as ops
 from . import scouting, store
 from .config import FRONTEND_DIR
-from .models import Project, RenderJob, RenderSettings
+from .models import Project, RenderJob, RenderPrefs, RenderSettings
 from .render.worker import RenderCancelled, RenderWorker
 
 app = FastAPI(title="CineMap")
@@ -197,12 +197,27 @@ def import_project(body: dict):
         raise HTTPException(400, f"invalid project file: {e}") from e
     p.id = ops.project_id(p.name)  # fresh id so import never clobbers an existing project
     p.renders = []              # drop render history (output files won't exist)
+    for kf in p.keyframes:      # thumbnails live in the OLD project dir -> stale paths; regenerate
+        kf.thumbnail_path = None
     store.save(p)
     try:
         scouting.load_dataset(p.data_path)
     except Exception:  # noqa: BLE001
         pass
     return p.model_dump()
+
+
+@app.put("/api/projects/{pid}/render_prefs")
+def set_render_prefs(pid: str, body: dict):
+    """Persist the UI's render-control choices on the project (so they survive reload
+    and travel with export). Merges into any existing prefs."""
+    if not store.exists(pid):
+        raise HTTPException(404, "no such project")
+    p = store.load(pid)
+    base = p.render_prefs.model_dump() if p.render_prefs else {}
+    p.render_prefs = RenderPrefs.model_validate({**base, **body})
+    store.save(p)
+    return p.render_prefs.model_dump()
 
 
 def _ng_url_for(request: Request) -> str:

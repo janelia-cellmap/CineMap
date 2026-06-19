@@ -399,7 +399,7 @@ async function createProject() {
   try {
     const p = await api('POST','/api/projects', { name: $('name').value || 'untitled', data_path: $('dataPath').value });
     PID = p.id; await refreshProjects(); $('projectSel').value = PID;
-    await loadNg(); renderKeyframes(p); setStatus('project ready: ' + p.manifest.title);
+    applyRenderPrefs(p); await loadNg(); renderKeyframes(p); setStatus('project ready: ' + p.manifest.title);
   } catch (e) { setStatus('error: ' + e.message); }
 }
 
@@ -416,8 +416,9 @@ async function importProject(e) {
     const data = JSON.parse(await file.text());
     const p = await api('POST', '/api/projects/import', data);
     PID = p.id; await refreshProjects(); $('projectSel').value = PID;
-    await loadNg(); renderKeyframes(p);
-    setStatus('imported: ' + (p.name || p.id));
+    applyRenderPrefs(p); await loadNg(); renderKeyframes(p);
+    setStatus('imported: ' + (p.name || p.id) + ' — auto-rendering thumbnails…');
+    autoRenderThumbs();   // thumbnails were cleared on import; refill the timeline strip
   } catch (err) { setStatus('import failed: ' + err.message); }
   e.target.value = '';
 }
@@ -433,7 +434,7 @@ async function importStates(e) {
       // no project open -> create one from the first state in the script
       r = await api('POST', '/api/projects/import_states', { text, name: file.name.replace(/\.[^.]+$/, '') });
       PID = r.project.id; await refreshProjects(); $('projectSel').value = PID;
-      await loadNg(); renderKeyframes(r.project);
+      applyRenderPrefs(r.project); await loadNg(); renderKeyframes(r.project);
     } else {
       r = await api('POST', `/api/projects/${PID}/keyframes/import_states`, { text });
       await reload();
@@ -450,7 +451,7 @@ async function openProject(pid) {
   PID = pid; setStatus('opening…');
   await api('POST', `/api/projects/${pid}/open`);
   const p = await api('GET', `/api/projects/${pid}`);
-  await loadNg(); renderKeyframes(p); setStatus('opened ' + p.name);
+  applyRenderPrefs(p); await loadNg(); renderKeyframes(p); setStatus('opened ' + p.name);
 }
 
 async function loadNg() {
@@ -982,9 +983,35 @@ function hexToRgb01(hex) {
   const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex || '');
   return m ? [1, 2, 3].map(i => parseInt(m[i], 16) / 255) : [0.62, 0.66, 0.74];
 }
+function rgb01ToHex(rgb) {
+  const h = v => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
+  return Array.isArray(rgb) && rgb.length >= 3 ? `#${h(rgb[0])}${h(rgb[1])}${h(rgb[2])}` : '#9ea8bd';
+}
+// persist the render controls on the project so they survive reload + travel with export
+function saveRenderPrefs() {
+  if (!PID) return;
+  const prefs = { width: +$('w').value, height: +$('h').value, fps: +$('fps').value,
+    samples: +$('samples').value, mesh_detail: +$('detail').value || 1,
+    auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
+    show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
+    preview_ratio: +$('ratio').value || 10 };
+  api('PUT', `/api/projects/${PID}/render_prefs`, prefs).catch(() => {});
+}
+// apply a project's saved render controls back onto the UI (only if it has any)
+function applyRenderPrefs(p) {
+  const rp = p && p.render_prefs;
+  if (!rp) return;
+  const set = (id, v) => { const el = $(id); if (el != null && v != null) el.value = v; };
+  set('w', rp.width); set('h', rp.height); set('fps', rp.fps); set('samples', rp.samples);
+  set('detail', rp.mesh_detail); set('lodMode', rp.lod_mode); set('ratio', rp.preview_ratio);
+  if (rp.auto_direct != null) $('autoDirect').checked = !!rp.auto_direct;
+  if (rp.show_bbox != null) $('showBbox').checked = !!rp.show_bbox;
+  if (rp.bbox_color) $('bboxColor').value = rgb01ToHex(rp.bbox_color);
+}
 async function startRender(mode) {
   AUTO_THUMBS = false;   // stop any thumbnail auto-sweep before a full render
   if (!PID) { setStatus('create/open a project first'); return; }
+  saveRenderPrefs();     // remember these controls on the project (survives reload + export)
   let fps = +$('fps').value;
   if (mode === 'preview') {
     const r = Math.max(1, +$('ratio').value || 1);
