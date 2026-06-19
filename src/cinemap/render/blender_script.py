@@ -672,15 +672,28 @@ def _make_slice(sl: dict, name: str):
     img.colorspace_settings.name = "Non-Color"
     tex.image = img
     emit = nt.nodes.new("ShaderNodeEmission")
-    emit.inputs["Strength"].default_value = 0.9  # slightly tame the bright EM plane
     transp = nt.nodes.new("ShaderNodeBsdfTransparent")
-    mix = nt.nodes.new("ShaderNodeMixShader")
     out = nt.nodes.new("ShaderNodeOutputMaterial")
     nt.links.new(tex.outputs["Color"], emit.inputs["Color"])
-    mix.inputs[0].default_value = sl.get("opacity", 1.0)
-    nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
-    nt.links.new(emit.outputs["Emission"], mix.inputs[2])
-    nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+    op = float(sl.get("opacity", 1.0))
+    if sl.get("occlude"):
+        # opaque cross-section: the EM plane blocks geometry behind it (old behavior)
+        emit.inputs["Strength"].default_value = 0.9
+        mix = nt.nodes.new("ShaderNodeMixShader")
+        mix.inputs[0].default_value = op
+        nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
+        nt.links.new(emit.outputs["Emission"], mix.inputs[2])
+        nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+    else:
+        # NON-occluding (default): the plane is fully transparent to camera rays, so it
+        # NEVER hides the 3D meshes — the EM is ADDED as a glowing overlay where visible.
+        # Meshes in front still cover it; meshes behind show through. ('both'/cutaway still
+        # removes meshes on the cut side via the clip, independent of this.)
+        emit.inputs["Strength"].default_value = 0.6 * op
+        add = nt.nodes.new("ShaderNodeAddShader")
+        nt.links.new(emit.outputs["Emission"], add.inputs[0])
+        nt.links.new(transp.outputs["BSDF"], add.inputs[1])
+        nt.links.new(add.outputs["Shader"], out.inputs["Surface"])
     mat.blend_method = "BLEND"
     obj.data.materials.append(mat)
     return obj
