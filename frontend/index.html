@@ -619,6 +619,9 @@ function openSweepEdit(id) {
   document.querySelector('#sweepPanel b').textContent = isSlice ? '▦ Edit EM slice sweep' : '▤ Edit cutaway sweep';
   $('sweepWhich').textContent = `${isSlice ? (s.em_name||'EM') : s.layer} · ${s.normal ? 'oblique' : s.axis} axis`;
   $('swSideRow').style.display = isSlice ? 'none' : 'block';   // 'side' only meaningful for a cut
+  // label the side by the cut's actual orientation (oblique => direction, not "+z")
+  if (s.normal) { $('swSide').options[0].text = 'cut toward the “To” end'; $('swSide').options[1].text = 'cut toward the “From” end'; }
+  else { $('swSide').options[0].text = `cut the +${s.axis} side`; $('swSide').options[1].text = `cut the −${s.axis} side`; }
   $('swStart').value = s.start_s; $('swDur').value = s.duration_s;
   $('swSide').value = String(s.side); $('swEase').value = s.easing || 'linear';
   $('swMirror').checked = !!s.mirror;
