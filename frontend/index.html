@@ -20,8 +20,12 @@
   .grow { flex:1; }
   main { flex:1; display:flex; min-height:0; }
   .col { display:flex; flex-direction:column; min-width:0; }
-  .left { flex:2; border-right:1px solid var(--line); }
+  .left { flex:2; }
   .right { flex:1.1; }
+  .resizer { flex:0 0 6px; cursor:col-resize; background:var(--line); transition:background .1s; }
+  .resizer:hover, body.resizing .resizer { background:#5a5fcf; }
+  body.resizing { cursor:col-resize; user-select:none; }
+  body.resizing iframe { pointer-events:none; }   /* let drag cross the NG iframe */
   .chatcol { flex:1.1; border-left:1px solid var(--line); }
   #chat { flex:1; overflow:auto; padding:10px; display:flex; flex-direction:column; gap:8px; }
   .bubble { padding:7px 10px; border-radius:8px; font-size:12.5px; max-width:92%; white-space:pre-wrap; line-height:1.4; }
@@ -96,7 +100,7 @@
 <main>
   <div class="col left">
     <div class="pane-title">◆ Neuroglancer — scouting
-      <button class="accent" onclick="bake()">★ Bake keyframe</button>
+      <button class="accent" onclick="bake()" title="Capture the current Neuroglancer view as a keyframe — a saved pose in the movie (camera + layers + segments). The movie is built by rendering/interpolating between keyframes. You need at least one keyframe before you can scan or render.">★ Bake keyframe</button>
       <button onclick="updateFrame()" title="overwrite the selected keyframe with the current Neuroglancer view (camera + layers + segments)">⟳ Update current frame</button>
       <button onclick="addKeyframe()">+ Duplicate last</button>
       <button onclick="document.getElementById('statesFile').click()" title="upload a list of neuroglancer states (one link per line, or a CSV with a state column) — each becomes a keyframe">⭱ Import states</button>
@@ -104,16 +108,17 @@
     </div>
     <div id="ngWrap"><iframe id="ng"></iframe></div>
   </div>
+  <div class="resizer" id="resizeLR" onmousedown="startResize(event)" title="drag to resize scouting ↔ preview"></div>
   <div class="col right">
     <div class="pane-title">⬡ Render preview</div>
     <div id="preview"><span class="msg">render output appears here</span></div>
     <div class="controls">
-      <button onclick="orbit()">Orbit 360°</button>
-      <button onclick="openPlanePanel()" title="Fixed camera; scan an axis-aligned plane start→stop. The plane can show the raw EM slice, cut a layer away (cutaway), or both.">▤ Plane scan</button>
-      <label>w</label><input id="w" value="1280" />
-      <label>h</label><input id="h" value="720" />
-      <label>fps</label><input id="fps" value="30" />
-      <label>samples</label><input id="samples" value="48" />
+      <button onclick="orbit()" title="Add a 360° orbit: the camera circles the current target while the scene holds. Keyframes mark the path; the render interpolates between them.">Orbit 360°</button>
+      <button onclick="openPlanePanel()" title="Fixed camera; scan a plane start→stop. It can show the raw EM slice (keyframes) or cut a layer away (an independent cutaway sweep on its own timeline).">▤ Plane scan</button>
+      <label title="output width in pixels">w</label><input id="w" value="1280" />
+      <label title="output height in pixels">h</label><input id="h" value="720" />
+      <label title="Frames per second of the output video (motion smoothness). Total frames rendered = total duration (sum of keyframe durations) × fps.">fps</label><input id="fps" value="30" />
+      <label title="Cycles render samples per pixel: higher = less grain/noise but slower to render. ~16–32 for previews, 48+ for final.">samples</label><input id="samples" value="48" />
       <label title="Mesh quality = the per-layer vertex budget. Higher = crisper but more GPU memory (auto-retries lower if it runs out).">quality
         <select id="detail">
           <option value="1" selected>basic (~5M/layer)</option>
@@ -121,7 +126,7 @@
           <option value="3">max (~15M/layer)</option>
         </select></label>
       <label class="chk" title="Director: a non-destructive presentation pass that enhances the look WITHOUT changing your neuroglancer data — camera-relative key/fill/rim lighting, publication-quality materials, and subtle depth-of-field on the framed subject. Uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
-      <label title="Mesh LOD strategy: Single = one resolution for the whole shot. Per-frame = coarser when far, finer on close-ups (like neuroglancer; free on orbits). Per-chunk = spatial LOD within a mesh (experimental, currently same as per-frame).">lod
+      <label title="Mesh level-of-detail strategy (how fine the meshes are): Single = one resolution for the whole shot (used automatically when cutting away). Per-frame = coarser when a layer is far/small, finer on close-ups, like neuroglancer (free on orbits). Per-chunk = different detail within one mesh by on-screen size (experimental).">lod
         <select id="lodMode">
           <option value="frame" selected>per-frame</option>
           <option value="single">single</option>
@@ -254,14 +259,17 @@
     <option value="both">both</option>
   </select>
   <label class="msg">Axis</label>
-  <select id="planeAxis" style="width:100%">
+  <select id="planeAxis" style="width:100%" onchange="updateSideLabels()">
     <option value="z">z</option><option value="y">y</option><option value="x">x</option>
   </select>
   <div id="planeCull" style="display:none">
     <label class="msg">Cut layer</label>
     <select id="planeLayer" style="width:100%"></select>
-    <label class="msg">Reveal direction</label>
-    <select id="planeSide" style="width:100%"><option value="1">forward (+)</option><option value="-1">backward (−)</option></select>
+    <label class="msg" title="Which side of the plane is sliced OFF (made hollow + capped). The other side stays solid. As the plane sweeps, more of the cut side is removed, revealing the interior.">What gets cut away</label>
+    <select id="planeSide" style="width:100%">
+      <option value="1">cut the +axis side (keep −)</option>
+      <option value="-1">cut the −axis side (keep +)</option>
+    </select>
     <label class="msg" title="cutaway is an independent sweep on its own timeline; this is how long it takes, regardless of the camera">Cutaway duration (s)</label>
     <input id="planeDur" type="number" min="0.1" step="0.1" value="4" style="width:100%">
   </div>
@@ -533,7 +541,7 @@ function showKeyframeThumb(id) {
   if (JOB) return;                       // a live render is using the preview
   const img = new Image();
   img.onload = () => { $('preview').innerHTML = ''; $('preview').appendChild(img); };
-  img.onerror = () => { $('preview').innerHTML = '<span class="msg">no render yet — Bake or Update to render this frame</span>'; };
+  img.onerror = () => { $('preview').innerHTML = '<span class="msg">this keyframe hasn’t been rendered yet — hit Preview, or “Render all” to fill the timeline</span>'; };
   img.src = `/api/projects/${PID}/keyframes/${id}/thumbnail?v=${THUMB_VER[id] || 0}`;
 }
 
@@ -630,10 +638,37 @@ async function openPlanePanel() {
   const last = kfs[kfs.length-1];
   const layers = last ? [...new Set(last.meshes.filter(m=>m.render_3d!==false && (m.segment_ids||[]).length).map(m=>m.mesh_name))] : [];
   $('planeLayer').innerHTML = `<option value="">all layers</option>` + layers.map(l=>`<option value="${l}">${l}</option>`).join('');
-  planeModeChanged();
+  planeModeChanged(); updateSideLabels();
   $('planeMsg').textContent = ''; $('planePanel').style.display='block';
 }
+// drag the divider between the scouting (NG) and preview panes to expand either one.
+// Adjusts only the left/right flex (the Claude column is untouched); the iframe gets
+// pointer-events:none mid-drag so the mouse can cross it.
+function startResize(e) {
+  e.preventDefault();
+  const left = document.querySelector('.col.left'), right = document.querySelector('.col.right');
+  if (!left || !right) return;
+  document.body.classList.add('resizing');
+  const move = (ev) => {
+    const lr = left.getBoundingClientRect(), rr = right.getBoundingClientRect();
+    const total = lr.width + rr.width;
+    const f = Math.max(0.15, Math.min(0.85, (ev.clientX - lr.left) / total));
+    left.style.flex = f.toFixed(3);
+    right.style.flex = (1 - f).toFixed(3);
+  };
+  const up = () => { document.body.classList.remove('resizing');
+    window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+  window.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', up);
+}
 function planeModeChanged() { $('planeCull').style.display = $('planeMode').value==='slice' ? 'none' : 'block'; }
+// spell out the cut side with the actual axis (x/y/z), so "+/-" isn't abstract
+function updateSideLabels() {
+  const ax = $('planeAxis').value, sel = $('planeSide');
+  if (!sel) return;
+  sel.options[0].text = `cut the +${ax} side (keep −${ax})`;
+  sel.options[1].text = `cut the −${ax} side (keep +${ax})`;
+}
 // parse a box: full "x, y, z" -> [x,y,z] (oblique), single number -> scalar depth nm
 function planeNums(str) {
   return (str||'').trim().split(/[\s,]+/).map(parseFloat).filter(isFinite);
