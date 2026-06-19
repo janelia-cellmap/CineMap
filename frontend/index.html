@@ -306,9 +306,10 @@
     <option value="ease-in-out">ease in-out (smooth start/stop)</option>
     <option value="ease-in">ease in</option><option value="ease-out">ease out</option>
   </select>
-  <label class="msg">From → To (nm along axis)</label>
-  <div style="display:flex;gap:6px">
-    <input id="swFrom" type="number" step="1" style="width:50%"><input id="swTo" type="number" step="1" style="width:50%">
+  <label class="msg" id="swRangeLbl" title="Where the cutting plane starts and ends. For an oblique cut these are offsets measured ALONG the cut direction (not x/y/z corners), so they look different from what you typed in.">Cut range (start → end)</label>
+  <div style="display:flex;gap:6px;align-items:center">
+    <input id="swFrom" type="number" step="1" style="width:42%"><input id="swTo" type="number" step="1" style="width:42%">
+    <button onclick="const a=$('swFrom'),b=$('swTo');[a.value,b.value]=[b.value,a.value]" title="reverse the sweep direction (swap start and end)">⇄</button>
   </div>
   <div style="margin-top:8px"><button class="primary" onclick="saveSweepEdit()">Save</button>
     <button onclick="delSweep(EDIT_SWEEP_ID); $('sweepPanel').style.display='none'">Delete</button>
@@ -749,9 +750,11 @@ async function openPlanePanel() {
   const last = kfs[kfs.length-1];
   const layers = last ? [...new Set(last.meshes.filter(m=>m.render_3d!==false && (m.segment_ids||[]).length).map(m=>m.mesh_name))] : [];
   $('planeLayer').innerHTML = `<option value="">all layers</option>` + layers.map(l=>`<option value="${l}">${l}</option>`).join('');
+  if (LAST_CUT_LAYER && layers.includes(LAST_CUT_LAYER)) $('planeLayer').value = LAST_CUT_LAYER;  // remember selection
   planeModeChanged(); updateSideLabels();
   $('planeMsg').textContent = ''; $('planePanel').style.display='block';
 }
+let LAST_CUT_LAYER = '';
 // drag the divider between the scouting (NG) and preview panes to expand either one.
 // Adjusts only the left/right flex (the Claude column is untouched); the iframe gets
 // pointer-events:none mid-drag so the mouse can cross it.
@@ -799,6 +802,7 @@ async function applyPlaneScan() {
   if (mode === 'cull') {
     const layer = $('planeLayer').value;
     if (!layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
+    LAST_CUT_LAYER = layer;   // remember for next time the panel opens
     const dur = parseFloat($('planeDur')?.value) || undefined;
     const body = {layer, axis, side, easing: 'linear'};
     if (fn.length) body.from_ng = fn;

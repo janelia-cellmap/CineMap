@@ -380,6 +380,12 @@ def add_sweep(project: Project, layer: str, axis: str = "z", normal=None, side: 
         lo, hi = _plane_default_range(project, base, ax_i, layer) if base else (0.0, 1.0)
         from_nm = lo if from_nm is None else from_nm
         to_nm = hi if to_nm is None else to_nm
+    # Default direction = REVEAL: start with nothing cut and progressively cut toward the
+    # end. The clip removes the dot(x,normal) > position side for side>=0 (so 'nothing cut'
+    # is the HIGH-offset end) and the < position side for side<0 (nothing cut at the LOW
+    # end). Order from/to so the cut grows over time regardless of which corner came first.
+    lo_off, hi_off = (from_nm, to_nm) if from_nm <= to_nm else (to_nm, from_nm)
+    from_nm, to_nm = (hi_off, lo_off) if side >= 0 else (lo_off, hi_off)
     total = sum(k.duration_in_s for k in project.keyframes) or 4.0
     sw = Sweep(id=_uid("sw"), layer=layer, axis=axis, normal=(normal if oblique else None),
                side=int(side), from_nm=float(from_nm), to_nm=float(to_nm),
