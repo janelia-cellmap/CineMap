@@ -83,8 +83,8 @@ def volume_extent_nm(project: Project) -> tuple[list[float], list[float]]:
     return center, size_xyz
 
 
-def mesh_bbox_nm(mesh_url: str, segment_ids: list[int]):
-    """(center_xyz_nm, radius_nm) of the given mesh segments, or None on failure."""
+def mesh_aabb_nm(mesh_url: str, segment_ids: list[int]):
+    """(lo_xyz, hi_xyz) nm axis-aligned bounding box of the segments, or None."""
     from .data.mesh_loader import MeshLoader
 
     loader = MeshLoader(mesh_url)
@@ -96,10 +96,17 @@ def mesh_bbox_nm(mesh_url: str, segment_ids: list[int]):
         except Exception:
             continue
         vlo, vhi = v.min(0), v.max(0)
-        lo = vlo if lo is None else [min(a, b) for a, b in zip(lo, vlo)]
-        hi = vhi if hi is None else [max(a, b) for a, b in zip(hi, vhi)]
-    if lo is None:
+        lo = list(vlo) if lo is None else [min(a, b) for a, b in zip(lo, vlo)]
+        hi = list(vhi) if hi is None else [max(a, b) for a, b in zip(hi, vhi)]
+    return (lo, hi) if lo is not None else None
+
+
+def mesh_bbox_nm(mesh_url: str, segment_ids: list[int]):
+    """(center_xyz_nm, radius_nm) of the given mesh segments, or None on failure."""
+    bb = mesh_aabb_nm(mesh_url, segment_ids)
+    if bb is None:
         return None
+    lo, hi = bb
     center = [(lo[i] + hi[i]) / 2 for i in range(3)]
     radius = 0.5 * max(hi[i] - lo[i] for i in range(3))
     return center, max(radius, 1.0)
@@ -439,13 +446,16 @@ def _layer_offset_range(project: Project, base: Keyframe, layer, normal):
         if (layer and m.mesh_name != layer) or not m.segment_ids:
             continue
         src = next((s for s in project.manifest.meshes if s.name == m.mesh_name), None)
-        bb = mesh_bbox_nm(src.mesh_url, m.segment_ids) if src else None
+        bb = mesh_aabb_nm(src.mesh_url, m.segment_ids) if src else None
         if not bb:
             continue
-        c, r = bb
-        off = sum(c[i] * normal[i] for i in range(3))
-        lo = off - r if lo is None else min(lo, off - r)
-        hi = off + r if hi is None else max(hi, off + r)
+        blo, bhi = bb
+        center = [(blo[i] + bhi[i]) / 2 for i in range(3)]
+        off = sum(center[i] * normal[i] for i in range(3))
+        # exact half-extent of the AABB projected onto the (possibly oblique) normal
+        half = 0.5 * sum(abs(normal[i]) * (bhi[i] - blo[i]) for i in range(3)) * 1.03  # tiny pad
+        lo = off - half if lo is None else min(lo, off - half)
+        hi = off + half if hi is None else max(hi, off + half)
     return (lo, hi) if lo is not None else None
 
 
