@@ -16,5 +16,8 @@ PORT="${CINEMAP_PORT:-8000}"
 export CINEMAP_NG_BIND="${CINEMAP_NG_BIND:-0.0.0.0}"
 
 echo "CineMap  →  http://$(hostname -f):${PORT}  (or http://localhost:${PORT}; server bound on ${HOST})"
+# --reload auto-restarts the server when a source file under src/ changes, so code
+# fixes take effect without a manual restart (the render worker runs in-process, so
+# edits would otherwise stay stale until restart).
 exec conda run --no-capture-output -n "$ENV" \
-  uvicorn cinemap.server:app --host "$HOST" --port "$PORT"
+  uvicorn cinemap.server:app --host "$HOST" --port "$PORT" --reload --reload-dir src

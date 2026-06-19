@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -75,6 +76,7 @@ class MeshLoader:
             self.mesh_url.rsplit("/", 1) if "/" in self.mesh_url else ("", self.mesh_url))
         self._cv = None
         self._manual = None   # lazily: does this source need our model-space draco decode?
+        self._manual_lock = threading.Lock()   # resolve _manual once, even under the fetch pool
         self._raw_cache: dict = {}   # seg_id -> (index_bytes, data_bytes), fetched once
         # persistent on-disk cache of RAW (uncolored) per-(segment, LOD) geometry,
         # keyed by (mesh_url, seg, lod) — so re-rendering at a different quality/zoom
@@ -133,21 +135,47 @@ class MeshLoader:
         the standard integer range [0, 2^bits). cloud-volume assumes integers and re-scales
         by chunk_shape -> double-scaling that balloons coarse LODs. Detect it by sampling
         one fragment: points beyond the quantization range mean it's the model-space kind."""
-        if self._manual is None:
-            self._manual = False
+        if self._manual is not None:
+            return self._manual
+        # Resolve ONCE under a lock. The fetch pool calls _draco (-> here) from many
+        # threads at once; previously this set self._manual=False up front and computed
+        # the real value after a slow network probe, so concurrent threads saw False mid-
+        # probe and decoded via cloud-volume (which double-scales -> some segments scatter,
+        # others compact, the intermittent broken-mesh bug). Now _manual stays None until
+        # the final value is assigned, and the lock makes other threads wait for it.
+        with self._manual_lock:
+            if self._manual is not None:
+                return self._manual
+            result = False
             try:
+                import struct
+
+                import DracoPy
                 seg = int(self.list_segments()[0])
-                # Decode one segment's finest LOD both ways. cloud-volume mis-scales this
-                # encoding (draco stream carries the dequantization transform, so its
-                # points are already model-space); our manual decode follows the spec
-                # exactly. If they disagree (cloud-volume comes out larger), decode manually.
-                cv = np.asarray(self._cv_mesh(seg, 0).vertices)
-                mn = self._draco_manual(seg, 0).vertices
-                cve = cv.max(0) - cv.min(0)
-                mne = mn.max(0) - mn.min(0)
-                self._manual = bool(np.any(cve > 1.3 * mne + 1.0))
+                bits = self._manifest_bits()
+                idx, data = self._raw_manifest_data(seg)
+                o = 24                                          # skip chunk_shape + grid_origin
+                nl = struct.unpack("<I", idx[o:o + 4])[0]; o += 4
+                o += 4 * nl + 12 * nl                           # lod_scales + vertex_offsets
+                nfrag = struct.unpack(f"<{nl}I", idx[o:o + 4 * nl]); o += 4 * nl
+                n0 = nfrag[0]
+                o += 12 * n0                                    # skip lod0 fragment_positions
+                fsz = struct.unpack(f"<{n0}I", idx[o:o + 4 * n0])
+                dp = 0
+                for sz in fsz:                                  # first NON-empty lod0 fragment
+                    if sz:
+                        pts = np.asarray(DracoPy.decode(data[dp:dp + sz]).points, float)
+                        # Raw-quantized draco gives INTEGER coords in [0, 2^bits); this export
+                        # bakes the dequantization in, so coords are fractional / far beyond
+                        # 2^bits (model space). Either signal => decode manually. Deterministic
+                        # (no cloud-volume comparison, which was flaky and flipped run to run).
+                        fractional = not np.allclose(pts, np.round(pts), atol=1e-3)
+                        result = bool(fractional or pts.max() > 1.5 * (2 ** bits))
+                        break
+                    dp += sz
             except Exception:  # noqa: BLE001  (sharded / unreachable -> trust cloud-volume)
-                self._manual = False
+                result = False
+            self._manual = result          # assign the final value exactly once
         return self._manual
 
     def _cv_mesh(self, seg_id: int, lod: int = 0):
@@ -248,7 +276,7 @@ class MeshLoader:
             import hashlib
             # `decode2` tags the decoder version: bumping it invalidates geometry cached
             # by an older (buggy) decode so a re-render can't reuse stale meshes.
-            key = hashlib.md5(f"{self.mesh_url}|{int(seg_id)}|{int(lod)}|decode2".encode()).hexdigest()
+            key = hashlib.md5(f"{self.mesh_url}|{int(seg_id)}|{int(lod)}|decode4".encode()).hexdigest()
             cache = os.path.join(self._cache_dir, f"{key}.ply")
             if os.path.exists(cache):
                 try:
