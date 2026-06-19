@@ -52,26 +52,37 @@
   #bar { height:6px; background:#222734; border-radius:3px; overflow:hidden; }
   #barFill { height:100%; width:0%; background:var(--accent); transition:width .2s; }
   footer { height:200px; border-top:1px solid var(--line); background:#12151c; display:flex; flex-direction:column; }
-  /* two-row timeline: keyframe markers (instants) over transition bars (the moves), then
-     the sweep lane — all on one horizontal time scale, scrolled together. */
-  #tlScroll { overflow-x:auto; overflow-y:hidden; padding:8px 8px 10px; }
-  #timeline { position:relative; height:90px; min-width:100%; }
-  .kfmark { position:absolute; top:0; width:92px; height:62px; border:1px solid var(--line); border-radius:6px; background:linear-gradient(#1b2430,#10161e); background-size:cover; background-position:center; font-size:11px; cursor:pointer; overflow:hidden; z-index:2; }
+  /* timeline: a left track-header gutter (Frames / Moves / Sweeps) + a horizontally
+     scrolling lane area. Keyframe markers (instants) sit over transition bars (the
+     moves); the sweep lane runs underneath — all on one shared time scale. Thin
+     separators divide the three bands. */
+  #tlWrap { position:relative; display:flex; align-items:stretch; }
+  #tlGutter { flex:0 0 60px; position:relative; border-right:1px solid var(--line); }
+  #tlGutter .trk { position:absolute; right:7px; left:0; text-align:right; font-size:9px;
+                   font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:#7a8194; }
+  #tlGutter .trk.frames { top:32px; color:#aab3c4; }   /* aligns with kfmark band (8–68) */
+  #tlGutter .trk.moves  { top:74px; color:#9aa0c8; }   /* aligns with transition band (72–90) */
+  #tlGutter .trk.sweeps { top:101px; color:#8a8fff; }  /* aligns with the sweep lane below */
+  .tlsep { position:absolute; left:60px; right:0; height:1px; background:var(--line); pointer-events:none; z-index:0; }
+  #tlScroll { flex:1; overflow-x:auto; overflow-y:hidden; padding:8px 8px 10px; }
+  #timeline { position:relative; height:86px; min-width:100%; }
+  .kfmark { position:absolute; top:0; width:92px; height:60px; border:1px solid var(--line); border-radius:6px; background:linear-gradient(#1b2430,#10161e); background-size:cover; background-position:center; font-size:11px; cursor:pointer; overflow:hidden; z-index:2; }
   .kfmark:hover { border-color:#5a6473; }
   .kfmark.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); z-index:4; }
   .kfmark.drop { border-color:#5aff7a; box-shadow:-3px 0 0 #5aff7a; }
   .kfmark .lbl { font-weight:600; cursor:grab; padding:2px 5px; background:linear-gradient(#000a,#0000); text-shadow:0 1px 2px #000; border-radius:6px 6px 0 0; }
   .kfmark .del { position:absolute; top:2px; right:5px; color:#fff; opacity:.7; cursor:pointer; text-shadow:0 1px 2px #000; }
   .kfmark .del:hover { opacity:1; }
-  .tltrans { position:absolute; top:66px; height:18px; background:linear-gradient(90deg,#3a4358,#566184); border-radius:4px; display:flex; align-items:center; padding:0 5px; cursor:pointer; overflow:hidden; z-index:1; }
+  .tltrans { position:absolute; top:64px; height:18px; background:linear-gradient(90deg,#3a4358,#566184); border-radius:4px; display:flex; align-items:center; padding:0 5px; cursor:pointer; overflow:hidden; z-index:1; }
   .tltrans.hold { background:repeating-linear-gradient(45deg,#262b36,#262b36 5px,#323847 5px,#323847 10px); }
   .tltrans .trlbl { font-size:10px; color:#cdd3ff; white-space:nowrap; text-shadow:0 1px 2px #000; }
   .tltrans .trgrip { position:absolute; right:0; top:0; width:7px; height:100%; cursor:ew-resize; background:rgba(255,255,255,.28); }
   .tltrans .trgrip:hover { background:#8a8fff; }
   #sweepLane { position:relative; }
-  #sweepLane:not(:empty) { min-height:38px; padding-top:16px; }
-  .lanelbl { position:absolute; top:2px; left:0; font-size:10px; color:#8a8fff; letter-spacing:.04em; text-transform:uppercase; }
-  .sweepbar { position:absolute; top:18px; height:18px; background:linear-gradient(90deg,#5a5fcf,#8a8fff); border-radius:4px; display:flex; align-items:center; padding:0 6px; box-shadow:0 1px 3px #0009; overflow:hidden; cursor:grab; }
+  #sweepLane:not(:empty) { min-height:30px; }
+  #sweepLane:empty::after { content:'no plane sweeps — add an Orbit or Plane scan below'; position:absolute; top:6px; left:0; font-size:10px; color:#5a6473; font-style:italic; }
+  #sweepLane:empty { min-height:24px; }
+  .sweepbar { position:absolute; top:6px; height:18px; background:linear-gradient(90deg,#5a5fcf,#8a8fff); border-radius:4px; display:flex; align-items:center; padding:0 6px; box-shadow:0 1px 3px #0009; overflow:hidden; cursor:grab; }
   .sweepbar .swlbl { font-size:11px; color:#fff; white-space:nowrap; text-shadow:0 1px 2px #000, 0 0 3px #000; }
   .sweepbar .del { margin-left:auto; color:#fff; opacity:.7; cursor:pointer; padding-left:6px; }
   .sweepbar .del:hover { opacity:1; }
@@ -79,7 +90,7 @@
   .sweepbar.dragging { opacity:.85; box-shadow:0 0 0 1px #fff, 0 2px 8px #000; }
   .sweepbar .grip { position:absolute; right:0; top:0; width:8px; height:100%; cursor:ew-resize; background:rgba(255,255,255,.25); }
   .sweepbar .grip:hover { background:#fff; }
-  .swsnap { position:absolute; top:16px; height:22px; width:2px; background:#8a8fff; pointer-events:none; box-shadow:0 0 4px #8a8fff; }
+  .swsnap { position:absolute; top:4px; height:22px; width:2px; background:#8a8fff; pointer-events:none; box-shadow:0 0 4px #8a8fff; }
   #swHover .swhovcap { font-size:10px; color:#aab0ff; margin-bottom:4px; }
   .msg { font-size:12px; color:var(--mut); }
   /* hover the before/after strip -> big side-by-side overlay (see #lookZoom) */
@@ -175,9 +186,18 @@
     <button id="exportBtn" class="primary" onclick="startRender('export')">⬇ Export video</button>
     <button id="blendBtn" onclick="startRender('blend')" title="bake the whole shot to a self-contained animated .blend (camera, meshes, EM slices; textures packed in)">⬇ Export .blend</button>
   </div>
-  <div id="tlScroll">
-    <div id="timeline"></div>
-    <div id="sweepLane"></div>
+  <div id="tlWrap">
+    <div id="tlGutter">
+      <div class="trk frames" title="Keyframes — the poses (instants). Drag to reorder.">▣ Frames</div>
+      <div class="trk moves" title="Transitions — the camera moves between keyframes; each takes time. Drag a bar's right edge to change its length.">▶ Moves</div>
+      <div class="trk sweeps" title="Plane sweeps — cutaways / EM slices on their own clips. Drag to move, drag the right edge to resize, click to edit.">▤ Sweeps</div>
+    </div>
+    <div class="tlsep" style="top:70px"></div>
+    <div class="tlsep" style="top:92px"></div>
+    <div id="tlScroll">
+      <div id="timeline"></div>
+      <div id="sweepLane"></div>
+    </div>
   </div>
 </footer>
 
@@ -534,8 +554,7 @@ function renderSweeps(p) {
   for (let i = 1; i < (p.keyframes||[]).length; i++) { t += (p.keyframes[i].duration_in_s || 0); SWEEP_SNAPS.push(t); }
   lane.style.width = TL_WIDTH + 'px';   // same width/scale as the keyframe lane above
   if (!sweeps.length) { lane.innerHTML = ''; return; }
-  lane.innerHTML = '<div class="lanelbl">plane sweeps — drag to move · drag the right edge to resize · click to edit · aligned to the keyframes above</div>'
-    + sweeps.map(s => {
+  lane.innerHTML = sweeps.map(s => {
     const left = TL_XOF(s.start_s), width = Math.max(8, s.duration_s * TL_PX);
     const dir = s.normal ? 'oblique' : `${s.axis}`;
     const isSlice = s.kind === 'slice';
