@@ -92,6 +92,19 @@
   .sweepbar .grip:hover { background:#fff; }
   .swsnap { position:absolute; top:4px; height:22px; width:2px; background:#8a8fff; pointer-events:none; box-shadow:0 0 4px #8a8fff; }
   #swHover .swhovcap { font-size:10px; color:#aab0ff; margin-bottom:4px; }
+  /* click-to-edit popover for a transition (duration + easing) */
+  #transEdit { position:fixed; z-index:80; display:none; width:208px; background:#1a1d22;
+               border:1px solid #3a3f47; border-radius:8px; padding:10px 12px; font-size:12px;
+               box-shadow:0 6px 24px rgba(0,0,0,.55); }
+  #transEdit .te-hd { display:flex; justify-content:space-between; align-items:center; font-weight:600; margin-bottom:8px; }
+  #transEdit .te-x { cursor:pointer; opacity:.7; }
+  #transEdit .te-x:hover { opacity:1; }
+  #transEdit label { display:flex; align-items:center; gap:6px; margin:6px 0; color:var(--mut); }
+  #transEdit input, #transEdit select { background:#11151f; border:1px solid var(--line); color:#cdd3ff; border-radius:4px; padding:2px 4px; }
+  #transEdit input { width:58px; }
+  #transEdit select { flex:1; }
+  #transEdit .te-row { display:flex; gap:6px; justify-content:flex-end; margin-top:9px; }
+  #transEdit .te-hint { color:var(--mut); font-size:10px; margin-top:7px; }
   .msg { font-size:12px; color:var(--mut); }
   /* hover the before/after strip -> big side-by-side overlay (see #lookZoom) */
   #lookCompare { cursor: zoom-in; }
@@ -481,6 +494,7 @@ function diffBadge(id) {
 function openPropForKf(id) { ACTIVE_KF = id; openPropPanel(); }
 
 let LAST_KF_ID = null, KF_ORDER = [], THUMB_VER = {}, CUR = null, EXPANDED_GROUPS = new Set();
+let KF_TIME = {};   // keyframe id -> its time on the timeline (seconds), set by renderKeyframes
 function thumbBg(k) {
   return k.thumbnail_path
     ? `background-image:url('/api/projects/${PID}/keyframes/${k.id}/thumbnail?v=${THUMB_VER[k.id]||0}');background-size:cover;background-position:center;`
@@ -507,6 +521,7 @@ function renderKeyframes(p) {
   }
   // cumulative time of each keyframe — only transitions (the moves) take time
   const tAt=[0]; for (let i=1;i<kfs.length;i++) tAt.push(tAt[i-1] + (+kfs[i].duration_in_s||0));
+  KF_TIME = {}; kfs.forEach((k,i)=>{ KF_TIME[k.id]=tAt[i]; });   // id -> timeline time (s)
   const T = tAt[kfs.length-1];
   const swEnd = Math.max(0, ...(p.sweeps||[]).map(s=>s.start_s+s.duration_s));
   const Tm = Math.max(T, swEnd, 0.1);
@@ -518,7 +533,7 @@ function renderKeyframes(p) {
     const k=kfs[i], x0=TL_XOF(tAt[i-1]), w=Math.max(2,(tAt[i]-tAt[i-1])*TL_PX);
     const hold = JSON.stringify(kfs[i-1].camera)===JSON.stringify(k.camera);   // identical pose = a dwell
     html += `<div class="tltrans${hold?' hold':''}" style="left:${x0}px;width:${w}px"
-        title="${hold?'hold (no move)':'move'} into KF${i} · ${fmtS(k.duration_in_s)}s · drag the right edge to change its length" onclick="gotoKf('${k.id}',null)">
+        title="${hold?'hold (no move)':'move'} into KF${i} · ${fmtS(k.duration_in_s)}s · click to edit · drag the right edge to resize" onclick="openTransEdit(event,'${k.id}')">
       <span class="trlbl">${hold?'⏸':'▶'}${fmtS(k.duration_in_s)}s</span>
       <span class="trgrip" onmousedown="event.stopPropagation(); startTransDrag(event,'${k.id}',${+k.duration_in_s||0})"></span></div>`;
   }
@@ -545,6 +560,38 @@ function startTransDrag(e, id, v0) {
     await api('PUT', `/api/projects/${PID}/keyframes/${id}/duration`, {duration_in_s: val}); reload(); };
   window.addEventListener('mousemove',move); window.addEventListener('mouseup',up);
 }
+// click a transition -> small popover to type its duration + pick easing (drag still resizes)
+function openTransEdit(e, id) {
+  e.stopPropagation();
+  const kfs=(CUR&&CUR.keyframes)||[], i=kfs.findIndex(k=>k.id===id), k=kfs[i];
+  if(!k) return;
+  const hold = i>0 && JSON.stringify(kfs[i-1].camera)===JSON.stringify(k.camera);
+  let pop=$('transEdit');
+  if(!pop){ pop=document.createElement('div'); pop.id='transEdit'; document.body.appendChild(pop); }
+  pop.innerHTML=`
+    <div class="te-hd">${hold?'⏸ Hold':'▶ Move'} → KF${i}<span class="te-x" onclick="closeTransEdit()">✕</span></div>
+    <label>duration <input id="teDur" type="number" min="0" step="0.1" value="${fmtS(k.duration_in_s)}" />s</label>
+    <label>easing <select id="teEase">
+      ${['ease-in-out','linear','ease-in','ease-out'].map(o=>`<option value="${o}"${(k.easing||'ease-in-out')===o?' selected':''}>${o}</option>`).join('')}
+    </select></label>
+    <div class="te-row"><button onclick="gotoKf('${id}',null); closeTransEdit()">view</button>
+      <button class="primary" onclick="applyTransEdit('${id}')">apply</button></div>
+    <div class="te-hint">0s = instant cut. Easing applies when Director is off.</div>`;
+  pop.style.left=Math.min(e.clientX, window.innerWidth-224)+'px';
+  pop.style.top=Math.max(10, e.clientY-170)+'px';
+  pop.style.display='block';
+  $('teDur').focus(); $('teDur').select();
+  setTimeout(()=>document.addEventListener('mousedown', _teOutside), 0);
+}
+function _teOutside(ev){ const p=$('transEdit'); if(p && !p.contains(ev.target)){ closeTransEdit(); } }
+function closeTransEdit(){ const p=$('transEdit'); if(p) p.style.display='none'; document.removeEventListener('mousedown', _teOutside); }
+async function applyTransEdit(id){
+  const dur=Math.max(0, parseFloat($('teDur').value)||0), ease=$('teEase').value;
+  closeTransEdit();
+  await setKfTiming(id, {duration_in_s: dur, easing: ease});
+}
+// the time (s) on the timeline of the keyframe you're currently on — anchors new sweeps "here"
+function activeKfTime(){ const id=ACTIVE_KF||LAST_KF_ID; return (id!=null && KF_TIME[id]!=null) ? KF_TIME[id] : 0; }
 
 // Independent cutaway sweeps live in their OWN lane below the keyframes — each a bar
 // spanning the slice of the movie's timeline it animates over (like a clip/effect track
@@ -827,8 +874,9 @@ async function openPlanePanel() {
   $('lookPanel').style.display='none'; $('propPanel').style.display='none';
   const proj = await api('GET', `/api/projects/${PID}`);
   const kfs = (proj && proj.keyframes) || [];
-  const last = kfs[kfs.length-1];
-  const layers = last ? [...new Set(last.meshes.filter(m=>m.render_3d!==false && (m.segment_ids||[]).length).map(m=>m.mesh_name))] : [];
+  // layers from the keyframe you're ON (falls back to the last), so the cut matches your view
+  const base = kfs.find(k=>k.id===(ACTIVE_KF||LAST_KF_ID)) || kfs[kfs.length-1];
+  const layers = base ? [...new Set(base.meshes.filter(m=>m.render_3d!==false && (m.segment_ids||[]).length).map(m=>m.mesh_name))] : [];
   $('planeLayer').innerHTML = `<option value="">all layers</option>` + layers.map(l=>`<option value="${l}">${l}</option>`).join('');
   if (LAST_CUT_LAYER && layers.includes(LAST_CUT_LAYER)) $('planeLayer').value = LAST_CUT_LAYER;  // remember selection
   planeModeChanged(); updateSideLabels();
@@ -889,7 +937,8 @@ async function previewPlaneScan() {
   const dur = parseFloat($('planeDur').value) || 4, layer = $('planeLayer').value;
   const kind = (mode === 'slice') ? 'slice' : 'cutaway';
   if (kind === 'cutaway' && !layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
-  const body = { kind, axis, side, easing: 'linear', duration_s: dur, mirror: $('planeMirror').checked };
+  // anchor the sweep at the keyframe you're on, so the preview frames from THAT camera
+  const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: activeKfTime(), mirror: $('planeMirror').checked };
   if (kind === 'cutaway') body.layer = layer;
   if (fn.length) body.from_ng = fn;
   if (tn.length) body.to_ng = tn;
@@ -925,7 +974,7 @@ async function applyPlaneScan() {
   const dur = parseFloat($('planeDur')?.value) || 4;
   const layer = $('planeLayer').value;
   const mk = async (kind) => {
-    const body = { kind, axis, side, easing: 'linear', duration_s: dur, mirror: $('planeMirror').checked };
+    const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: activeKfTime(), mirror: $('planeMirror').checked };
     if (kind === 'cutaway') { body.layer = layer; LAST_CUT_LAYER = layer; }
     if (fn.length) body.from_ng = fn;
     if (tn.length) body.to_ng = tn;
