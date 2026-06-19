@@ -278,9 +278,11 @@
     <input id="planeFrom" placeholder="auto" style="width:50%" title="paste exactly as neuroglancer shows it (its units + order). One value = depth along the axis; a full x,y,z = a point">
     <input id="planeTo" placeholder="auto" style="width:50%" title="paste exactly as neuroglancer shows it (its units + order). One value = depth along the axis; a full x,y,z = a point">
   </div>
-  <label class="msg">Frames <span id="planeNVal" class="msg">12</span></label>
-  <input type="range" id="planeN" min="2" max="48" step="1" value="12" style="width:100%" oninput="$('planeNVal').textContent=this.value">
-  <div style="margin-top:8px"><button class="primary" onclick="applyPlaneScan()">Add scan</button> <span id="planeMsg" class="msg"></span></div>
+  <div id="planeFramesRow">
+    <label class="msg">Frames <span id="planeNVal" class="msg">12</span></label>
+    <input type="range" id="planeN" min="2" max="48" step="1" value="12" style="width:100%" oninput="$('planeNVal').textContent=this.value">
+  </div>
+  <div style="margin-top:8px"><button class="primary" onclick="applyPlaneScan()"><span id="planeAddLbl">Add scan</span></button> <span id="planeMsg" class="msg"></span></div>
   <div class="msg" style="margin-top:2px">Tip: copy a position straight from neuroglancer. A single value scans along the axis; a full <b>x,y,z</b> in <i>both</i> boxes = an <b>oblique</b> scan along that line (axis ignored). Converted to nm via this view's grid.</div>
 </div>
 
@@ -661,7 +663,13 @@ function startResize(e) {
   window.addEventListener('mousemove', move);
   window.addEventListener('mouseup', up);
 }
-function planeModeChanged() { $('planeCull').style.display = $('planeMode').value==='slice' ? 'none' : 'block'; }
+function planeModeChanged() {
+  const mode = $('planeMode').value, cut = mode === 'cull';
+  $('planeCull').style.display = mode === 'slice' ? 'none' : 'block';
+  // cutaway is a duration-based sweep (no per-keyframe frame count); slice/both still scan keyframes
+  if ($('planeFramesRow')) $('planeFramesRow').style.display = cut ? 'none' : 'block';
+  if ($('planeAddLbl')) $('planeAddLbl').textContent = cut ? 'Add cutaway' : 'Add scan';
+}
 // spell out the cut side with the actual axis (x/y/z), so "+/-" isn't abstract
 function updateSideLabels() {
   const ax = $('planeAxis').value, sel = $('planeSide');

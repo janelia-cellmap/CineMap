@@ -235,9 +235,11 @@ class RenderWorker:
             if (not getattr(sw, "enabled", True) or getattr(sw, "kind", "cutaway") != "cutaway"
                     or sw.layer != layer_name):
                 continue
-            if not (sw.start_s <= t <= sw.start_s + sw.duration_s):
-                continue
-            p = _ease(min(1.0, max(0.0, (t - sw.start_s) / (sw.duration_s or 1e-9))), sw.easing)
+            if t < sw.start_s:
+                continue                          # before it starts -> mesh is whole
+            # progress clamps to 1 after the end, so the cut HOLDS open once finished
+            # (doesn't snap back to whole), and animates during [start, start+duration].
+            p = _ease(min(1.0, (t - sw.start_s) / (sw.duration_s or 1e-9)), sw.easing)
             pos = sw.from_nm + (sw.to_nm - sw.from_nm) * p
             return {"axis": sw.axis, "side": sw.side, "normal": sw.normal,
                     "position_nm": float(pos)}
@@ -640,6 +642,17 @@ class RenderWorker:
         frames = build_frames(kfs, self.job.settings.fps, smooth_ends=smooth)
         if not frames:
             raise ValueError("no keyframes to render")
+        # A cutaway sweep runs on the GLOBAL timeline, so the movie must be at least as long
+        # as the furthest sweep — otherwise a sweep over a single (static) keyframe gets just
+        # one frame. Hold the last camera pose out to the latest sweep end.
+        fps = max(1, self.job.settings.fps)
+        sweep_end = max([0.0] + [float(s.start_s) + float(s.duration_s)
+                                 for s in (getattr(self.project, "sweeps", []) or [])
+                                 if getattr(s, "enabled", True)
+                                 and getattr(s, "kind", "") == "cutaway"])
+        need = int(round(sweep_end * fps))
+        if need > len(frames):
+            frames = frames + [frames[-1]] * (need - len(frames))
 
         exporting = self.job.settings.export_blend
         scene_path = self.workdir / "scene.json"
