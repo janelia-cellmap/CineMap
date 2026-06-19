@@ -649,20 +649,14 @@ class RenderWorker:
         kfs = self.project.keyframes
         if not kfs:
             return None
-        # walk the timeline the same way build_frames does: hold ON kf[i], then transition
-        # INTO kf[i+1]. So holds shift global time and the snapshot camera stays correct.
+        # only transitions take time (keyframes are instants); walk cumulative transitions.
         cum = 0.0
-        for i in range(len(kfs)):
-            h = max(0.0, getattr(kfs[i], "hold_in_s", 0.0))
-            if t <= cum + h:
-                return _state_at(kfs[i], kfs[i], 0.0)        # within the dwell on kf[i]
-            cum += h
-            if i < len(kfs) - 1:
-                d = kfs[i + 1].duration_in_s or 0.0
-                if t <= cum + d or i == len(kfs) - 2:
-                    local = 0.0 if d <= 0 else min(1.0, max(0.0, (t - cum) / d))
-                    return _state_at(kfs[i], kfs[i + 1], _ease(local, kfs[i + 1].easing))
-                cum += d
+        for i in range(len(kfs) - 1):
+            d = kfs[i + 1].duration_in_s or 0.0
+            if t <= cum + d or i == len(kfs) - 2:
+                local = 0.0 if d <= 0 else min(1.0, max(0.0, (t - cum) / d))
+                return _state_at(kfs[i], kfs[i + 1], _ease(local, kfs[i + 1].easing))
+            cum += d
         return _state_at(kfs[-1], kfs[-1], 0.0)
 
     def render_snapshots(self, times: list[float], out_dir) -> list[str]:

@@ -212,13 +212,13 @@ def build_frames(keyframes: list[Keyframe], fps: int,
     total duration as video_tool either way."""
     if not keyframes:
         return []
+    # Keyframes are instants; only the TRANSITIONS between them take time. A dwell/"hold"
+    # is just a transition between two identical keyframes (the camera doesn't move), so
+    # timing falls out of the transition durations alone — and the sweep lane lines up.
     frames: list[FrameState] = []
     n_trans = len(keyframes) - 1
     for i in range(n_trans):
         a, b = keyframes[i], keyframes[i + 1]
-        # rest ON keyframe a for its hold (static frames) before moving on — a pause/dwell
-        for _ in range(int(round(max(0.0, getattr(a, "hold_in_s", 0.0)) * fps))):
-            frames.append(_state_at(a, a, 0.0))
         n = 0 if b.duration_in_s <= 0 else max(1, int(round(b.duration_in_s * fps)))
         if smooth_ends:
             ease = ("ease-in-out" if n_trans == 1 else
@@ -227,8 +227,5 @@ def build_frames(keyframes: list[Keyframe], fps: int,
             ease = b.easing
         for k in range(n):
             frames.append(_state_at(a, b, _ease(k / n, ease)))
-    last = keyframes[-1]
-    for _ in range(int(round(max(0.0, getattr(last, "hold_in_s", 0.0)) * fps))):
-        frames.append(_state_at(last, last, 0.0))   # rest on the final pose
-    frames.append(_state_at(last, last, 0.0))        # final keyframe, ≥1 frame
+    frames.append(_state_at(keyframes[-1], keyframes[-1], 0.0))  # final keyframe, 1 frame
     return frames
