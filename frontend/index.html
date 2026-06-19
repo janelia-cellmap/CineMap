@@ -481,7 +481,10 @@ function renderSweeps(p) {
   const lane = $('sweepLane'); if (!lane) return;
   const sweeps = p.sweeps || [];
   if (!sweeps.length) { lane.innerHTML = ''; return; }
-  const total = (p.keyframes || []).reduce((a, k) => a + (k.duration_in_s || 0), 0) || 4;
+  // movie length = max(camera-keyframe timeline, furthest sweep end) — a sweep can extend it
+  const kfTotal = (p.keyframes || []).reduce((a, k) => a + (k.duration_in_s || 0), 0);
+  const swEnd = Math.max(0, ...sweeps.map(s => s.start_s + s.duration_s));
+  const total = Math.max(kfTotal, swEnd, 0.1);
   lane.innerHTML = '<div class="lanelbl">cutaway sweeps</div>' + sweeps.map(s => {
     const left = Math.max(0, (s.start_s / total) * 100);
     const width = Math.max(4, Math.min(100 - left, (s.duration_s / total) * 100));
