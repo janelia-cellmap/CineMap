@@ -74,7 +74,7 @@
   #sweepLane:not(:empty) { min-height:34px; padding-top:16px; }
   .lanelbl { position:absolute; top:0; left:0; font-size:10px; color:#8a8fff; letter-spacing:.04em; text-transform:uppercase; }
   .sweepbar { position:absolute; top:16px; height:18px; background:linear-gradient(90deg,#5a5fcf,#8a8fff); border-radius:4px; display:flex; align-items:center; padding:0 6px; box-shadow:0 1px 3px #0009; overflow:hidden; }
-  .sweepbar .swlbl { font-size:11px; color:#fff; white-space:nowrap; }
+  .sweepbar .swlbl { font-size:11px; color:#fff; white-space:nowrap; text-shadow:0 1px 2px #000, 0 0 3px #000; }
   .sweepbar .del { margin-left:auto; color:#fff; opacity:.7; cursor:pointer; padding-left:6px; }
   .sweepbar .del:hover { opacity:1; }
   .sweepbar.slicebar { background:linear-gradient(90deg,#2f8f8f,#46c2c2); }   /* EM slice = teal */
@@ -322,6 +322,8 @@
   <div style="margin-top:8px"><button class="primary" onclick="saveSweepEdit()">Save</button>
     <button onclick="delSweep(EDIT_SWEEP_ID); $('sweepPanel').style.display='none'">Delete</button>
     <span id="swMsg" class="msg"></span></div>
+  <div style="margin-top:8px"><button onclick="renderSweepSnapshots()" title="render small start / middle / end stills so the clip shows a preview on the timeline">📷 Preview frames</button></div>
+  <div id="swSnaps" style="display:flex;gap:4px;margin-top:6px"></div>
 </div>
 
 <div id="lookZoom" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.82);align-items:center;justify-content:center;gap:18px;pointer-events:none">
@@ -547,7 +549,11 @@ function renderSweeps(p) {
     const isSlice = s.kind === 'slice';
     const name = isSlice ? (s.em_name || 'EM slice') : s.layer;
     const icon = isSlice ? '▦' : '▤';
-    return `<div class="sweepbar${isSlice ? ' slicebar' : ''}" data-id="${s.id}" style="left:${left}%;width:${width}%"
+    // show the middle preview frame as the bar background (gradient fallback if not rendered)
+    const grad = isSlice ? 'linear-gradient(90deg,#2f8f8f,#46c2c2)' : 'linear-gradient(90deg,#5a5fcf,#8a8fff)';
+    const v = SNAP_VER[s.id] ? `?v=${SNAP_VER[s.id]}` : '';
+    const bg = `background-image:url('/api/projects/${PID}/sweeps/${s.id}/snapshot/1${v}'),${grad};background-size:cover;background-position:center;`;
+    return `<div class="sweepbar${isSlice ? ' slicebar' : ''}" data-id="${s.id}" style="left:${left}%;width:${width}%;${bg}"
                  onmousedown="startSweepDrag(event,'${s.id}','move')"
                  title="${isSlice ? 'EM slice' : 'cutaway'}: ${name} · ${dir} · ${Math.round(s.from_nm)}→${Math.round(s.to_nm)}nm · start ${s.start_s}s · ${s.duration_s}s">
       <span class="del" onmousedown="event.stopPropagation()" onclick="event.stopPropagation(); delSweep('${s.id}')">✕</span>
@@ -617,6 +623,20 @@ function openSweepEdit(id) {
   $('lookPanel').style.display='none'; $('planePanel').style.display='none'; $('propPanel').style.display='none';
   $('sweepPanel').style.display = 'block';
 }
+async function renderSweepSnapshots() {
+  if (!PID || !EDIT_SWEEP_ID) return;
+  const id = EDIT_SWEEP_ID;
+  $('swMsg').textContent = 'rendering preview frames…';
+  try {
+    await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`);
+    const v = Date.now(); SNAP_VER[id] = v;
+    $('swSnaps').innerHTML = [0,1,2].map(i =>
+      `<img src="/api/projects/${PID}/sweeps/${id}/snapshot/${i}?v=${v}" style="width:33%;border-radius:3px;background:#000">`).join('');
+    $('swMsg').textContent = 'done';
+    if (CUR) renderSweeps(CUR);   // show the mid frame on the lane bar
+  } catch (e) { $('swMsg').textContent = 'failed: ' + (e.message||e); }
+}
+let SNAP_VER = {};
 async function saveSweepEdit() {
   if (!PID || !EDIT_SWEEP_ID) return;
   const body = { start_s:+$('swStart').value, duration_s:+$('swDur').value,

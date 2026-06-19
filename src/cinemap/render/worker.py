@@ -439,7 +439,8 @@ class RenderWorker:
         return frame_layer_uid
 
     # ---- scene spec ----
-    def _build_scene_spec(self, frames: list[FrameState], index_offset: int = 0) -> dict:
+    def _build_scene_spec(self, frames: list[FrameState], index_offset: int = 0,
+                          frame_times: list[float] | None = None) -> dict:
         # On-screen scale (nm per pixel) per frame, for picking precomputed-mesh LOD
         # like neuroglancer. With dynamic LOD this varies per frame (coarser when the
         # layer is far/small on screen); otherwise every frame uses the finest.
@@ -512,7 +513,7 @@ class RenderWorker:
                     seg_overlays.append((src.label_zarr, m.segment_ids, self._frame_colors(m)))
             slices = []
             # keyframe slices PLUS any 'slice' sweeps evaluated on the global timeline
-            t_global = (index_offset + fi) / max(1, self.job.settings.fps)
+            t_global = (frame_times[fi] if frame_times else (index_offset + fi) / max(1, self.job.settings.fps))
             for sl in list(fr.slices) + self._slices_from_sweeps(t_global):
                 if sl.opacity <= 0.001:
                     continue
@@ -548,7 +549,7 @@ class RenderWorker:
                     if is_hero and emph_glow > 0.0:
                         ov["emphasis"] = emph_glow       # brief emission glow on the hero
                     # a sweep (independent timeline) overrides the keyframe's own clip
-                    t_global = (index_offset + fi) / max(1, self.job.settings.fps)
+                    t_global = (frame_times[fi] if frame_times else (index_offset + fi) / max(1, self.job.settings.fps))
                     cl = self._clip_from_sweeps(m.mesh_name, t_global) or _clip_params(
                         getattr(m, "clip", None))
                     if cl:
@@ -640,6 +641,47 @@ class RenderWorker:
             self.job.status = "error"
             raise RuntimeError(f"blender exited {proc.returncode}")
         return oom
+
+    def _state_at_time(self, t: float):
+        """The interpolated FrameState (camera/slices/meshes) at a GLOBAL time t (seconds),
+        for one-off snapshot frames. Holds the last keyframe past the end."""
+        from .interpolate import _ease, _state_at
+        kfs = self.project.keyframes
+        if not kfs:
+            return None
+        if len(kfs) == 1:
+            return _state_at(kfs[0], kfs[0], 0.0)
+        cum = 0.0
+        for i in range(len(kfs) - 1):
+            d = kfs[i + 1].duration_in_s or 0.0
+            if t <= cum + d or i == len(kfs) - 2:
+                local = 0.0 if d <= 0 else min(1.0, max(0.0, (t - cum) / d))
+                return _state_at(kfs[i], kfs[i + 1], _ease(local, kfs[i + 1].easing))
+            cum += d
+        return _state_at(kfs[-1], kfs[-1], 0.0)
+
+    def render_snapshots(self, times: list[float], out_dir) -> list[str]:
+        """Render single still frames at the given GLOBAL times (seconds) into out_dir —
+        used for clip preview thumbnails. The camera is interpolated at each time and any
+        sweeps are applied at that time (via _build_scene_spec's frame_times)."""
+        import json
+        from pathlib import Path
+
+        from ..data.ng_camera import handedness_flipped
+        self._cb = None
+        self._kfs = self.project.keyframes
+        st0 = next((k.ng_state for k in self.project.keyframes if k.ng_state), None)
+        self._flip_handed = bool(st0 and handedness_flipped(st0))
+        frames = [self._state_at_time(t) for t in times]
+        if any(f is None for f in frames):
+            return []
+        out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+        self.frames_dir = out
+        spec = self._build_scene_spec(frames, frame_times=list(times))
+        spec["output_dir"] = str(out)
+        sp = out / "snap_scene.json"; sp.write_text(json.dumps(spec))
+        self._run_blender(sp, len(frames))
+        return sorted(str(p) for p in out.glob("frame_*.png"))
 
     def run(self, progress: Progress | None = None) -> str:
         self._cb = progress

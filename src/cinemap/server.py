@@ -557,6 +557,33 @@ def delete_sweep(pid: str, sid: str):
     return {"ok": True}
 
 
+@app.post("/api/projects/{pid}/sweeps/{sid}/snapshots")
+def render_sweep_snapshots(pid: str, sid: str):
+    """Render 3 small preview stills (start / middle / end) of a clip, so the timeline
+    bar can show what the sweep looks like. Synchronous (a few draft frames)."""
+    import shutil
+    p = store.load(pid)
+    sw = next((s for s in p.sweeps if s.id == sid), None)
+    if sw is None:
+        raise HTTPException(404, "no such sweep")
+    times = [sw.start_s, sw.start_s + sw.duration_s / 2.0, sw.start_s + sw.duration_s]
+    settings = RenderSettings(width=240, height=160, samples=12, fps=2, draft=True)
+    worker = RenderWorker(p, RenderJob(id=f"snap_{sid}", settings=settings))
+    out = config.PROJECTS_DIR / pid / "assets" / "snapshots" / sid
+    shutil.rmtree(out, ignore_errors=True)
+    try:
+        paths = worker.render_snapshots(times, out)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"snapshot render failed: {e}") from e
+    return {"count": len(paths)}
+
+
+@app.get("/api/projects/{pid}/sweeps/{sid}/snapshot/{idx}")
+def get_sweep_snapshot(pid: str, sid: str, idx: int):
+    path = config.PROJECTS_DIR / pid / "assets" / "snapshots" / sid / f"frame_{idx:05d}.png"
+    return _image_response(str(path), cacheable=False)
+
+
 # ----------------------------- render -----------------------------
 def _run_render(pid: str, job_id: str, worker: RenderWorker, thumbnail_for: str | None = None):
     def cb(pr, msg):
