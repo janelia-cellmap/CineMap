@@ -112,6 +112,9 @@
       <button onclick="addKeyframe()">+ Duplicate last</button>
       <button onclick="document.getElementById('statesFile').click()" title="upload a list of neuroglancer states (one link per line, or a CSV with a state column) — each becomes a keyframe">⭱ Import states</button>
       <input type="file" id="statesFile" accept=".csv,.txt,text/csv,text/plain" style="display:none" onchange="importStates(event)" />
+      <span style="opacity:.4">·</span>
+      <button onclick="orbit()" title="Add a 360° orbit move: the camera circles the current target while the scene holds. Set its duration in seconds.">↻ Orbit 360°</button>
+      <button onclick="openPlanePanel()" title="Add a plane move: an EM slice sweep or a cutaway, as an independent clip on the timeline (start→stop over a duration).">▤ Plane scan</button>
     </div>
     <div id="ngWrap"><iframe id="ng"></iframe></div>
   </div>
@@ -120,8 +123,6 @@
     <div class="pane-title">⬡ Render preview</div>
     <div id="preview"><span class="msg">render output appears here</span></div>
     <div class="controls">
-      <button onclick="orbit()" title="Add a 360° orbit: the camera circles the current target while the scene holds. Keyframes mark the path; the render interpolates between them.">Orbit 360°</button>
-      <button onclick="openPlanePanel()" title="Fixed camera; scan a plane start→stop. It can show the raw EM slice (keyframes) or cut a layer away (an independent cutaway sweep on its own timeline).">▤ Plane scan</button>
       <label title="output width in pixels">w</label><input id="w" value="1280" />
       <label title="output height in pixels">h</label><input id="h" value="720" />
       <label title="Frames per second of the output video (motion smoothness). Total frames rendered = total duration (sum of keyframe durations) × fps.">fps</label><input id="fps" value="30" />
