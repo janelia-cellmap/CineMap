@@ -114,9 +114,6 @@
       <button onclick="addKeyframe()">+ Duplicate last</button>
       <button onclick="document.getElementById('statesFile').click()" title="upload a list of neuroglancer states (one link per line, or a CSV with a state column) — each becomes a keyframe">⭱ Import states</button>
       <input type="file" id="statesFile" accept=".csv,.txt,text/csv,text/plain" style="display:none" onchange="importStates(event)" />
-      <span style="opacity:.4">·</span>
-      <button onclick="orbit()" title="Add a 360° orbit move: the camera circles the current target while the scene holds. Set its duration in seconds.">↻ Orbit 360°</button>
-      <button onclick="openPlanePanel()" title="Add a plane move: an EM slice sweep or a cutaway, as an independent clip on the timeline (start→stop over a duration).">▤ Plane scan</button>
     </div>
     <div id="ngWrap"><iframe id="ng"></iframe></div>
   </div>
@@ -171,6 +168,9 @@
 <footer>
   <div class="pane-title">Keyframe timeline — <span id="kfCount" class="msg">0 frames</span>
     <span class="grow"></span>
+    <button onclick="orbit()" title="Add a 360° orbit move: the camera circles the current target while the scene holds. Set its duration in seconds.">↻ Orbit 360°</button>
+    <button onclick="openPlanePanel()" title="Add a plane move: an EM slice sweep or a cutaway, as an independent clip on the timeline (start→stop over a duration).">▤ Plane scan</button>
+    <span style="width:12px"></span>
     <label class="msg" title="Opacity of the 3D meshes on the SELECTED keyframe. Slide down to fade the meshes and reveal the EM cross-section behind them (0 = meshes hidden, only the EM slice shows).">3D mesh opacity</label>
     <input id="meshOp" type="range" min="0" max="1" step="0.05" value="1" style="width:90px"
       onchange="setMeshOpacity()" title="Opacity of the 3D meshes on the selected keyframe (0 = hidden, reveals the EM slice; 1 = solid)." />
@@ -284,8 +284,8 @@
   </div>
   <label class="msg">From → To &nbsp;<span class="msg">(neuroglancer coords; blank = auto)</span></label>
   <div style="display:flex;gap:6px">
-    <input id="planeFrom" placeholder="auto" style="width:50%" title="paste exactly as neuroglancer shows it (its units + order). One value = depth along the axis; a full x,y,z = a point">
-    <input id="planeTo" placeholder="auto" style="width:50%" title="paste exactly as neuroglancer shows it (its units + order). One value = depth along the axis; a full x,y,z = a point">
+    <input id="planeFrom" placeholder="auto" oninput="updateSideLabels()" style="width:50%" title="paste exactly as neuroglancer shows it (its units + order). One value = depth along the axis; a full x,y,z = a point">
+    <input id="planeTo" placeholder="auto" oninput="updateSideLabels()" style="width:50%" title="paste exactly as neuroglancer shows it (its units + order). One value = depth along the axis; a full x,y,z = a point">
   </div>
   <label class="msg" title="How long the scan/cutaway takes on screen. Frames are filled in automatically from this and the fps — you set time, not frame count.">Duration (s)</label>
   <input id="planeDur" type="number" min="0.1" step="0.1" value="4" style="width:100%">
@@ -819,12 +819,19 @@ function planeModeChanged() {
   $('planeCull').style.display = $('planeMode').value === 'slice' ? 'none' : 'block';
   if ($('planeAddLbl')) $('planeAddLbl').textContent = cut ? 'Add cutaway' : 'Add scan';
 }
-// spell out the cut side with the actual axis (x/y/z), so "+/-" isn't abstract
+// spell out the cut side. For an OBLIQUE cut (full x,y,z in both boxes) the axis is
+// meaningless, so describe it relative to the From→To direction instead of "+z".
 function updateSideLabels() {
-  const ax = $('planeAxis').value, sel = $('planeSide');
-  if (!sel) return;
-  sel.options[0].text = `cut the +${ax} side (keep −${ax})`;
-  sel.options[1].text = `cut the −${ax} side (keep +${ax})`;
+  const sel = $('planeSide'); if (!sel) return;
+  const fn = planeNums($('planeFrom').value), tn = planeNums($('planeTo').value);
+  if (fn.length >= 3 && tn.length >= 3) {
+    sel.options[0].text = 'cut toward the “To” end';
+    sel.options[1].text = 'cut toward the “From” end';
+  } else {
+    const ax = $('planeAxis').value;
+    sel.options[0].text = `cut the +${ax} side (keep −${ax})`;
+    sel.options[1].text = `cut the −${ax} side (keep +${ax})`;
+  }
 }
 // parse a box: full "x, y, z" -> [x,y,z] (oblique), single number -> scalar depth nm
 function planeNums(str) {
