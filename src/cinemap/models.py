@@ -188,8 +188,10 @@ class Sweep(BaseModel):
     whatever its keyframes say. This decouples 'what the plane does' from 'where the
     camera is' — a sweep is one self-contained thing laid on top of the camera track."""
     id: str
-    kind: Literal["cutaway"] = "cutaway"   # (slice/orbit sweeps can extend this later)
-    layer: str = ""                        # mesh layer name the clip plane cuts
+    # cutaway = slice a mesh layer's clip plane; slice = sweep an EM cross-section plane.
+    kind: Literal["cutaway", "slice"] = "cutaway"
+    layer: str = ""                        # mesh layer name the clip plane cuts (cutaway)
+    em_name: str = ""                      # EM layer name the slice shows (slice)
     axis: Axis = "z"
     normal: Optional[list[float]] = None   # oblique plane; None => axis-aligned
     side: int = 1
@@ -198,6 +200,7 @@ class Sweep(BaseModel):
     start_s: float = 0.0                   # global-timeline start (seconds)
     duration_s: float = 2.0
     easing: Literal["linear", "ease-in-out", "ease-in", "ease-out"] = "linear"
+    opacity: float = 1.0                   # EM slice overlay strength (slice kind)
     enabled: bool = True
 
 

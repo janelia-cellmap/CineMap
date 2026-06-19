@@ -355,16 +355,19 @@ def _plane_default_range(project: Project, base: Keyframe, ax_i: int,
     return lo - pad, hi + pad
 
 
-def add_sweep(project: Project, layer: str, axis: str = "z", normal=None, side: int = 1,
+def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, side: int = 1,
               from_nm=None, to_nm=None, start_s=None, duration_s=None,
-              from_ng=None, to_ng=None, easing: str = "linear") -> Sweep:
-    """Add an independent cutaway sweep on `layer`: slide its clip plane from `from_nm`
-    to `to_nm` over [start_s, start_s+duration_s] of the GLOBAL timeline — regardless of
-    the camera keyframes. Defaults: the full layer bounds along `axis`, starting at 0 and
-    lasting the movie's current length (or 4s). `from_ng`/`to_ng` accept neuroglancer
-    coords (a triple => an oblique plane along A->B; a single value => a depth)."""
+              from_ng=None, to_ng=None, easing: str = "linear",
+              kind: str = "cutaway", em_name: str = "") -> Sweep:
+    """Add an independent plane sweep on its OWN timeline (decoupled from the camera).
+    kind='cutaway' slides a mesh layer's clip plane; kind='slice' sweeps an EM cross-section.
+    Slides from `from_nm` to `to_nm` over [start_s, start_s+duration_s]. Defaults: the full
+    layer/volume bounds along `axis`, start 0, lasting the movie's length (or 4s).
+    `from_ng`/`to_ng` accept neuroglancer coords (a triple => oblique plane along A->B; a
+    single value => a depth)."""
     base = project.keyframes[-1] if project.keyframes else None
     oblique = False
+    bbox_layer = layer if kind == "cutaway" else None
     if base is not None and (from_ng is not None or to_ng is not None):
         fx, tx, a, b = _ng_coords_to_nm(base, project, axis, from_ng, to_ng)
         if fx and tx:
@@ -377,17 +380,20 @@ def add_sweep(project: Project, layer: str, axis: str = "z", normal=None, side: 
             to_nm = b if b is not None else to_nm
     ax_i = {"x": 0, "y": 1, "z": 2}[axis]
     if from_nm is None or to_nm is None:
-        lo, hi = _plane_default_range(project, base, ax_i, layer) if base else (0.0, 1.0)
+        lo, hi = _plane_default_range(project, base, ax_i, bbox_layer) if base else (0.0, 1.0)
         from_nm = lo if from_nm is None else from_nm
         to_nm = hi if to_nm is None else to_nm
-    # Default direction = REVEAL: start with nothing cut and progressively cut toward the
-    # end. The clip removes the dot(x,normal) > position side for side>=0 (so 'nothing cut'
-    # is the HIGH-offset end) and the < position side for side<0 (nothing cut at the LOW
-    # end). Order from/to so the cut grows over time regardless of which corner came first.
-    lo_off, hi_off = (from_nm, to_nm) if from_nm <= to_nm else (to_nm, from_nm)
-    from_nm, to_nm = (hi_off, lo_off) if side >= 0 else (lo_off, hi_off)
+    if kind == "cutaway":
+        # Default direction = REVEAL: start with nothing cut and progressively cut toward
+        # the end. The clip removes the dot(x,normal) > position side for side>=0 ('nothing
+        # cut' is the HIGH-offset end) and < position for side<0. Order from/to so the cut
+        # grows over time regardless of which corner came first.
+        lo_off, hi_off = (from_nm, to_nm) if from_nm <= to_nm else (to_nm, from_nm)
+        from_nm, to_nm = (hi_off, lo_off) if side >= 0 else (lo_off, hi_off)
+    # (slice keeps from->to literal: the EM plane travels from the start position to the stop)
     total = sum(k.duration_in_s for k in project.keyframes) or 4.0
-    sw = Sweep(id=_uid("sw"), layer=layer, axis=axis, normal=(normal if oblique else None),
+    sw = Sweep(id=_uid("sw"), kind=kind, layer=layer, em_name=em_name, axis=axis,
+               normal=(normal if oblique else None),
                side=int(side), from_nm=float(from_nm), to_nm=float(to_nm),
                start_s=float(start_s if start_s is not None else 0.0),
                duration_s=float(duration_s if duration_s is not None else total),

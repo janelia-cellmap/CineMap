@@ -77,6 +77,7 @@
   .sweepbar .swlbl { font-size:11px; color:#fff; white-space:nowrap; }
   .sweepbar .del { margin-left:auto; color:#fff; opacity:.7; cursor:pointer; padding-left:6px; }
   .sweepbar .del:hover { opacity:1; }
+  .sweepbar.slicebar { background:linear-gradient(90deg,#2f8f8f,#46c2c2); }   /* EM slice = teal */
   .sweepbar.dragging { opacity:.85; box-shadow:0 0 0 1px #fff, 0 2px 8px #000; }
   .sweepbar .grip { position:absolute; right:0; top:0; width:8px; height:100%; cursor:ew-resize; background:rgba(255,255,255,.25); }
   .swsnap { position:absolute; top:14px; height:22px; width:2px; background:#8a8fff; pointer-events:none; box-shadow:0 0 4px #8a8fff; }
@@ -298,8 +299,10 @@
   <input id="swStart" type="number" min="0" step="0.1" style="width:100%">
   <label class="msg">Duration (s)</label>
   <input id="swDur" type="number" min="0.1" step="0.1" style="width:100%">
-  <label class="msg" title="which side of the plane is cut away (the other stays solid)">What gets cut away</label>
-  <select id="swSide" style="width:100%"><option value="1">+ side</option><option value="-1">− side</option></select>
+  <div id="swSideRow">
+    <label class="msg" title="which side of the plane is cut away (the other stays solid)">What gets cut away</label>
+    <select id="swSide" style="width:100%"><option value="1">+ side</option><option value="-1">− side</option></select>
+  </div>
   <label class="msg">Easing</label>
   <select id="swEase" style="width:100%">
     <option value="linear">linear (constant speed)</option>
@@ -528,16 +531,19 @@ function renderSweeps(p) {
   let t = 0; SWEEP_SNAPS = [0];
   for (const k of (p.keyframes || [])) { t += (k.duration_in_s || 0); SWEEP_SNAPS.push(t); }
   SWEEP_SNAPS.push(SWEEP_TOTAL);
-  lane.innerHTML = '<div class="lanelbl">cutaway sweeps — drag to move · drag the right edge to resize · click to edit</div>'
+  lane.innerHTML = '<div class="lanelbl">plane sweeps — drag to move · drag the right edge to resize · click to edit</div>'
     + sweeps.map(s => {
     const left = Math.max(0, (s.start_s / SWEEP_TOTAL) * 100);
     const width = Math.max(4, Math.min(100 - left, (s.duration_s / SWEEP_TOTAL) * 100));
     const dir = s.normal ? 'oblique' : `${s.axis}`;
-    return `<div class="sweepbar" data-id="${s.id}" style="left:${left}%;width:${width}%"
+    const isSlice = s.kind === 'slice';
+    const name = isSlice ? (s.em_name || 'EM slice') : s.layer;
+    const icon = isSlice ? '▦' : '▤';
+    return `<div class="sweepbar${isSlice ? ' slicebar' : ''}" data-id="${s.id}" style="left:${left}%;width:${width}%"
                  onmousedown="startSweepDrag(event,'${s.id}','move')"
-                 title="${s.layer} · ${dir} · ${Math.round(s.from_nm)}→${Math.round(s.to_nm)}nm · start ${s.start_s}s · ${s.duration_s}s">
+                 title="${isSlice ? 'EM slice' : 'cutaway'}: ${name} · ${dir} · ${Math.round(s.from_nm)}→${Math.round(s.to_nm)}nm · start ${s.start_s}s · ${s.duration_s}s">
       <span class="del" onmousedown="event.stopPropagation()" onclick="event.stopPropagation(); delSweep('${s.id}')">✕</span>
-      <span class="swlbl">▤ ${s.layer} ${dir} · ${s.duration_s}s</span>
+      <span class="swlbl">${icon} ${name} ${dir} · ${s.duration_s}s</span>
       <span class="grip" onmousedown="event.stopPropagation(); startSweepDrag(event,'${s.id}','resize')"></span>
     </div>`;
   }).join('');
@@ -591,7 +597,10 @@ let EDIT_SWEEP_ID = null;
 function openSweepEdit(id) {
   const s = (CUR.sweeps || []).find(x => x.id === id); if (!s) return;
   EDIT_SWEEP_ID = id;
-  $('sweepWhich').textContent = `${s.layer} · ${s.normal ? 'oblique' : s.axis} axis`;
+  const isSlice = s.kind === 'slice';
+  document.querySelector('#sweepPanel b').textContent = isSlice ? '▦ Edit EM slice sweep' : '▤ Edit cutaway sweep';
+  $('sweepWhich').textContent = `${isSlice ? (s.em_name||'EM') : s.layer} · ${s.normal ? 'oblique' : s.axis} axis`;
+  $('swSideRow').style.display = isSlice ? 'none' : 'block';   // 'side' only meaningful for a cut
   $('swStart').value = s.start_s; $('swDur').value = s.duration_s;
   $('swSide').value = String(s.side); $('swEase').value = s.easing || 'linear';
   $('swFrom').value = Math.round(s.from_nm); $('swTo').value = Math.round(s.to_nm);
@@ -793,39 +802,28 @@ function planeNums(str) {
 }
 async function applyPlaneScan() {
   if(!PID) return;
+  // Both EM slice and cutaway are now independent plane-CLIPS (own timeline, in the lane),
+  // defined by start→stop + duration — no keyframes, no per-keyframe frame count.
   const axis = $('planeAxis').value, mode = $('planeMode').value;
   const side = parseInt($('planeSide').value,10);
   const fn = planeNums($('planeFrom').value), tn = planeNums($('planeTo').value);
   const oblique = fn.length >= 3 && tn.length >= 3;
-  // Cutaway is now an INDEPENDENT sweep (its own timeline, decoupled from the camera) —
-  // not 24 culled keyframes. 'slice' (raw EM) still drops keyframes for now.
-  if (mode === 'cull') {
-    const layer = $('planeLayer').value;
-    if (!layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
-    LAST_CUT_LAYER = layer;   // remember for next time the panel opens
-    const dur = parseFloat($('planeDur')?.value) || undefined;
-    const body = {layer, axis, side, easing: 'linear'};
+  const dur = parseFloat($('planeDur')?.value) || 4;
+  const layer = $('planeLayer').value;
+  const mk = async (kind) => {
+    const body = { kind, axis, side, easing: 'linear', duration_s: dur };
+    if (kind === 'cutaway') { body.layer = layer; LAST_CUT_LAYER = layer; }
     if (fn.length) body.from_ng = fn;
     if (tn.length) body.to_ng = tn;
-    if (dur) body.duration_s = dur;
-    $('planeMsg').textContent = 'adding cutaway sweep…';
     await api('POST', `/api/projects/${PID}/sweeps`, body);
-    $('planeMsg').textContent = `cutaway sweep added` + (oblique ? ' (oblique)' : '');
-    await reload();
-    return;
-  }
-  // raw EM slice: duration-driven, 2 keyframes (the slice position interpolates between
-  // them, so the EM is rendered smoothly at every frame — no need to sample many keyframes).
-  const mesh_name = (mode!=='slice' && $('planeLayer').value) ? $('planeLayer').value : null;
-  const dur = parseFloat($('planeDur')?.value) || 4;
-  const body = {axis, mode, mesh_name, side, n: 2, total_duration_s: dur};
-  if (fn.length) body.from_ng = fn;
-  if (tn.length) body.to_ng = tn;
+  };
   $('planeMsg').textContent = 'adding…';
-  const r = await api('POST', `/api/projects/${PID}/plane_move`, body);
-  $('planeMsg').textContent = `EM slice scan added (${dur}s)` + (oblique ? ' (oblique)' : '');
+  if (mode === 'cull' && !layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
+  if (mode === 'slice') await mk('slice');
+  else if (mode === 'cull') await mk('cutaway');
+  else { await mk('slice'); if (layer) await mk('cutaway'); }   // both
+  $('planeMsg').textContent = `added (${dur}s)` + (oblique ? ' (oblique)' : '');
   await reload();
-  if (r.thumb_id) renderThumbnail(r.thumb_id);
 }
 
 let JOB = null;

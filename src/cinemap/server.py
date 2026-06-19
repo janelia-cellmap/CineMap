@@ -494,7 +494,9 @@ def plane_move(pid: str, req: PlaneMoveReq):
 
 
 class SweepReqNew(BaseModel):
-    layer: str
+    kind: str = "cutaway"                # 'cutaway' (clip a mesh layer) or 'slice' (EM plane)
+    layer: str = ""                      # mesh layer (cutaway)
+    em_name: str = ""                    # EM layer (slice)
     axis: str = "z"
     side: int = 1
     from_ng: list[float] | None = None   # NG coords: triple => oblique A->B, single => depth
@@ -508,10 +510,11 @@ class SweepReqNew(BaseModel):
 
 @app.post("/api/projects/{pid}/sweeps")
 def add_sweep(pid: str, req: SweepReqNew):
-    """Create an independent cutaway sweep (animates a layer's clip plane on its own
-    timeline, decoupled from the camera keyframes)."""
+    """Create an independent plane sweep (cutaway or EM slice) on its own timeline,
+    decoupled from the camera keyframes."""
     p = store.load(pid)
-    sw = ops.add_sweep(p, layer=req.layer, axis=req.axis, side=req.side,
+    sw = ops.add_sweep(p, kind=req.kind, layer=req.layer, em_name=req.em_name,
+                       axis=req.axis, side=req.side,
                        from_ng=req.from_ng, to_ng=req.to_ng,
                        from_nm=req.from_nm, to_nm=req.to_nm,
                        start_s=req.start_s, duration_s=req.duration_s, easing=req.easing)

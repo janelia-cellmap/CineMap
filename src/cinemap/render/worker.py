@@ -245,6 +245,24 @@ class RenderWorker:
                     "position_nm": float(pos)}
         return None
 
+    def _slices_from_sweeps(self, t: float) -> list:
+        """EM slice planes from active 'slice' sweeps at global time `t` — swept on the
+        sweep's OWN timeline (independent of the camera keyframes). Returns FrameSlice
+        objects at the interpolated position; holds at the end after the sweep finishes."""
+        from .interpolate import FrameSlice
+        out = []
+        default_em = self.manifest.em.name if self.manifest.em else "em"
+        for sw in getattr(self.project, "sweeps", []) or []:
+            if not getattr(sw, "enabled", True) or getattr(sw, "kind", "") != "slice":
+                continue
+            if t < sw.start_s:
+                continue
+            p = _ease(min(1.0, (t - sw.start_s) / (sw.duration_s or 1e-9)), sw.easing)
+            pos = sw.from_nm + (sw.to_nm - sw.from_nm) * p
+            out.append(FrameSlice(sw.em_name or default_em, sw.axis, float(pos), 0,
+                                  float(sw.opacity), normal=sw.normal))
+        return out
+
     @staticmethod
     def _frame_colors(m):
         """LayerColors (neuroglancer seed / fixed colors) from a FrameMesh."""
@@ -486,7 +504,9 @@ class RenderWorker:
                 if src and src.label_zarr and m.segment_ids:
                     seg_overlays.append((src.label_zarr, m.segment_ids, self._frame_colors(m)))
             slices = []
-            for sl in fr.slices:
+            # keyframe slices PLUS any 'slice' sweeps evaluated on the global timeline
+            t_global = (index_offset + fi) / max(1, self.job.settings.fps)
+            for sl in list(fr.slices) + self._slices_from_sweeps(t_global):
                 if sl.opacity <= 0.001:
                     continue
                 # slot is stable across frames (matches interpolate's slice identity)
@@ -648,8 +668,7 @@ class RenderWorker:
         fps = max(1, self.job.settings.fps)
         sweep_end = max([0.0] + [float(s.start_s) + float(s.duration_s)
                                  for s in (getattr(self.project, "sweeps", []) or [])
-                                 if getattr(s, "enabled", True)
-                                 and getattr(s, "kind", "") == "cutaway"])
+                                 if getattr(s, "enabled", True)])
         need = int(round(sweep_end * fps))
         if need > len(frames):
             frames = frames + [frames[-1]] * (need - len(frames))
