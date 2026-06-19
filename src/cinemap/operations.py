@@ -392,6 +392,19 @@ def remove_sweep(project: Project, sweep_id: str) -> None:
     store.save(project)
 
 
+def update_sweep(project: Project, sweep_id: str, **fields) -> Sweep | None:
+    """Patch an existing sweep's fields (start_s, duration_s, side, easing, from_nm,
+    to_nm, axis, layer, enabled). Unknown/None fields are ignored."""
+    sw = next((s for s in project.sweeps if s.id == sweep_id), None)
+    if sw is None:
+        return None
+    for k, v in fields.items():
+        if v is not None and hasattr(sw, k):
+            setattr(sw, k, v)
+    store.save(project)
+    return sw
+
+
 def _unit(v):
     import math as _m
     n = _m.sqrt(sum(c * c for c in v)) or 1.0

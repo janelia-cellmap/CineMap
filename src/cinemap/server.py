@@ -498,6 +498,26 @@ def add_sweep(pid: str, req: SweepReqNew):
     return sw.model_dump()
 
 
+class SweepPatch(BaseModel):
+    start_s: float | None = None
+    duration_s: float | None = None
+    side: int | None = None
+    easing: str | None = None
+    from_nm: float | None = None
+    to_nm: float | None = None
+    axis: str | None = None
+    enabled: bool | None = None
+
+
+@app.put("/api/projects/{pid}/sweeps/{sid}")
+def update_sweep(pid: str, sid: str, req: SweepPatch):
+    p = store.load(pid)
+    sw = ops.update_sweep(p, sid, **req.model_dump(exclude_none=True))
+    if sw is None:
+        raise HTTPException(404, "no such sweep")
+    return sw.model_dump()
+
+
 @app.delete("/api/projects/{pid}/sweeps/{sid}")
 def delete_sweep(pid: str, sid: str):
     p = store.load(pid)

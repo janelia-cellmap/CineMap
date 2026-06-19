@@ -286,6 +286,32 @@
   <div class="msg" style="margin-top:2px">Tip: copy a position straight from neuroglancer. A single value scans along the axis; a full <b>x,y,z</b> in <i>both</i> boxes = an <b>oblique</b> scan along that line (axis ignored). Converted to nm via this view's grid.</div>
 </div>
 
+<div id="sweepPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #5a5fcf;border-radius:8px;padding:12px 14px;width:300px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.9">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <b>▤ Edit cutaway sweep</b><span onclick="$('sweepPanel').style.display='none'" style="cursor:pointer;opacity:.7">✕</span>
+  </div>
+  <div class="msg" id="sweepWhich" style="margin:2px 0 6px"></div>
+  <label class="msg">Start (s)</label>
+  <input id="swStart" type="number" min="0" step="0.1" style="width:100%">
+  <label class="msg">Duration (s)</label>
+  <input id="swDur" type="number" min="0.1" step="0.1" style="width:100%">
+  <label class="msg" title="which side of the plane is cut away (the other stays solid)">What gets cut away</label>
+  <select id="swSide" style="width:100%"><option value="1">+ side</option><option value="-1">− side</option></select>
+  <label class="msg">Easing</label>
+  <select id="swEase" style="width:100%">
+    <option value="linear">linear (constant speed)</option>
+    <option value="ease-in-out">ease in-out (smooth start/stop)</option>
+    <option value="ease-in">ease in</option><option value="ease-out">ease out</option>
+  </select>
+  <label class="msg">From → To (nm along axis)</label>
+  <div style="display:flex;gap:6px">
+    <input id="swFrom" type="number" step="1" style="width:50%"><input id="swTo" type="number" step="1" style="width:50%">
+  </div>
+  <div style="margin-top:8px"><button class="primary" onclick="saveSweepEdit()">Save</button>
+    <button onclick="delSweep(EDIT_SWEEP_ID); $('sweepPanel').style.display='none'">Delete</button>
+    <span id="swMsg" class="msg"></span></div>
+</div>
+
 <div id="lookZoom" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.82);align-items:center;justify-content:center;gap:18px;pointer-events:none">
   <div style="text-align:center"><div style="color:#bbb;margin-bottom:6px;font-size:14px">before</div><img id="zoomBefore" style="max-width:45vw;max-height:82vh;border-radius:6px;background:#000"></div>
   <div style="text-align:center"><div style="color:#bbb;margin-bottom:6px;font-size:14px">after</div><img id="zoomAfter" style="max-width:45vw;max-height:82vh;border-radius:6px;background:#000"></div>
@@ -489,9 +515,9 @@ function renderSweeps(p) {
     const left = Math.max(0, (s.start_s / total) * 100);
     const width = Math.max(4, Math.min(100 - left, (s.duration_s / total) * 100));
     const dir = s.normal ? 'oblique' : `${s.axis}`;
-    return `<div class="sweepbar" style="left:${left}%;width:${width}%"
-                 title="${s.layer} · ${dir} · ${Math.round(s.from_nm)}→${Math.round(s.to_nm)}nm · ${s.duration_s}s">
-      <span class="del" onclick="delSweep('${s.id}')">✕</span>
+    return `<div class="sweepbar" style="left:${left}%;width:${width}%" onclick="openSweepEdit('${s.id}')"
+                 title="${s.layer} · ${dir} · ${Math.round(s.from_nm)}→${Math.round(s.to_nm)}nm · ${s.duration_s}s — click to edit">
+      <span class="del" onclick="event.stopPropagation(); delSweep('${s.id}')">✕</span>
       <span class="swlbl">▤ ${s.layer} ${dir} · ${s.duration_s}s</span>
     </div>`;
   }).join('');
@@ -499,6 +525,27 @@ function renderSweeps(p) {
 async function delSweep(id) {
   if (!PID) return;
   await api('DELETE', `/api/projects/${PID}/sweeps/${id}`);
+  reload();
+}
+let EDIT_SWEEP_ID = null;
+function openSweepEdit(id) {
+  const s = (CUR.sweeps || []).find(x => x.id === id); if (!s) return;
+  EDIT_SWEEP_ID = id;
+  $('sweepWhich').textContent = `${s.layer} · ${s.normal ? 'oblique' : s.axis} axis`;
+  $('swStart').value = s.start_s; $('swDur').value = s.duration_s;
+  $('swSide').value = String(s.side); $('swEase').value = s.easing || 'linear';
+  $('swFrom').value = Math.round(s.from_nm); $('swTo').value = Math.round(s.to_nm);
+  $('swMsg').textContent = '';
+  $('lookPanel').style.display='none'; $('planePanel').style.display='none'; $('propPanel').style.display='none';
+  $('sweepPanel').style.display = 'block';
+}
+async function saveSweepEdit() {
+  if (!PID || !EDIT_SWEEP_ID) return;
+  const body = { start_s:+$('swStart').value, duration_s:+$('swDur').value,
+                 side:parseInt($('swSide').value,10), easing:$('swEase').value,
+                 from_nm:+$('swFrom').value, to_nm:+$('swTo').value };
+  await api('PUT', `/api/projects/${PID}/sweeps/${EDIT_SWEEP_ID}`, body);
+  $('sweepPanel').style.display='none';
   reload();
 }
 function toggleGroup(g) {
