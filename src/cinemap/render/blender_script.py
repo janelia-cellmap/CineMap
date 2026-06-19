@@ -585,7 +585,16 @@ def _geometric_clip(obj, clip) -> None:
                 bmesh.ops.holes_fill(bm, edges=cut, sides=0)
                 newf = [f for f in bm.faces if f not in before]
                 if newf:
-                    bmesh.ops.triangulate(bm, faces=newf)
+                    tri = bmesh.ops.triangulate(bm, faces=newf)
+                    newf = [f for f in tri.get("faces", newf) if f.is_valid]
+                # The cap is coplanar with the clip plane, but the rest of the cell is
+                # SMOOTH-shaded — letting the cap inherit that averages its triangles'
+                # normals into a wrinkled fan. Flat-shade the cap so it reads as one clean
+                # solid cross-section; the cut + cap make a closed solid again, so recalc
+                # gives every face (incl. the cap) a consistent outward normal.
+                for f in newf:
+                    f.smooth = False
+                bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
             except Exception:  # noqa: BLE001 (degenerate loop -> fall back to global fill)
                 try:
                     bmesh.ops.triangle_fill(bm, edges=cut, use_beauty=True, normal=n * side)
