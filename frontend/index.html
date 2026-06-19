@@ -82,8 +82,10 @@
   .sweepbar .grip { position:absolute; right:0; top:0; width:8px; height:100%; cursor:ew-resize; background:rgba(255,255,255,.25); }
   .swsnap { position:absolute; top:14px; height:22px; width:2px; background:#8a8fff; pointer-events:none; box-shadow:0 0 4px #8a8fff; }
   .kf .kfdur { position:absolute; bottom:4px; right:6px; background:#0c0d11cc; border-radius:4px; padding:0 4px; font-size:10px; color:#aab0ff; z-index:3; }
-  .kf .kfdur input { width:30px; background:transparent; border:0; color:#cdd3ff; font-size:10px; text-align:right; padding:0; }
+  .kf .kfdur input { width:26px; background:transparent; border:0; color:#cdd3ff; font-size:10px; text-align:right; padding:0; }
   .kf .kfdur input::-webkit-outer-spin-button, .kf .kfdur input::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
+  .kf .kfdur select { background:transparent; border:0; color:#aab0ff; font-size:11px; padding:0; cursor:pointer; }
+  .kf .kfdur select option { background:#11151f; color:#cdd3ff; }
   .msg { font-size:12px; color:var(--mut); }
   /* hover the before/after strip -> big side-by-side overlay (see #lookZoom) */
   #lookCompare { cursor: zoom-in; }
@@ -470,14 +472,17 @@ function kfCard(k, i) {
       <div class="lbl">⠿ KF${i} · ${k.label||''}</div>
       <div class="meta">${k.slices.map(s=>s.axis+'='+Math.round(s.position_nm)).join(' ')}<br>
         ${k.meshes.map(m=>m.mesh_name).join(',')||'—'}</div>
-      <label class="kfdur" title="transition duration INTO this keyframe (seconds); 0 = instant cut" onclick="event.stopPropagation()">
+      <span class="kfdur" title="transition INTO this keyframe — duration (s; 0 = instant cut) and easing (how the move accelerates)" onclick="event.stopPropagation()">
         <input type="number" min="0" step="0.1" value="${(+k.duration_in_s).toFixed(2).replace(/\.?0+$/,'')}"
-               onchange="setKfDuration('${k.id}', this.value)"> s</label>
+               onchange="setKfTiming('${k.id}', {duration_in_s: parseFloat(this.value)||0})">s
+        <select onchange="setKfTiming('${k.id}', {easing: this.value})" title="easing (active when Director is off)">
+          ${['ease-in-out','linear','ease-in','ease-out'].map(e=>`<option value="${e}"${k.easing===e?' selected':''}>${{'ease-in-out':'⌢','linear':'╱','ease-in':'⌜','ease-out':'⌝'}[e]}</option>`).join('')}
+        </select></span>
     </div>`;
 }
-async function setKfDuration(id, v) {
+async function setKfTiming(id, fields) {
   if (!PID) return;
-  await api('PUT', `/api/projects/${PID}/keyframes/${id}/duration`, { duration_in_s: parseFloat(v) || 0 });
+  await api('PUT', `/api/projects/${PID}/keyframes/${id}/duration`, fields);
   reload();
 }
 function renderKeyframes(p) {

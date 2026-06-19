@@ -429,19 +429,25 @@ def set_mesh_opacity(pid: str, kid: str, req: MeshOpacityReq):
 
 
 class DurationReq(BaseModel):
-    duration_in_s: float
+    duration_in_s: float | None = None
+    easing: str | None = None
 
 
 @app.put("/api/projects/{pid}/keyframes/{kid}/duration")
 def set_keyframe_duration(pid: str, kid: str, req: DurationReq):
-    """Set a keyframe's transition duration (seconds) — the time the camera/slice takes to
-    glide INTO this keyframe from the previous one. 0 = an instant cut."""
+    """Set a keyframe's transition TIMING — duration (seconds the camera/slice glides INTO
+    this keyframe; 0 = instant cut) and/or easing (how it accelerates)."""
     p = store.load(pid)
     kf = next((k for k in p.keyframes if k.id == kid), None)
     if kf is None:
         raise HTTPException(404, "no such keyframe")
-    ops.update_keyframe(p, kid, duration_in_s=max(0.0, float(req.duration_in_s)))
-    return {"ok": True, "duration_in_s": max(0.0, float(req.duration_in_s))}
+    fields = {}
+    if req.duration_in_s is not None:
+        fields["duration_in_s"] = max(0.0, float(req.duration_in_s))
+    if req.easing:
+        fields["easing"] = req.easing
+    ops.update_keyframe(p, kid, **fields)
+    return {"ok": True, **fields}
 
 
 @app.post("/api/projects/{pid}/keyframes/reorder")
