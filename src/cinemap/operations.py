@@ -23,6 +23,7 @@ from .models import (
     RenderJob,
     RenderSettings,
     SlicePlane,
+    Sweep,
 )
 
 
@@ -348,6 +349,47 @@ def _plane_default_range(project: Project, base: Keyframe, ax_i: int,
         lo, hi = center[ax_i] - 0.55 * size[ax_i], center[ax_i] + 0.55 * size[ax_i]
     pad = (hi - lo) * 0.1 or 1000.0
     return lo - pad, hi + pad
+
+
+def add_sweep(project: Project, layer: str, axis: str = "z", normal=None, side: int = 1,
+              from_nm=None, to_nm=None, start_s=None, duration_s=None,
+              from_ng=None, to_ng=None, easing: str = "linear") -> Sweep:
+    """Add an independent cutaway sweep on `layer`: slide its clip plane from `from_nm`
+    to `to_nm` over [start_s, start_s+duration_s] of the GLOBAL timeline — regardless of
+    the camera keyframes. Defaults: the full layer bounds along `axis`, starting at 0 and
+    lasting the movie's current length (or 4s). `from_ng`/`to_ng` accept neuroglancer
+    coords (a triple => an oblique plane along A->B; a single value => a depth)."""
+    base = project.keyframes[-1] if project.keyframes else None
+    oblique = False
+    if base is not None and (from_ng is not None or to_ng is not None):
+        fx, tx, a, b = _ng_coords_to_nm(base, project, axis, from_ng, to_ng)
+        if fx and tx:
+            normal = _unit([tx[i] - fx[i] for i in range(3)]); axis = _dominant_axis(normal)
+            from_nm = sum(normal[j] * fx[j] for j in range(3))
+            to_nm = sum(normal[j] * tx[j] for j in range(3))
+            oblique = True
+        else:
+            from_nm = a if a is not None else from_nm
+            to_nm = b if b is not None else to_nm
+    ax_i = {"x": 0, "y": 1, "z": 2}[axis]
+    if from_nm is None or to_nm is None:
+        lo, hi = _plane_default_range(project, base, ax_i, layer) if base else (0.0, 1.0)
+        from_nm = lo if from_nm is None else from_nm
+        to_nm = hi if to_nm is None else to_nm
+    total = sum(k.duration_in_s for k in project.keyframes) or 4.0
+    sw = Sweep(id=_uid("sw"), layer=layer, axis=axis, normal=(normal if oblique else None),
+               side=int(side), from_nm=float(from_nm), to_nm=float(to_nm),
+               start_s=float(start_s if start_s is not None else 0.0),
+               duration_s=float(duration_s if duration_s is not None else total),
+               easing=easing)
+    project.sweeps.append(sw)
+    store.save(project)
+    return sw
+
+
+def remove_sweep(project: Project, sweep_id: str) -> None:
+    project.sweeps = [s for s in project.sweeps if s.id != sweep_id]
+    store.save(project)
 
 
 def _unit(v):

@@ -65,6 +65,14 @@
   .kf .stackbadge { position:absolute; top:4px; left:6px; background:#4a4fbf; color:#fff; border-radius:4px; padding:0 6px; font-size:11px; line-height:16px; z-index:3; box-shadow:0 1px 3px #0009; }
   .kfgrouphdr { flex:0 0 22px; height:150px; display:flex; align-items:center; justify-content:center; gap:4px; writing-mode:vertical-rl; transform:rotate(180deg); font-size:11px; color:#aab0ff; cursor:pointer; border:1px dashed #5a5fcf; border-radius:6px; user-select:none; }
   .kfgrouphdr:hover { background:#1a1d33; }
+  /* independent cutaway-sweep lane: a time track below the keyframes */
+  #sweepLane { position:relative; margin:4px 8px 8px; min-height:0; }
+  #sweepLane:not(:empty) { min-height:34px; padding-top:16px; }
+  .lanelbl { position:absolute; top:0; left:0; font-size:10px; color:#8a8fff; letter-spacing:.04em; text-transform:uppercase; }
+  .sweepbar { position:absolute; top:16px; height:18px; background:linear-gradient(90deg,#5a5fcf,#8a8fff); border-radius:4px; display:flex; align-items:center; padding:0 6px; box-shadow:0 1px 3px #0009; overflow:hidden; }
+  .sweepbar .swlbl { font-size:11px; color:#fff; white-space:nowrap; }
+  .sweepbar .del { margin-left:auto; color:#fff; opacity:.7; cursor:pointer; padding-left:6px; }
+  .sweepbar .del:hover { opacity:1; }
   .msg { font-size:12px; color:var(--mut); }
   /* hover the before/after strip -> big side-by-side overlay (see #lookZoom) */
   #lookCompare { cursor: zoom-in; }
@@ -158,6 +166,7 @@
     <button id="blendBtn" onclick="startRender('blend')" title="bake the whole shot to a self-contained animated .blend (camera, meshes, EM slices; textures packed in)">⬇ Export .blend</button>
   </div>
   <div id="timeline"></div>
+  <div id="sweepLane"></div>
 </footer>
 
 <div id="propPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #3a3f47;border-radius:8px;padding:12px 14px;width:330px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.9">
@@ -253,6 +262,8 @@
     <select id="planeLayer" style="width:100%"></select>
     <label class="msg">Reveal direction</label>
     <select id="planeSide" style="width:100%"><option value="1">forward (+)</option><option value="-1">backward (−)</option></select>
+    <label class="msg" title="cutaway is an independent sweep on its own timeline; this is how long it takes, regardless of the camera">Cutaway duration (s)</label>
+    <input id="planeDur" type="number" min="0.1" step="0.1" value="4" style="width:100%">
   </div>
   <label class="msg">From → To &nbsp;<span class="msg">(neuroglancer coords; blank = auto)</span></label>
   <div style="display:flex;gap:6px">
@@ -450,6 +461,32 @@ function renderKeyframes(p) {
   }
   $('kfCount').textContent = `${kfs.length} frames` + (groups ? ` · ${groups} scan${groups>1?'s':''}` : '');
   tl.innerHTML = html || '<span class="msg" style="padding:10px">no keyframes yet — Bake one from the scouting view</span>';
+  renderSweeps(p);
+}
+
+// Independent cutaway sweeps live in their OWN lane below the keyframes — each a bar
+// spanning the slice of the movie's timeline it animates over (like a clip/effect track
+// in a video editor). The camera keyframes drive the camera up top; sweeps run underneath.
+function renderSweeps(p) {
+  const lane = $('sweepLane'); if (!lane) return;
+  const sweeps = p.sweeps || [];
+  if (!sweeps.length) { lane.innerHTML = ''; return; }
+  const total = (p.keyframes || []).reduce((a, k) => a + (k.duration_in_s || 0), 0) || 4;
+  lane.innerHTML = '<div class="lanelbl">cutaway sweeps</div>' + sweeps.map(s => {
+    const left = Math.max(0, (s.start_s / total) * 100);
+    const width = Math.max(4, Math.min(100 - left, (s.duration_s / total) * 100));
+    const dir = s.normal ? 'oblique' : `${s.axis}`;
+    return `<div class="sweepbar" style="left:${left}%;width:${width}%"
+                 title="${s.layer} · ${dir} · ${Math.round(s.from_nm)}→${Math.round(s.to_nm)}nm · ${s.duration_s}s">
+      <span class="del" onclick="delSweep('${s.id}')">✕</span>
+      <span class="swlbl">▤ ${s.layer} ${dir} · ${s.duration_s}s</span>
+    </div>`;
+  }).join('');
+}
+async function delSweep(id) {
+  if (!PID) return;
+  await api('DELETE', `/api/projects/${PID}/sweeps/${id}`);
+  reload();
 }
 function toggleGroup(g) {
   if (EXPANDED_GROUPS.has(g)) EXPANDED_GROUPS.delete(g); else EXPANDED_GROUPS.add(g);
@@ -604,21 +641,34 @@ function planeNums(str) {
 async function applyPlaneScan() {
   if(!PID) return;
   const axis = $('planeAxis').value, mode = $('planeMode').value;
-  const mesh_name = (mode!=='slice' && $('planeLayer').value) ? $('planeLayer').value : null;
-  const side = (mode!=='slice') ? parseInt($('planeSide').value,10) : 1;
-  const n = parseInt($('planeN').value,10) || 12;
-  // From/To are neuroglancer coords (its units + display order). The server converts:
-  // a single value = depth along the axis; a full x,y,z in both = an oblique line.
+  const side = parseInt($('planeSide').value,10);
   const fn = planeNums($('planeFrom').value), tn = planeNums($('planeTo').value);
+  const oblique = fn.length >= 3 && tn.length >= 3;
+  // Cutaway is now an INDEPENDENT sweep (its own timeline, decoupled from the camera) —
+  // not 24 culled keyframes. 'slice' (raw EM) still drops keyframes for now.
+  if (mode === 'cull') {
+    const layer = $('planeLayer').value;
+    if (!layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
+    const dur = parseFloat($('planeDur')?.value) || undefined;
+    const body = {layer, axis, side, easing: 'linear'};
+    if (fn.length) body.from_ng = fn;
+    if (tn.length) body.to_ng = tn;
+    if (dur) body.duration_s = dur;
+    $('planeMsg').textContent = 'adding cutaway sweep…';
+    await api('POST', `/api/projects/${PID}/sweeps`, body);
+    $('planeMsg').textContent = `cutaway sweep added` + (oblique ? ' (oblique)' : '');
+    await reload();
+    return;
+  }
+  const mesh_name = (mode!=='slice' && $('planeLayer').value) ? $('planeLayer').value : null;
+  const n = parseInt($('planeN').value,10) || 12;
   const body = {axis, mode, mesh_name, side, n};
   if (fn.length) body.from_ng = fn;
   if (tn.length) body.to_ng = tn;
-  const oblique = fn.length >= 3 && tn.length >= 3;
   $('planeMsg').textContent = 'adding…';
   const r = await api('POST', `/api/projects/${PID}/plane_move`, body);
   $('planeMsg').textContent = `added ${r.added} frames` + (oblique ? ' (oblique)' : '');
   await reload();
-  // render the representative (middle) frame so the collapsed/stacked scan card isn't blank
   if (r.thumb_id) renderThumbnail(r.thumb_id);
 }
 

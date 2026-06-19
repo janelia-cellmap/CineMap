@@ -473,6 +473,38 @@ def plane_move(pid: str, req: PlaneMoveReq):
     return _scan_resp(kfs)
 
 
+class SweepReqNew(BaseModel):
+    layer: str
+    axis: str = "z"
+    side: int = 1
+    from_ng: list[float] | None = None   # NG coords: triple => oblique A->B, single => depth
+    to_ng: list[float] | None = None
+    from_nm: float | None = None
+    to_nm: float | None = None
+    start_s: float | None = None
+    duration_s: float | None = None
+    easing: str = "linear"
+
+
+@app.post("/api/projects/{pid}/sweeps")
+def add_sweep(pid: str, req: SweepReqNew):
+    """Create an independent cutaway sweep (animates a layer's clip plane on its own
+    timeline, decoupled from the camera keyframes)."""
+    p = store.load(pid)
+    sw = ops.add_sweep(p, layer=req.layer, axis=req.axis, side=req.side,
+                       from_ng=req.from_ng, to_ng=req.to_ng,
+                       from_nm=req.from_nm, to_nm=req.to_nm,
+                       start_s=req.start_s, duration_s=req.duration_s, easing=req.easing)
+    return sw.model_dump()
+
+
+@app.delete("/api/projects/{pid}/sweeps/{sid}")
+def delete_sweep(pid: str, sid: str):
+    p = store.load(pid)
+    ops.remove_sweep(p, sid)
+    return {"ok": True}
+
+
 # ----------------------------- render -----------------------------
 def _run_render(pid: str, job_id: str, worker: RenderWorker, thumbnail_for: str | None = None):
     def cb(pr, msg):
