@@ -286,7 +286,7 @@ def render_thumbnail(pid: str, kid: str):
     idx = next((i for i, k in enumerate(p.keyframes) if k.id == kid), None)
     if idx is None:
         raise HTTPException(404, "no such keyframe")
-    settings = RenderSettings(width=640, height=480, samples=24, fps=1, draft=True)
+    settings = RenderSettings(width=640, height=480, samples=24, fps=1, draft=True, still=True)
     job_id = _start_render(pid, settings, kf_range=[idx, idx], thumbnail_for=kid)
     return {"job_id": job_id}
 

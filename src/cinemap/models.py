@@ -151,6 +151,9 @@ class RenderSettings(BaseModel):
     # draft = fast preview/thumbnail quality: coarse EM slice level + low-voxel
     # meshes (see RenderWorker). Off = full resolution for the final video.
     draft: bool = False
+    # still = render exactly ONE frame (a per-keyframe thumbnail), ignoring holds and
+    # sweep timeline-extension so it stays a single PNG (not an mp4).
+    still: bool = False
     # By default a layer's precomputed meshes are downloaded (fast, LOD-adaptive,
     # matches neuroglancer). Set this to instead regenerate watertight meshes from
     # the OME-Zarr label volume via marching cubes when one is available.

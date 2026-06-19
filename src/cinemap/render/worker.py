@@ -716,16 +716,19 @@ class RenderWorker:
         frames = build_frames(kfs, self.job.settings.fps, smooth_ends=smooth)
         if not frames:
             raise ValueError("no keyframes to render")
-        # A cutaway sweep runs on the GLOBAL timeline, so the movie must be at least as long
-        # as the furthest sweep — otherwise a sweep over a single (static) keyframe gets just
-        # one frame. Hold the last camera pose out to the latest sweep end.
-        fps = max(1, self.job.settings.fps)
-        sweep_end = max([0.0] + [float(s.start_s) + float(s.duration_s)
-                                 for s in (getattr(self.project, "sweeps", []) or [])
-                                 if getattr(s, "enabled", True)])
-        need = int(round(sweep_end * fps))
-        if need > len(frames):
-            frames = frames + [frames[-1]] * (need - len(frames))
+        if getattr(self.job.settings, "still", False):
+            frames = frames[:1]   # a thumbnail: one frame only (no hold / no sweep extension)
+        else:
+            # A cutaway sweep runs on the GLOBAL timeline, so the movie must be at least as
+            # long as the furthest sweep — otherwise a sweep over a single (static) keyframe
+            # gets just one frame. Hold the last camera pose out to the latest sweep end.
+            fps = max(1, self.job.settings.fps)
+            sweep_end = max([0.0] + [float(s.start_s) + float(s.duration_s)
+                                     for s in (getattr(self.project, "sweeps", []) or [])
+                                     if getattr(s, "enabled", True)])
+            need = int(round(sweep_end * fps))
+            if need > len(frames):
+                frames = frames + [frames[-1]] * (need - len(frames))
 
         exporting = self.job.settings.export_blend
         scene_path = self.workdir / "scene.json"
