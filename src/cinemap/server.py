@@ -60,6 +60,7 @@ class OrbitReq(BaseModel):
     degrees: float = 360.0
     n: int = 12
     elevation_deg: float = 22.0
+    total_duration_s: float | None = None
 
 
 class SweepReq(BaseModel):
@@ -86,6 +87,7 @@ class PlaneMoveReq(BaseModel):
     n: int = 12
     mesh_name: str | None = None
     side: int = 1
+    total_duration_s: float | None = None   # duration-driven scan (spans the whole sweep)
 
 
 class RenderReq(BaseModel):
@@ -445,7 +447,8 @@ def _scan_resp(kfs):
 @app.post("/api/projects/{pid}/orbit")
 def orbit(pid: str, req: OrbitReq):
     p = store.load(pid)
-    kfs = ops.make_orbit(p, degrees=req.degrees, n=req.n, elevation_deg=req.elevation_deg)
+    kfs = ops.make_orbit(p, degrees=req.degrees, n=req.n, elevation_deg=req.elevation_deg,
+                         total_duration_s=req.total_duration_s)
     return _scan_resp(kfs)
 
 
@@ -469,7 +472,8 @@ def plane_move(pid: str, req: PlaneMoveReq):
     kfs = ops.plane_move(p, axis=req.axis, mode=req.mode, start_nm=req.start_nm,
                          stop_nm=req.stop_nm, from_xyz=req.from_xyz, to_xyz=req.to_xyz,
                          from_ng=req.from_ng, to_ng=req.to_ng,
-                         n=req.n, mesh_name=req.mesh_name, side=req.side)
+                         n=req.n, mesh_name=req.mesh_name, side=req.side,
+                         total_duration_s=req.total_duration_s)
     return _scan_resp(kfs)
 
 

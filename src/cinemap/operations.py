@@ -300,7 +300,8 @@ def _base_framing(project: Project, target, radius_nm):
 
 def make_orbit(project: Project, degrees: float = 360.0, n: int = 12,
                elevation_deg: float = 22.0, target=None, radius_nm=None,
-               duration_per_kf_s: float = 0.6) -> list[Keyframe]:
+               duration_per_kf_s: float = 0.6,
+               total_duration_s: float | None = None) -> list[Keyframe]:
     base, target, radius = _base_framing(project, target, radius_nm)
     # start the orbit at the current camera's azimuth so the first keyframe doesn't
     # swing away from the framing the user/agent set (fall back to 35°).
@@ -319,7 +320,10 @@ def make_orbit(project: Project, degrees: float = 360.0, n: int = 12,
             camera=frame_camera(target, radius, azimuth_deg=az, elevation_deg=elevation_deg),
             slices=[s.model_copy() for s in (base.slices if base else [])],
             meshes=[m.model_copy() for m in (base.meshes if base else [])],
-            duration_in_s=duration_per_kf_s,
+            # duration-driven: spread total_duration_s across the orbit's keyframes so the
+            # whole orbit takes that long regardless of how many sample its arc.
+            duration_in_s=(duration_per_kf_s if total_duration_s is None
+                           else total_duration_s / max(1, n)),
             group=gid, group_label=glabel,
         )
         new.append(kf)
@@ -442,7 +446,8 @@ def plane_move(project: Project, axis: str = "z", mode: str = "slice",
                from_xyz: list[float] | None = None, to_xyz: list[float] | None = None,
                from_ng: list[float] | None = None, to_ng: list[float] | None = None,
                n: int = 12, mesh_name: str | None = None, side: int = 1,
-               duration_per_kf_s: float = 0.4) -> list[Keyframe]:
+               duration_per_kf_s: float = 0.4,
+               total_duration_s: float | None = None) -> list[Keyframe]:
     """Lay down keyframes for a plane scanning from a start to a stop with the camera
     held fixed. Two ways to specify the path:
       - axis-aligned: `axis` + scalar `start_nm`/`stop_nm` (default = the involved
@@ -495,10 +500,15 @@ def plane_move(project: Project, axis: str = "z", mode: str = "slice",
         slices = ([SlicePlane(em_name=em_name, axis=axis, position_nm=offset,
                               normal=normal, visible=True)]
                   if do_slice else [s.model_copy() for s in base.slices])
+        # duration-driven: spread total_duration_s across the scan (first keyframe is the
+        # instant lead-in to the start, the rest divide the span) so the whole scan takes
+        # total_duration_s regardless of how many keyframes sample it.
+        dur = (duration_per_kf_s if total_duration_s is None
+               else (0.0 if i == 0 else total_duration_s / max(1, n - 1)))
         new.append(Keyframe(
             id=_uid("kf"), label=f"{mode} {axis}={int(offset)}nm{' (oblique)' if normal else ''}",
             camera=base.camera.model_copy(), slices=slices,
-            meshes=meshes, duration_in_s=duration_per_kf_s,
+            meshes=meshes, duration_in_s=dur,
             group=gid, group_label=glabel,
         ))
     project.keyframes.extend(new)
