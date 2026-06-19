@@ -428,6 +428,22 @@ def set_mesh_opacity(pid: str, kid: str, req: MeshOpacityReq):
     return {"ok": True, "opacity": op}
 
 
+class DurationReq(BaseModel):
+    duration_in_s: float
+
+
+@app.put("/api/projects/{pid}/keyframes/{kid}/duration")
+def set_keyframe_duration(pid: str, kid: str, req: DurationReq):
+    """Set a keyframe's transition duration (seconds) — the time the camera/slice takes to
+    glide INTO this keyframe from the previous one. 0 = an instant cut."""
+    p = store.load(pid)
+    kf = next((k for k in p.keyframes if k.id == kid), None)
+    if kf is None:
+        raise HTTPException(404, "no such keyframe")
+    ops.update_keyframe(p, kid, duration_in_s=max(0.0, float(req.duration_in_s)))
+    return {"ok": True, "duration_in_s": max(0.0, float(req.duration_in_s))}
+
+
 @app.post("/api/projects/{pid}/keyframes/reorder")
 def reorder_keyframes(pid: str, req: ReorderReq):
     p = store.load(pid)
