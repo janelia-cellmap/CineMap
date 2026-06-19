@@ -33,6 +33,16 @@ def _bu(p, nm_per_bu):
     return [c / nm_per_bu for c in p]
 
 
+def _ease(t: float, mode: str) -> float:
+    if mode == "ease-in-out":
+        return t * t * (3 - 2 * t)
+    if mode == "ease-in":
+        return t * t
+    if mode == "ease-out":
+        return t * (2 - t)
+    return t
+
+
 def _clip_params(cl) -> dict | None:
     """Normalize a layer's cutaway plane to a plain dict, or None if absent/disabled.
     `cl` may be a ClipPlane model OR a plain dict (legacy), so read with getattr/get;
@@ -99,8 +109,11 @@ class RenderWorker:
         # other, so the seams don't weld and the cap can't close (plus the surface cracks).
         # Whenever any layer has a clip plane, force ONE consistent LOD for the whole shot
         # so fragment boundaries line up and the cap fills cleanly.
-        if any(_clip_params(getattr(m, "clip", None))
-               for kf in project.keyframes for m in kf.meshes):
+        has_clip = any(_clip_params(getattr(m, "clip", None))
+                       for kf in project.keyframes for m in kf.meshes)
+        has_sweep = any(getattr(s, "enabled", True) and getattr(s, "kind", "") == "cutaway"
+                        for s in getattr(project, "sweeps", []) or [])
+        if has_clip or has_sweep:
             self._lod_mode = "single"
         # non-destructive presentation pass (lighting rig / materials / DOF)
         self._auto_direct = bool(getattr(job.settings, "auto_direct", True))
@@ -213,6 +226,22 @@ class RenderWorker:
         sig = (",".join(map(str, sorted(ids))) + "|" + str(color_key) + "|"
                + self._lod_tag_for(nmpp) + "|decode4")
         return f"{mesh_name}_{hashlib.md5(sig.encode()).hexdigest()[:8]}"
+
+    def _clip_from_sweeps(self, layer_name: str, t: float) -> dict | None:
+        """The cutaway clip for `layer_name` at global time `t` (seconds), from any active
+        Sweep — evaluated on the SWEEP's own timeline, independent of the camera keyframes.
+        Returns a clip dict (same shape as _clip_params) or None. First active sweep wins."""
+        for sw in getattr(self.project, "sweeps", []) or []:
+            if (not getattr(sw, "enabled", True) or getattr(sw, "kind", "cutaway") != "cutaway"
+                    or sw.layer != layer_name):
+                continue
+            if not (sw.start_s <= t <= sw.start_s + sw.duration_s):
+                continue
+            p = _ease(min(1.0, max(0.0, (t - sw.start_s) / (sw.duration_s or 1e-9))), sw.easing)
+            pos = sw.from_nm + (sw.to_nm - sw.from_nm) * p
+            return {"axis": sw.axis, "side": sw.side, "normal": sw.normal,
+                    "position_nm": float(pos)}
+        return None
 
     @staticmethod
     def _frame_colors(m):
@@ -489,7 +518,10 @@ class RenderWorker:
                     }
                     if is_hero and emph_glow > 0.0:
                         ov["emphasis"] = emph_glow       # brief emission glow on the hero
-                    cl = _clip_params(getattr(m, "clip", None))
+                    # a sweep (independent timeline) overrides the keyframe's own clip
+                    t_global = (index_offset + fi) / max(1, self.job.settings.fps)
+                    cl = self._clip_from_sweeps(m.mesh_name, t_global) or _clip_params(
+                        getattr(m, "clip", None))
                     if cl:
                         ov["clip"] = {**cl, "position_bu": cl["position_nm"] / self.nm_per_bu}
                         mesh_specs[uid]["clip"] = True   # geometric cutaway (slice + cap)

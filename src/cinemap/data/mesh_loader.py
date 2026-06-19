@@ -130,11 +130,17 @@ class MeshLoader:
             return 16
 
     def _needs_manual_decode(self) -> bool:
-        """Some multilod exports bake the dequantization transform into the draco stream,
-        so the decoded points are already in model space (range ~chunk_shape) instead of
-        the standard integer range [0, 2^bits). cloud-volume assumes integers and re-scales
-        by chunk_shape -> double-scaling that balloons coarse LODs. Detect it by sampling
-        one fragment: points beyond the quantization range mean it's the model-space kind."""
+        """True for meshes from the DEPRECATED/legacy meshifying pipeline.
+
+        That old meshifier leaned on Draco's built-in position quantization
+        (`quantization_range=...`), so DracoPy dequantizes the points for us and they come
+        out already in (chunk) model space — fractional, ranging up to ~chunk_shape —
+        instead of the raw integer grid indices [0, 2^bits) that the CURRENT meshifier (and
+        standard igneous / neuroglancer) emit. cloud-volume assumes the integer form and
+        re-applies the chunk_shape*2^lod scaling, so on these legacy meshes it double-scales
+        and the fragments balloon/scatter. We detect the legacy form by sampling one fragment
+        (fractional or out-of-[0,2^bits) points) and decode it ourselves. Meshes from the
+        current pipeline take the cloud-volume path unchanged."""
         if self._manual is not None:
             return self._manual
         # Resolve ONCE under a lock. The fetch pool calls _draco (-> here) from many
@@ -202,10 +208,11 @@ class MeshLoader:
         return hit
 
     def _draco_manual(self, seg_id: int, lod: int = 0) -> trimesh.Trimesh:
-        """Decode one LOD of an unsharded multilod mesh whose draco points are already in
-        absolute model space (grid_origin-relative): vertex = grid_origin + points. The
-        same formula holds at every LOD (coarser LODs are simply lower-poly), so this
-        supports LOD selection; avoids cloud-volume's double-scaling for this encoding."""
+        """Decode one LOD of a LEGACY-meshifier unsharded multilod mesh (see
+        _needs_manual_decode): Draco already dequantized the points to chunk model space,
+        so vertex = grid_origin + points. The same formula holds at every LOD (coarser LODs
+        are just lower-poly), so this supports LOD selection; it avoids cloud-volume's
+        double-scaling of this legacy (Draco-quantized) encoding."""
         import struct
 
         import DracoPy

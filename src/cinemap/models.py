@@ -181,6 +181,26 @@ class RenderJob(BaseModel):
     output_path: Optional[str] = None
 
 
+class Sweep(BaseModel):
+    """An animated effect on its OWN timeline, independent of the camera keyframes.
+    A cutaway sweep slides a layer's clip plane from `from_nm` to `to_nm` over a span of
+    the movie's global time [start_s, start_s+duration_s]; the camera meanwhile does
+    whatever its keyframes say. This decouples 'what the plane does' from 'where the
+    camera is' — a sweep is one self-contained thing laid on top of the camera track."""
+    id: str
+    kind: Literal["cutaway"] = "cutaway"   # (slice/orbit sweeps can extend this later)
+    layer: str = ""                        # mesh layer name the clip plane cuts
+    axis: Axis = "z"
+    normal: Optional[list[float]] = None   # oblique plane; None => axis-aligned
+    side: int = 1
+    from_nm: float = 0.0
+    to_nm: float = 0.0
+    start_s: float = 0.0                   # global-timeline start (seconds)
+    duration_s: float = 2.0
+    easing: Literal["linear", "ease-in-out", "ease-in", "ease-out"] = "linear"
+    enabled: bool = True
+
+
 class Project(BaseModel):
     id: str
     name: str
@@ -188,6 +208,8 @@ class Project(BaseModel):
     manifest: Manifest = Field(default_factory=Manifest)
     lighting: Lighting = Field(default_factory=Lighting)
     keyframes: list[Keyframe] = Field(default_factory=list)
+    # independent animated effects (cutaway sweeps) overlaid on the camera timeline
+    sweeps: list[Sweep] = Field(default_factory=list)
     renders: list[RenderJob] = Field(default_factory=list)
     look: dict[str, Any] = Field(default_factory=dict)  # render look overrides (preset +
     # glow/roughness/specular/ng_shader/view) — the look-experiment panel writes this.
