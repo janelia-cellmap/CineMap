@@ -296,10 +296,14 @@
   <div class="msg" style="margin:2px 0 6px">Fixed camera; scan a plane start→stop.</div>
   <label class="msg">Plane shows</label>
   <select id="planeMode" onchange="planeModeChanged()" style="width:100%">
-    <option value="slice">raw EM slice</option>
+    <option value="slice">layer cross-section (EM or seg)</option>
     <option value="cull">cutaway — cut a layer</option>
     <option value="both">both</option>
   </select>
+  <div id="planeSliceWrap">
+    <label class="msg" title="Which layer to show on the slice plane — an EM/image volume (grayscale) or a segmentation layer (its labels in color). No longer assumes a layer called 'em'/'raw'.">Slice layer</label>
+    <select id="planeSliceLayer" style="width:100%"></select>
+  </div>
   <label class="msg">Axis</label>
   <select id="planeAxis" style="width:100%" onchange="updateSideLabels()">
     <option value="z">z</option><option value="y">y</option><option value="x">x</option>
@@ -879,6 +883,13 @@ async function openPlanePanel() {
   const layers = base ? [...new Set(base.meshes.filter(m=>m.render_3d!==false && (m.segment_ids||[]).length).map(m=>m.mesh_name))] : [];
   $('planeLayer').innerHTML = `<option value="">all layers</option>` + layers.map(l=>`<option value="${l}">${l}</option>`).join('');
   if (LAST_CUT_LAYER && layers.includes(LAST_CUT_LAYER)) $('planeLayer').value = LAST_CUT_LAYER;  // remember selection
+  // sliceable layers = the EM/image volume + any segmentation layer that has a label volume
+  const man = proj.manifest || {}, sl = [];
+  if (man.em && man.em.name) sl.push([man.em.name, man.em.name + ' — EM']);
+  (man.meshes || []).forEach(ms => { if (ms.label_zarr) sl.push([ms.name, ms.name + ' — seg']); });
+  $('planeSliceLayer').innerHTML = sl.length
+    ? sl.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')
+    : '<option value="">(default EM)</option>';
   planeModeChanged(); updateSideLabels();
   PREVIEW_READY = false; if ($('planeSnaps')) $('planeSnaps').innerHTML = '';
   $('planeMsg').textContent = ''; $('planePanel').style.display='block';
@@ -907,6 +918,7 @@ function startResize(e) {
 function planeModeChanged() {
   const cut = $('planeMode').value === 'cull';
   $('planeCull').style.display = $('planeMode').value === 'slice' ? 'none' : 'block';
+  $('planeSliceWrap').style.display = cut ? 'none' : 'block';   // slice-layer picker: slice/both only
   if ($('planeAddLbl')) $('planeAddLbl').textContent = cut ? 'Add cutaway' : 'Add scan';
   PREVIEW_READY = false; if ($('planeSnaps')) $('planeSnaps').innerHTML = '';   // mode changed -> preview stale
 }
@@ -940,6 +952,7 @@ async function previewPlaneScan() {
   // anchor the sweep at the keyframe you're on, so the preview frames from THAT camera
   const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: activeKfTime(), mirror: $('planeMirror').checked };
   if (kind === 'cutaway') body.layer = layer;
+  else body.em_name = $('planeSliceLayer').value;   // which layer the slice shows (EM or seg)
   if (fn.length) body.from_ng = fn;
   if (tn.length) body.to_ng = tn;
   $('planeMsg').textContent = 'rendering preview…';
@@ -976,6 +989,7 @@ async function applyPlaneScan() {
   const mk = async (kind) => {
     const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: activeKfTime(), mirror: $('planeMirror').checked };
     if (kind === 'cutaway') { body.layer = layer; LAST_CUT_LAYER = layer; }
+    else body.em_name = $('planeSliceLayer').value;   // which layer the slice shows (EM or seg)
     if (fn.length) body.from_ng = fn;
     if (tn.length) body.to_ng = tn;
     return await api('POST', `/api/projects/${PID}/sweeps`, body);   // returns the new sweep

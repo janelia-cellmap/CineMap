@@ -143,29 +143,68 @@ class RenderWorker:
             self._label_vols[url] = get_volume(url)
         return self._label_vols[url]
 
-    def _slice_png(self, sl, region, seg_overlays) -> dict:
-        """Render the EM cross-section, with the segmentation labels of
-        `seg_overlays` [(label_zarr, segment_ids), …] colored on top (like the
-        neuroglancer cross-section). Cached per (slice, region, overlay)."""
+    def _vol_for(self, em_name: str):
+        """Resolve a slice layer NAME to (zarr_url, is_label) — so a slice can point at
+        any layer, not just the default EM. An EM/image layer -> grayscale cross-section;
+        a segmentation layer (its label volume) -> colored labels. Empty/unknown name
+        falls back to the manifest's EM image."""
+        em = self.manifest.em
+        if em and (not em_name or em_name == em.name):
+            return em.zarr_url, False
+        src = next((s for s in self.manifest.meshes
+                    if s.name == em_name and s.label_zarr), None)
+        if src:
+            return src.label_zarr, True
+        return (em.zarr_url, False) if em else (None, False)
+
+    def _slice_png(self, sl, region, seg_overlays, slice_seg=None) -> dict:
+        """Render a cross-section of the slice's chosen layer. For an EM/image layer:
+        the grayscale EM with `seg_overlays` [(label_zarr, ids, lc), …] colored on top
+        (like neuroglancer). For a SEGMENTATION layer (resolved via _vol_for): the
+        layer's labels rendered in color directly (`slice_seg=(ids, lc)`). Cached per
+        (slice, region, overlay)."""
         import numpy as np
         from PIL import Image
 
         center, half = region
         normal = getattr(sl, "normal", None)
-        key = (sl.em_name, sl.axis, round(sl.position_nm), tuple(normal) if normal else None,
+        zurl, is_label = self._vol_for(sl.em_name)
+        seg_key = (tuple(sorted(slice_seg[0])), slice_seg[1].cache_key()) if (is_label and slice_seg) else None
+        key = (sl.em_name, is_label, seg_key, sl.axis, round(sl.position_nm),
+               tuple(normal) if normal else None,
                tuple(round(c) for c in center), round(half), self._em_target_px,
                tuple((u, tuple(sorted(ids)), lc.cache_key()) for u, ids, lc in seg_overlays))
         if key in self._slice_cache:
             return self._slice_cache[key]
 
+        vol = self._label_vol(zurl) if zurl else self._em_vol()
         if normal:   # oblique plane: resample the tilted plane through the projected focus
             n = np.asarray(normal, float); n = n / (np.linalg.norm(n) or 1.0)
             c = np.asarray(center, float)
             cproj = c + (sl.position_nm - float(np.dot(c, n))) * n
-            res = self._em_vol().read_oblique_slice(normal, cproj, half, target_px=self._em_target_px)
+            res = vol.read_oblique_slice(normal, cproj, half, target_px=self._em_target_px)
         else:
-            res = self._em_vol().read_slice(sl.axis, sl.position_nm, level=sl.scale_level,
-                                            target_px=self._em_target_px, region=region)
+            res = vol.read_slice(sl.axis, sl.position_nm, level=sl.scale_level,
+                                 target_px=self._em_target_px, region=region, raw=is_label)
+
+        if is_label:   # segmentation layer: color the labels directly (no EM grayscale)
+            lab = np.asarray(res.image)
+            H, W = lab.shape[:2]
+            rgb = np.zeros((H, W, 3), dtype=np.float64)
+            ids, lc = slice_seg if slice_seg else (None, None)
+            idset = set(int(i) for i in ids) if ids else None
+            for u in np.unique(lab):
+                iu = int(u)
+                if iu == 0 or (idset is not None and iu not in idset):
+                    continue
+                rgb[lab == u] = (np.array(lc.rgb(iu)) * 255 if lc else np.array([230.0, 180.0, 90.0]))
+            path = self.assets_dir / f"slice_{sl.axis}_{abs(hash(key)) % 10**8}.png"
+            Image.fromarray(rgb.clip(0, 255).astype(np.uint8)).save(path)
+            out = {"image_path": str(path), "origin_bu": _bu(res.origin_nm, self.nm_per_bu),
+                   "u_bu": _bu(res.u_nm, self.nm_per_bu), "v_bu": _bu(res.v_nm, self.nm_per_bu)}
+            self._slice_cache[key] = out
+            return out
+
         rgb = np.repeat(res.image[:, :, None].astype(np.float64), 3, axis=2)  # grayscale EM
         H, W = rgb.shape[:2]
 
@@ -173,7 +212,8 @@ class RenderWorker:
             if not ids:
                 continue
             lres = self._label_vol(label_zarr).read_slice(sl.axis, sl.position_nm,
-                                                          target_px=self._em_target_px, region=region)
+                                                          target_px=self._em_target_px,
+                                                          region=region, raw=True)
             lab = np.asarray(lres.image)
             yi = (np.arange(H) * lab.shape[0] / H).astype(int).clip(0, lab.shape[0] - 1)
             xi = (np.arange(W) * lab.shape[1] / W).astype(int).clip(0, lab.shape[1] - 1)
@@ -588,8 +628,17 @@ class RenderWorker:
                 # so the blend exporter can group a slice's per-frame images into one
                 # animated image-sequence plane. A slice that can't be read (e.g. a
                 # non-OME-Zarr EM source) is skipped, not fatal to the whole render.
+                # If the slice points at a SEGMENTATION layer, pass its (ids, colors) so
+                # _slice_png renders the labels colored (resolved from the frame's mesh).
+                _, is_label = self._vol_for(sl.em_name)
+                slice_seg = None
+                if is_label:
+                    sm = next((mm for mm in fr.meshes
+                               if mm.mesh_name == sl.em_name and mm.segment_ids), None)
+                    if sm:
+                        slice_seg = (list(sm.segment_ids), self._frame_colors(sm))
                 try:
-                    png = self._slice_png(sl, region, seg_overlays)
+                    png = self._slice_png(sl, region, seg_overlays, slice_seg=slice_seg)
                 except Exception as e:  # noqa: BLE001
                     print(f"[worker] slice {sl.em_name}:{sl.axis} failed: {e}")
                     continue

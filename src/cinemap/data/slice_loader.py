@@ -225,10 +225,15 @@ class EMVolume:
     def read_slice(
         self, axis: str, position_nm: float, level: int | None = None, target_px: int = 1600,
         region: tuple[tuple[float, float, float], float] | None = None,
+        raw: bool = False,
     ) -> SliceResult:
         """Read one cross-section. If `region`=((cx,cy,cz)_nm, half_nm) is given,
         read only that square crop around the camera target at a level chosen for
-        the crop extent (sharp when zoomed); otherwise read the whole plane."""
+        the crop extent (sharp when zoomed); otherwise read the whole plane.
+
+        `raw=True` keeps the array's native dtype — required for LABEL volumes whose
+        segment ids exceed 255 (the default uint8 cast, fine for 8-bit EM, would
+        truncate ids mod 256 and collide segments)."""
         zyx = _AXIS_TO_ZYX[axis]
         ua, va = self._INPLANE[axis]  # world axis names for the two in-plane dirs
 
@@ -266,7 +271,9 @@ class EMVolume:
         sel[zyx] = idx
         sel[u_zyx] = slice(u0, u1)
         sel[v_zyx] = slice(v0, v1)
-        sub = np.asarray(arr[tuple(sel)].read().result()).astype(np.uint8)
+        sub = np.asarray(arr[tuple(sel)].read().result())
+        if not raw:
+            sub = sub.astype(np.uint8)
         # orient so rows=v, cols=u
         sub = np.moveaxis(sub, (0, 1), (0, 1)) if v_zyx < u_zyx else sub.T
 

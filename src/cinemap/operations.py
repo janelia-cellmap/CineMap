@@ -84,20 +84,25 @@ def volume_extent_nm(project: Project) -> tuple[list[float], list[float]]:
 
 
 def mesh_aabb_nm(mesh_url: str, segment_ids: list[int]):
-    """(lo_xyz, hi_xyz) nm axis-aligned bounding box of the segments, or None."""
+    """(lo_xyz, hi_xyz) nm axis-aligned bounding box of the segments, or None.
+
+    Uses each segment's COARSEST-LOD bounds (a tiny fetch via seg_bbox) and the shared
+    on-disk mesh cache — sizing a cutaway/scan must not re-decode full-resolution
+    geometry (that made 'Add cutaway' take minutes). Coarse bounds ≈ true bounds, and
+    the callers pad the range anyway."""
+    from .config import PROJECTS_DIR
     from .data.mesh_loader import MeshLoader
 
-    loader = MeshLoader(mesh_url)
+    loader = MeshLoader(mesh_url, cache_dir=PROJECTS_DIR / ".mesh_cache")
     ids = segment_ids or list(loader.list_segments()[:1])
     lo = hi = None
     for sid in ids[:8]:  # cap cost
-        try:
-            v = loader.load(sid).vertices
-        except Exception:
+        bb = loader.seg_bbox(sid)            # coarsest-LOD bounds; None on failure
+        if bb is None:
             continue
-        vlo, vhi = v.min(0), v.max(0)
-        lo = list(vlo) if lo is None else [min(a, b) for a, b in zip(lo, vlo)]
-        hi = list(vhi) if hi is None else [max(a, b) for a, b in zip(hi, vhi)]
+        blo, bhi = bb
+        lo = list(blo) if lo is None else [min(a, b) for a, b in zip(lo, blo)]
+        hi = list(bhi) if hi is None else [max(a, b) for a, b in zip(hi, bhi)]
     return (lo, hi) if lo is not None else None
 
 

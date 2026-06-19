@@ -581,6 +581,18 @@ def delete_sweep(pid: str, sid: str):
 _snap_state: dict[str, dict] = {}
 
 
+def _snapshot_times(sw) -> list[float]:
+    """Global times (s) to sample a sweep for its preview stills. A CUTAWAY is expensive
+    (per-frame geometric slice + cap on the whole layer), so it gets ONE still — the
+    fully-revealed end (or the mid-peak for a mirror). A SLICE is cheap, so it gets 3
+    across the sweep (5 for mirror, since start≈end)."""
+    dur = sw.duration_s or 1e-9
+    if sw.kind == "cutaway":
+        return [sw.start_s + dur * (0.5 if getattr(sw, "mirror", False) else 1.0)]
+    n = 5 if getattr(sw, "mirror", False) else 3
+    return [sw.start_s + dur * k / (n - 1) for k in range(n)]
+
+
 @app.post("/api/projects/{pid}/sweeps/{sid}/snapshots")
 def render_sweep_snapshots(pid: str, sid: str):
     """Kick off (in the background) a few small preview stills of a clip so the timeline
@@ -592,9 +604,8 @@ def render_sweep_snapshots(pid: str, sid: str):
     sw = next((s for s in p.sweeps if s.id == sid), None)
     if sw is None:
         raise HTTPException(404, "no such sweep")
-    n = 5 if getattr(sw, "mirror", False) else 3
-    dur = sw.duration_s or 1e-9
-    times = [sw.start_s + dur * k / (n - 1) for k in range(n)]
+    times = _snapshot_times(sw)
+    n = len(times)
     out = config.PROJECTS_DIR / pid / "assets" / "snapshots" / sid
     key = f"{pid}/{sid}"
     _snap_state[key] = {"status": "running", "count": n}
@@ -647,9 +658,8 @@ def preview_sweep(pid: str, req: SweepReqNew):
                        from_nm=req.from_nm, to_nm=req.to_nm, start_s=req.start_s,
                        duration_s=req.duration_s, easing=req.easing, mirror=req.mirror,
                        commit=False)
-    n = 5 if sw.mirror else 3
-    dur = sw.duration_s or 1e-9
-    times = [sw.start_s + dur * k / (n - 1) for k in range(n)]
+    times = _snapshot_times(sw)
+    n = len(times)
     out = config.PROJECTS_DIR / pid / "assets" / "snapshots" / "_preview"
     key = f"{pid}/_preview"
     _snap_state[key] = {"status": "running", "count": n}
