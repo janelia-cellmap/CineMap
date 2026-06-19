@@ -154,6 +154,11 @@ class RenderSettings(BaseModel):
     # still = render exactly ONE frame (a per-keyframe thumbnail), ignoring holds and
     # sweep timeline-extension so it stays a single PNG (not an mp4).
     still: bool = False
+    # show_bbox = draw a thin wireframe box around each data source's extent (the EM
+    # volume and/or each rendered layer's label volume), like neuroglancer's bounding
+    # box. Falls back to a tight box around the rendered meshes when no volume source.
+    show_bbox: bool = False
+    bbox_color: list[float] = Field(default_factory=lambda: [0.62, 0.66, 0.74])  # wireframe rgb (0–1)
     # By default a layer's precomputed meshes are downloaded (fast, LOD-adaptive,
     # matches neuroglancer). Set this to instead regenerate watertight meshes from
     # the OME-Zarr label volume via marching cubes when one is available.

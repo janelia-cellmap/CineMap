@@ -102,6 +102,8 @@ class RenderReq(BaseModel):
     mesh_from_labels: bool = False  # regenerate watertight meshes from labels vs precomputed
     auto_direct: bool = True    # non-destructive presentation pass (lighting/material/DOF)
     lod_mode: str = "frame"     # mesh LOD: "single" | "frame" (per-frame adaptive) | "chunk"
+    show_bbox: bool = False     # draw a wireframe box around each data source's extent
+    bbox_color: list[float] | None = None   # wireframe rgb (0–1); None = default gray
 
 
 class ChatReq(BaseModel):
@@ -733,7 +735,9 @@ def render(pid: str, req: RenderReq):
     settings = RenderSettings(width=req.width, height=req.height, fps=req.fps,
                               samples=req.samples, export_blend=req.export_blend, draft=req.draft,
                               mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels,
-                              auto_direct=req.auto_direct, lod_mode=req.lod_mode)
+                              auto_direct=req.auto_direct, lod_mode=req.lod_mode,
+                              show_bbox=req.show_bbox,
+                              bbox_color=req.bbox_color or [0.62, 0.66, 0.74])
     return {"job_id": _start_render(pid, settings, kf_range=req.kf_range)}
 
 

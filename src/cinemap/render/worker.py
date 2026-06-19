@@ -20,7 +20,7 @@ from ..config import NM_PER_BU, PROJECTS_DIR
 from ..models import Manifest, Project, RenderJob
 from ..data.mesh_loader import MeshLoader
 from ..data.slice_loader import EMVolume, get_volume
-from .interpolate import FrameState, build_frames
+from .interpolate import FrameAnnotation, FrameState, build_frames
 
 Progress = Callable[[float, str], None]
 
@@ -127,6 +127,9 @@ class RenderWorker:
             self._lod_mode = "single"
         # non-destructive presentation pass (lighting rig / materials / DOF)
         self._auto_direct = bool(getattr(job.settings, "auto_direct", True))
+        # draw a wireframe box around each data source's extent (neuroglancer-style)
+        self._show_bbox = bool(getattr(job.settings, "show_bbox", False))
+        self._bbox_color = list(getattr(job.settings, "bbox_color", None) or [0.62, 0.66, 0.74])
 
     # ---- asset preparation ----
     def _em_vol(self) -> EMVolume:
@@ -325,6 +328,63 @@ class RenderWorker:
                           an.point_radius_nm, an.line_radius_nm], sort_keys=True)
         return f"ann_{hashlib.md5(sig.encode()).hexdigest()[:10]}"
 
+    def _bbox_boxes(self) -> list[tuple[list[float], list[float]]]:
+        """Data-source extent boxes to outline (neuroglancer-style): the EM volume's
+        box plus each rendered layer's label-volume box. Falls back to a tight AABB
+        around the rendered meshes when a layer has no volume source. (lo_xyz, hi_xyz) nm."""
+        boxes: list[tuple[list[float], list[float]]] = []
+        seen: set = set()
+
+        def add(lo, hi):
+            if lo is None or hi is None or not all(hi[i] > lo[i] for i in range(3)):
+                return
+            key = tuple(round(float(v), 1) for v in (*lo, *hi))
+            if key not in seen:
+                seen.add(key)
+                boxes.append(([float(v) for v in lo], [float(v) for v in hi]))
+
+        kfs = getattr(self, "_kfs", None) or self.project.keyframes
+        used = {m.mesh_name for kf in kfs for m in kf.meshes}
+        if self.manifest.em:
+            try:
+                add(*self._em_vol().extent_nm())
+            except Exception as e:  # noqa: BLE001
+                print(f"[worker] bbox: EM extent failed: {e}")
+        for src in self.manifest.meshes:
+            if src.name in used and src.label_zarr:
+                try:
+                    add(*self._label_vol(src.label_zarr).extent_nm())
+                except Exception as e:  # noqa: BLE001
+                    print(f"[worker] bbox: {src.name} label extent failed: {e}")
+        if not boxes:   # no volume source -> tight box around the rendered meshes
+            from ..operations import mesh_aabb_nm
+            for src in self.manifest.meshes:
+                if src.name not in used or not src.mesh_url:
+                    continue
+                ids = sorted({i for kf in kfs for m in kf.meshes
+                              if m.mesh_name == src.name for i in m.segment_ids})
+                try:
+                    bb = mesh_aabb_nm(src.mesh_url, ids)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[worker] bbox: {src.name} mesh AABB failed: {e}")
+                    continue
+                if bb:
+                    add(*bb)
+        return boxes
+
+    def _bbox_annotation(self) -> FrameAnnotation | None:
+        """A synthetic annotation layer holding the data-source bounding box(es) as
+        boxes, drawn as thin wireframe tubes through the normal annotation path."""
+        boxes = self._bbox_boxes()
+        if not boxes:
+            return None
+        # tube radius scaled to the box so it reads as a hairline at any dataset size
+        span = max((hi[i] - lo[i]) for lo, hi in boxes for i in range(3))
+        radius = max(20.0, span * 0.0012)
+        return FrameAnnotation(
+            name="__bbox__", color=self._bbox_color, opacity=1.0,
+            boxes=[[lo, hi] for lo, hi in boxes], line_radius_nm=radius)
+
     def _ann_obj(self, an) -> str | None:
         from ..data.annotations import annotations_to_mesh
 
@@ -453,6 +513,13 @@ class RenderWorker:
         frame_nmpp = [_nmpp(fr) for fr in frames]
         self._nm_per_px = min(frame_nmpp, default=None)
         frame_lod_nmpp = self._lod_bucket_nmpp(frame_nmpp)  # nm/px to build each frame at
+
+        # neuroglancer-style bounding box: a static wireframe layer on every frame
+        if self._show_bbox:
+            bbox_an = self._bbox_annotation()
+            if bbox_an is not None:
+                for fr in frames:
+                    fr.annotations = list(fr.annotations) + [bbox_an]
 
         # One Blender object per distinct (layer, segment set, LOD bucket): a frame
         # references only its bucket's variant and the others auto-hide, so far frames

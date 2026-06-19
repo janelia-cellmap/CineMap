@@ -126,6 +126,16 @@ class EMVolume:
     def level_shape_zyx(self, level: int) -> tuple[int, int, int]:
         return tuple(int(x) for x in self._open_level(level).shape)
 
+    def extent_nm(self) -> tuple[list[float], list[float]]:
+        """Full data extent as (lo_xyz, hi_xyz) in nm world coords — the source's
+        bounding box, like neuroglancer draws. Derived from level 0: world =
+        voxel*scale + translation, with shape/scale/translation in z,y,x order."""
+        shp = self.level_shape_zyx(0)              # z,y,x voxels
+        sc, tr = self.level_scale_nm[0], self.level_translation_nm[0]   # z,y,x nm
+        lo_zyx = [float(tr[i]) for i in range(3)]
+        hi_zyx = [float(tr[i]) + shp[i] * float(sc[i]) for i in range(3)]
+        return [lo_zyx[2], lo_zyx[1], lo_zyx[0]], [hi_zyx[2], hi_zyx[1], hi_zyx[0]]
+
     def pick_level_for_box(self, bbox_xyz_nm, target_voxels: int = 8_000_000) -> int:
         """Finest level whose voxel count inside the bbox is <= target_voxels."""
         ext = [bbox_xyz_nm[1][i] - bbox_xyz_nm[0][i] for i in range(3)]  # x,y,z nm
