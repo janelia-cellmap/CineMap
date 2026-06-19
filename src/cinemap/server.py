@@ -598,6 +598,22 @@ def snapshot_status(pid: str, sid: str):
     return _snap_state.get(f"{pid}/{sid}", {"status": "idle", "count": 0})
 
 
+@app.post("/api/projects/{pid}/sweeps/{sid}/adopt_preview")
+def adopt_preview(pid: str, sid: str):
+    """Hand the just-rendered '_preview' stills to a newly-created sweep, so the preview
+    frames stick to the clip without re-rendering."""
+    base = config.PROJECTS_DIR / pid / "assets" / "snapshots"
+    prev, dest = base / "_preview", base / sid
+    if not prev.exists():
+        return {"ok": False, "count": 0}
+    import shutil
+    shutil.rmtree(dest, ignore_errors=True)
+    prev.rename(dest)
+    st = _snap_state.pop(f"{pid}/_preview", {"status": "done", "count": 0})
+    _snap_state[f"{pid}/{sid}"] = st
+    return {"ok": True, "count": st.get("count", 0)}
+
+
 @app.post("/api/projects/{pid}/sweeps/preview")
 def preview_sweep(pid: str, req: SweepReqNew):
     """Render preview stills for a sweep BEFORE committing it — so you can see a cutaway/

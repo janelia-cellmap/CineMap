@@ -827,6 +827,7 @@ async function openPlanePanel() {
   $('planeLayer').innerHTML = `<option value="">all layers</option>` + layers.map(l=>`<option value="${l}">${l}</option>`).join('');
   if (LAST_CUT_LAYER && layers.includes(LAST_CUT_LAYER)) $('planeLayer').value = LAST_CUT_LAYER;  // remember selection
   planeModeChanged(); updateSideLabels();
+  PREVIEW_READY = false; if ($('planeSnaps')) $('planeSnaps').innerHTML = '';
   $('planeMsg').textContent = ''; $('planePanel').style.display='block';
 }
 let LAST_CUT_LAYER = '';
@@ -854,6 +855,7 @@ function planeModeChanged() {
   const cut = $('planeMode').value === 'cull';
   $('planeCull').style.display = $('planeMode').value === 'slice' ? 'none' : 'block';
   if ($('planeAddLbl')) $('planeAddLbl').textContent = cut ? 'Add cutaway' : 'Add scan';
+  PREVIEW_READY = false; if ($('planeSnaps')) $('planeSnaps').innerHTML = '';   // mode changed -> preview stale
 }
 // spell out the cut side. For an OBLIQUE cut (full x,y,z in both boxes) the axis is
 // meaningless, so describe it relative to the From→To direction instead of "+z".
@@ -896,8 +898,16 @@ async function previewPlaneScan() {
     if (st.status === 'error') { $('planeMsg').textContent = 'preview failed: ' + (st.error||''); return; }
     showSnapStrip($('planeSnaps'), '_preview', st.count || 3, Date.now());
     $('planeMsg').textContent = 'preview ready (not added yet)';
+    PREVIEW_READY = true;   // Add will adopt these frames onto the new clip
   };
   setTimeout(poll, 1500);
+}
+let PREVIEW_READY = false;
+async function adoptPreview(sw) {
+  if (!PREVIEW_READY || !sw || !sw.id) return;
+  try { await api('POST', `/api/projects/${PID}/sweeps/${sw.id}/adopt_preview`); SNAP_VER[sw.id] = Date.now(); }
+  catch {}
+  PREVIEW_READY = false;
 }
 async function applyPlaneScan() {
   if(!PID) return;
@@ -914,14 +924,16 @@ async function applyPlaneScan() {
     if (kind === 'cutaway') { body.layer = layer; LAST_CUT_LAYER = layer; }
     if (fn.length) body.from_ng = fn;
     if (tn.length) body.to_ng = tn;
-    await api('POST', `/api/projects/${PID}/sweeps`, body);
+    return await api('POST', `/api/projects/${PID}/sweeps`, body);   // returns the new sweep
   };
   $('planeMsg').textContent = 'adding…';
   if (mode === 'cull' && !layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
-  if (mode === 'slice') await mk('slice');
-  else if (mode === 'cull') await mk('cutaway');
-  else { await mk('slice'); if (layer) await mk('cutaway'); }   // both
+  // single-kind modes adopt the just-rendered preview frames onto the new clip
+  if (mode === 'slice') await adoptPreview(await mk('slice'));
+  else if (mode === 'cull') await adoptPreview(await mk('cutaway'));
+  else { await mk('slice'); if (layer) await adoptPreview(await mk('cutaway')); }   // both
   $('planeMsg').textContent = `added (${dur}s)` + (oblique ? ' (oblique)' : '');
+  $('planeSnaps').innerHTML = '';
   await reload();
 }
 
