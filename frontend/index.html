@@ -81,6 +81,7 @@
   .sweepbar.dragging { opacity:.85; box-shadow:0 0 0 1px #fff, 0 2px 8px #000; }
   .sweepbar .grip { position:absolute; right:0; top:0; width:8px; height:100%; cursor:ew-resize; background:rgba(255,255,255,.25); }
   .swsnap { position:absolute; top:14px; height:22px; width:2px; background:#8a8fff; pointer-events:none; box-shadow:0 0 4px #8a8fff; }
+  #swHover .swhovcap { font-size:10px; color:#aab0ff; margin-bottom:4px; }
   .kf .kfdur { position:absolute; bottom:4px; right:6px; background:#0c0d11cc; border-radius:4px; padding:0 4px; font-size:10px; color:#aab0ff; z-index:3; }
   .kf .kfdur input { width:26px; background:transparent; border:0; color:#cdd3ff; font-size:10px; text-align:right; padding:0; }
   .kf .kfdur input::-webkit-outer-spin-button, .kf .kfdur input::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
@@ -326,6 +327,8 @@
   <div id="swSnaps" style="display:flex;gap:4px;margin-top:6px"></div>
 </div>
 
+<div id="swHover" style="display:none;position:fixed;z-index:90;background:#11151fee;border:1px solid #5a5fcf;border-radius:6px;padding:6px;box-shadow:0 6px 20px rgba(0,0,0,.6)"></div>
+
 <div id="lookZoom" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.82);align-items:center;justify-content:center;gap:18px;pointer-events:none">
   <div style="text-align:center"><div style="color:#bbb;margin-bottom:6px;font-size:14px">before</div><img id="zoomBefore" style="max-width:45vw;max-height:82vh;border-radius:6px;background:#000"></div>
   <div style="text-align:center"><div style="color:#bbb;margin-bottom:6px;font-size:14px">after</div><img id="zoomAfter" style="max-width:45vw;max-height:82vh;border-radius:6px;background:#000"></div>
@@ -555,6 +558,7 @@ function renderSweeps(p) {
     const bg = `background-image:url('/api/projects/${PID}/sweeps/${s.id}/snapshot/1${v}'),${grad};background-size:cover;background-position:center;`;
     return `<div class="sweepbar${isSlice ? ' slicebar' : ''}" data-id="${s.id}" style="left:${left}%;width:${width}%;${bg}"
                  onmousedown="startSweepDrag(event,'${s.id}','move')"
+                 onmouseenter="showSweepHover(event,'${s.id}',${s.mirror ? 5 : 3})" onmouseleave="hideSweepHover()"
                  title="${isSlice ? 'EM slice' : 'cutaway'}: ${name} · ${dir} · ${Math.round(s.from_nm)}→${Math.round(s.to_nm)}nm · start ${s.start_s}s · ${s.duration_s}s">
       <span class="del" onmousedown="event.stopPropagation()" onclick="event.stopPropagation(); delSweep('${s.id}')">✕</span>
       <span class="swlbl">${icon} ${name} ${dir} · ${s.duration_s}s</span>
@@ -626,17 +630,43 @@ function openSweepEdit(id) {
 async function renderSweepSnapshots() {
   if (!PID || !EDIT_SWEEP_ID) return;
   const id = EDIT_SWEEP_ID;
-  $('swMsg').textContent = 'rendering preview frames…';
+  $('swMsg').textContent = 'rendering preview frames… (runs in the background)';
   try {
     await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`);
-    const v = Date.now(); SNAP_VER[id] = v;
-    $('swSnaps').innerHTML = [0,1,2].map(i =>
-      `<img src="/api/projects/${PID}/sweeps/${id}/snapshot/${i}?v=${v}" style="width:33%;border-radius:3px;background:#000">`).join('');
+  } catch (e) { $('swMsg').textContent = 'failed to start: ' + (e.message||e); return; }
+  const poll = async () => {
+    let st; try { st = await api('GET', `/api/projects/${PID}/sweeps/${id}/snapshots/status`); }
+    catch { st = {status:'error'}; }
+    if (st.status === 'running') { $('swMsg').textContent = 'rendering preview frames…'; setTimeout(poll, 2000); return; }
+    if (st.status === 'error') { $('swMsg').textContent = 'snapshot failed: ' + (st.error||''); return; }
+    const v = Date.now(); SNAP_VER[id] = v; SNAP_COUNT[id] = st.count || 3;
+    showSnapStrip($('swSnaps'), id, st.count || 3, v);
     $('swMsg').textContent = 'done';
-    if (CUR) renderSweeps(CUR);   // show the mid frame on the lane bar
-  } catch (e) { $('swMsg').textContent = 'failed: ' + (e.message||e); }
+    if (CUR) renderSweeps(CUR);   // show the middle frame on the lane bar
+  };
+  setTimeout(poll, 1500);
 }
-let SNAP_VER = {};
+let SNAP_VER = {}, SNAP_COUNT = {};
+function snapUrl(id, i, v) { return `/api/projects/${PID}/sweeps/${id}/snapshot/${i}` + (v?`?v=${v}`:''); }
+// hover a clip to peek its preview frames (rendered via the 📷 button). Frames that don't
+// exist yet just don't show; a caption nudges you to render them.
+function showSweepHover(e, id, n) {
+  const h = $('swHover'); if (!h) return;
+  const v = SNAP_VER[id] ? `?v=${SNAP_VER[id]}` : '';
+  h.innerHTML = `<div class="swhovcap">preview — open the clip → 📷 to (re)render</div>`
+    + `<div style="display:flex;gap:3px">` + Array.from({length:n}, (_,i) =>
+        `<img src="/api/projects/${PID}/sweeps/${id}/snapshot/${i}${v}" onerror="this.remove()" style="height:70px;border-radius:3px;background:#000">`).join('')
+    + `</div>`;
+  const r = e.currentTarget.getBoundingClientRect();
+  h.style.display = 'block';
+  h.style.left = Math.max(8, Math.min(r.left, window.innerWidth - h.offsetWidth - 8)) + 'px';
+  h.style.bottom = (window.innerHeight - r.top + 8) + 'px';
+}
+function hideSweepHover() { const h = $('swHover'); if (h) h.style.display = 'none'; }
+function showSnapStrip(el, id, n, v) {
+  el.innerHTML = Array.from({length:n}, (_,i) =>
+    `<img src="${snapUrl(id,i,v)}" onerror="this.style.display='none'" style="width:${Math.floor(100/n)-1}%;border-radius:3px;background:#000">`).join('');
+}
 async function saveSweepEdit() {
   if (!PID || !EDIT_SWEEP_ID) return;
   const body = { start_s:+$('swStart').value, duration_s:+$('swDur').value,

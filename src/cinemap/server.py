@@ -557,25 +557,45 @@ def delete_sweep(pid: str, sid: str):
     return {"ok": True}
 
 
+# clip snapshot render state: "pid/sid" -> {status, count}
+_snap_state: dict[str, dict] = {}
+
+
 @app.post("/api/projects/{pid}/sweeps/{sid}/snapshots")
 def render_sweep_snapshots(pid: str, sid: str):
-    """Render 3 small preview stills (start / middle / end) of a clip, so the timeline
-    bar can show what the sweep looks like. Synchronous (a few draft frames)."""
+    """Kick off (in the background) a few small preview stills of a clip so the timeline
+    bar can show what the sweep looks like. A MIRROR sweep gets 5 evenly-spaced frames
+    (0/25/50/75/100%) since start & end look identical; others get 3 (start/mid/end).
+    Returns immediately; poll …/snapshots/status."""
     import shutil
     p = store.load(pid)
     sw = next((s for s in p.sweeps if s.id == sid), None)
     if sw is None:
         raise HTTPException(404, "no such sweep")
-    times = [sw.start_s, sw.start_s + sw.duration_s / 2.0, sw.start_s + sw.duration_s]
-    settings = RenderSettings(width=240, height=160, samples=12, fps=2, draft=True)
-    worker = RenderWorker(p, RenderJob(id=f"snap_{sid}", settings=settings))
+    n = 5 if getattr(sw, "mirror", False) else 3
+    dur = sw.duration_s or 1e-9
+    times = [sw.start_s + dur * k / (n - 1) for k in range(n)]
     out = config.PROJECTS_DIR / pid / "assets" / "snapshots" / sid
-    shutil.rmtree(out, ignore_errors=True)
-    try:
-        paths = worker.render_snapshots(times, out)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"snapshot render failed: {e}") from e
-    return {"count": len(paths)}
+    key = f"{pid}/{sid}"
+    _snap_state[key] = {"status": "running", "count": n}
+
+    def _run():
+        try:
+            shutil.rmtree(out, ignore_errors=True)
+            settings = RenderSettings(width=240, height=160, samples=12, fps=2, draft=True)
+            worker = RenderWorker(p, RenderJob(id=f"snap_{sid}", settings=settings))
+            paths = worker.render_snapshots(times, out)
+            _snap_state[key] = {"status": "done", "count": len(paths)}
+        except Exception as e:  # noqa: BLE001
+            _snap_state[key] = {"status": "error", "error": str(e)}
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "running", "count": n}
+
+
+@app.get("/api/projects/{pid}/sweeps/{sid}/snapshots/status")
+def snapshot_status(pid: str, sid: str):
+    return _snap_state.get(f"{pid}/{sid}", {"status": "idle", "count": 0})
 
 
 @app.get("/api/projects/{pid}/sweeps/{sid}/snapshot/{idx}")
