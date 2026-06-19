@@ -128,7 +128,8 @@ class Keyframe(BaseModel):
     meshes: list[MeshInstance] = Field(default_factory=list)
     annotations: list[AnnotationInstance] = Field(default_factory=list)
     lighting: Lighting = Field(default_factory=Lighting)
-    duration_in_s: float = 2.0  # transition duration INTO this keyframe
+    duration_in_s: float = 2.0  # transition duration INTO this keyframe (the move)
+    hold_in_s: float = 0.0      # rest/dwell ON this keyframe's pose before moving on
     easing: Literal["linear", "ease-in-out", "ease-in", "ease-out"] = "ease-in-out"
     ng_state: Optional[dict] = None  # originating scouting state (round-trip)
     thumbnail_path: Optional[str] = None

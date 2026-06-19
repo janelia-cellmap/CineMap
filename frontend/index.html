@@ -82,11 +82,14 @@
   .sweepbar .grip { position:absolute; right:0; top:0; width:8px; height:100%; cursor:ew-resize; background:rgba(255,255,255,.25); }
   .swsnap { position:absolute; top:14px; height:22px; width:2px; background:#8a8fff; pointer-events:none; box-shadow:0 0 4px #8a8fff; }
   #swHover .swhovcap { font-size:10px; color:#aab0ff; margin-bottom:4px; }
-  .kf .kfdur { position:absolute; bottom:4px; right:6px; background:#0c0d11cc; border-radius:4px; padding:0 4px; font-size:10px; color:#aab0ff; z-index:3; }
-  .kf .kfdur input { width:26px; background:transparent; border:0; color:#cdd3ff; font-size:10px; text-align:right; padding:0; }
+  .kf .kfdur { position:absolute; bottom:4px; left:4px; right:11px; background:#0c0d11cc; border-radius:4px; padding:1px 3px; font-size:10px; color:#aab0ff; z-index:3; display:flex; align-items:center; gap:3px; }
+  .kf .kfdur label { display:inline-flex; align-items:center; }
+  .kf .kfdur input { width:22px; background:transparent; border:0; color:#cdd3ff; font-size:10px; text-align:right; padding:0; }
   .kf .kfdur input::-webkit-outer-spin-button, .kf .kfdur input::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
-  .kf .kfdur select { background:transparent; border:0; color:#aab0ff; font-size:11px; padding:0; cursor:pointer; }
+  .kf .kfdur select { background:transparent; border:0; color:#aab0ff; font-size:11px; padding:0; cursor:pointer; margin-left:auto; }
   .kf .kfdur select option { background:#11151f; color:#cdd3ff; }
+  .kf .kfgrip { position:absolute; top:0; right:0; width:7px; height:100%; cursor:ew-resize; background:linear-gradient(90deg,transparent,#5a5fcf66); border-radius:0 6px 6px 0; z-index:3; }
+  .kf .kfgrip:hover { background:#5a5fcf; }
   .msg { font-size:12px; color:var(--mut); }
   /* hover the before/after strip -> big side-by-side overlay (see #lookZoom) */
   #lookCompare { cursor: zoom-in; }
@@ -468,10 +471,14 @@ function thumbBg(k) {
     : '';
 }
 // one normal keyframe card (i = its global index, for the KF# label)
+const KF_HOLD_PXPERSEC = 42;   // a keyframe card widens by this per second of hold
 function kfCard(k, i) {
+  const hold = +k.hold_in_s || 0;
+  const fmt = v => (+v).toFixed(2).replace(/\.?0+$/,'');
   return `
-    <div class="kf${k.thumbnail_path ? ' hasthumb' : ''}" draggable="true" data-id="${k.id}" style="${thumbBg(k)}"
-         title="click to view · drag to reorder"
+    <div class="kf${k.thumbnail_path ? ' hasthumb' : ''}" draggable="true" data-id="${k.id}"
+         style="${thumbBg(k)}flex:0 0 ${150 + hold*KF_HOLD_PXPERSEC}px;width:${150 + hold*KF_HOLD_PXPERSEC}px"
+         title="click to view · drag body to reorder · drag the right edge to rest (hold) longer"
          onclick="gotoKf('${k.id}', this)"
          ondragstart="kfDragStart(event,'${k.id}')" ondragover="kfDragOver(event, this)"
          ondragleave="this.classList.remove('drop')" ondrop="kfDrop(event,'${k.id}')">
@@ -480,13 +487,35 @@ function kfCard(k, i) {
       <div class="lbl">⠿ KF${i} · ${k.label||''}</div>
       <div class="meta">${k.slices.map(s=>s.axis+'='+Math.round(s.position_nm)).join(' ')}<br>
         ${k.meshes.map(m=>m.mesh_name).join(',')||'—'}</div>
-      <span class="kfdur" title="transition INTO this keyframe — duration (s; 0 = instant cut) and easing (how the move accelerates)" onclick="event.stopPropagation()">
-        <input type="number" min="0" step="0.1" value="${(+k.duration_in_s).toFixed(2).replace(/\.?0+$/,'')}"
-               onchange="setKfTiming('${k.id}', {duration_in_s: parseFloat(this.value)||0})">s
-        <select onchange="setKfTiming('${k.id}', {easing: this.value})" title="easing (active when Director is off)">
+      <span class="kfdur" onclick="event.stopPropagation()">
+        <label title="transition INTO this keyframe (the move from the previous one); 0 = instant cut">▶<input type="number" min="0" step="0.1" value="${fmt(k.duration_in_s)}"
+               onchange="setKfTiming('${k.id}', {duration_in_s: parseFloat(this.value)||0})">s</label>
+        <label title="hold / rest ON this keyframe before moving on — or drag the card's right edge">⏸<input type="number" min="0" step="0.1" value="${fmt(hold)}"
+               onchange="setKfTiming('${k.id}', {hold_in_s: parseFloat(this.value)||0})">s</label>
+        <select onchange="setKfTiming('${k.id}', {easing: this.value})" title="easing of the move-in (active when Director is off)">
           ${['ease-in-out','linear','ease-in','ease-out'].map(e=>`<option value="${e}"${k.easing===e?' selected':''}>${{'ease-in-out':'⌢','linear':'╱','ease-in':'⌜','ease-out':'⌝'}[e]}</option>`).join('')}
         </select></span>
+      <span class="kfgrip" title="drag to rest (hold) longer" onmousedown="startKfHoldDrag(event,'${k.id}',${hold})"></span>
     </div>`;
+}
+// drag a keyframe's right edge to set how long it RESTS (holds) on screen — the card widens
+// with the hold, like stretching a clip in iMovie.
+function startKfHoldDrag(e, id, hold0) {
+  e.preventDefault(); e.stopPropagation();
+  const card = e.currentTarget.parentElement;
+  const startX = e.clientX; let newHold = hold0;
+  const move = (ev) => {
+    newHold = Math.max(0, hold0 + (ev.clientX - startX) / KF_HOLD_PXPERSEC);
+    newHold = Math.round(newHold * 10) / 10;
+    card.style.flex = `0 0 ${150 + newHold*KF_HOLD_PXPERSEC}px`;
+    card.style.width = (150 + newHold*KF_HOLD_PXPERSEC) + 'px';
+  };
+  const up = async () => {
+    window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up);
+    await api('PUT', `/api/projects/${PID}/keyframes/${id}/duration`, { hold_in_s: newHold });
+    reload();
+  };
+  window.addEventListener('mousemove', move); window.addEventListener('mouseup', up);
 }
 async function setKfTiming(id, fields) {
   if (!PID) return;

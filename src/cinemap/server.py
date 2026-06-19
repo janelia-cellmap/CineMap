@@ -430,6 +430,7 @@ def set_mesh_opacity(pid: str, kid: str, req: MeshOpacityReq):
 
 class DurationReq(BaseModel):
     duration_in_s: float | None = None
+    hold_in_s: float | None = None
     easing: str | None = None
 
 
@@ -444,6 +445,8 @@ def set_keyframe_duration(pid: str, kid: str, req: DurationReq):
     fields = {}
     if req.duration_in_s is not None:
         fields["duration_in_s"] = max(0.0, float(req.duration_in_s))
+    if req.hold_in_s is not None:
+        fields["hold_in_s"] = max(0.0, float(req.hold_in_s))
     if req.easing:
         fields["easing"] = req.easing
     ops.update_keyframe(p, kid, **fields)
