@@ -19,5 +19,9 @@ echo "CineMap  →  http://$(hostname -f):${PORT}  (or http://localhost:${PORT};
 # --reload auto-restarts the server when a source file under src/ changes, so code
 # fixes take effect without a manual restart (the render worker runs in-process, so
 # edits would otherwise stay stale until restart).
+# The repo lives on NFS, where inotify file-watching does NOT fire — so plain --reload
+# never triggers. WATCHFILES_FORCE_POLLING makes watchfiles poll instead, so reload
+# works on the network filesystem.
+export WATCHFILES_FORCE_POLLING="${WATCHFILES_FORCE_POLLING:-1}"
 exec conda run --no-capture-output -n "$ENV" \
   uvicorn cinemap.server:app --host "$HOST" --port "$PORT" --reload --reload-dir src

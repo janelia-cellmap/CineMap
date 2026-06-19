@@ -252,6 +252,16 @@ def bake(pid: str):
     return kf.model_dump()
 
 
+@app.post("/api/projects/{pid}/sync_layers")
+def sync_layers(pid: str):
+    """Union the live neuroglancer view's layers into the manifest (no bake) so a
+    volume just added in the viewer becomes sliceable. Returns the updated project."""
+    if not store.exists(pid):
+        raise HTTPException(404, "no such project")
+    p = scouting.sync_manifest_from_view(store.load(pid))
+    return _light_project(p)
+
+
 @app.post("/api/projects/import_states")
 def import_states_new_project(body: dict):
     """Create a project from an uploaded states list and bake a keyframe per state.

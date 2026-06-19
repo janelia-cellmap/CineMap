@@ -200,6 +200,7 @@ def _annotations_from_view(project: Project, st: dict) -> list[AnnotationInstanc
 def bake_keyframe(project: Project, label: str = "scouted", st: dict | None = None) -> Keyframe:
     """Build a NEW keyframe from a neuroglancer state (the live view by default)."""
     cam, slices, meshes, annotations, st = _scene_from_view(project, st)
+    _merge_manifest(project, st)   # learn layers new to this view (e.g. an EM image just added)
     if not meshes and not slices and project.keyframes:  # nothing on -> keep previous meshes
         meshes = [m.model_copy() for m in project.keyframes[-1].meshes]
     kf = Keyframe(id=ops._uid("kf"), label=label, camera=cam, slices=slices,
@@ -290,11 +291,22 @@ def update_keyframe_from_view(project: Project, keyframe_id: str) -> Keyframe | 
     if kf is None:
         return None
     cam, slices, meshes, annotations, st = _scene_from_view(project)
+    _merge_manifest(project, st)   # learn layers new to this view (e.g. an EM image just added)
     updated = kf.model_copy(update={"camera": cam, "slices": slices, "meshes": meshes,
                                     "annotations": annotations, "ng_state": st})
     project.keyframes = [updated if k.id == keyframe_id else k for k in project.keyframes]
     ops.store.save(project)
     return updated
+
+
+def sync_manifest_from_view(project: Project) -> Project:
+    """Union the live neuroglancer view's layers into the project manifest WITHOUT
+    baking a keyframe — so a volume just added in the viewer (e.g. an EM image, or a
+    segmentation with a label volume) becomes sliceable right away. Returns the project."""
+    st = get_viewer().state.to_json()
+    _merge_manifest(project, st)
+    ops.store.save(project)
+    return project
 
 
 def sync_segments(project: Project, keyframe_id: str) -> Keyframe | None:

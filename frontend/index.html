@@ -876,7 +876,10 @@ async function orbit()       { if(!PID)return; const secs=parseFloat(prompt('Orb
 async function openPlanePanel() {
   if(!PID) return;
   $('lookPanel').style.display='none'; $('propPanel').style.display='none';
-  const proj = await api('GET', `/api/projects/${PID}`);
+  // pull in any volume layers added live in neuroglancer (e.g. an EM image) so they're sliceable
+  let proj;
+  try { proj = await api('POST', `/api/projects/${PID}/sync_layers`); }
+  catch (e) { proj = await api('GET', `/api/projects/${PID}`); }
   const kfs = (proj && proj.keyframes) || [];
   // layers from the keyframe you're ON (falls back to the last), so the cut matches your view
   const base = kfs.find(k=>k.id===(ACTIVE_KF||LAST_KF_ID)) || kfs[kfs.length-1];
