@@ -598,6 +598,40 @@ def snapshot_status(pid: str, sid: str):
     return _snap_state.get(f"{pid}/{sid}", {"status": "idle", "count": 0})
 
 
+@app.post("/api/projects/{pid}/sweeps/preview")
+def preview_sweep(pid: str, req: SweepReqNew):
+    """Render preview stills for a sweep BEFORE committing it — so you can see a cutaway/
+    slice in the create panel without adding it to the timeline first. Renders into the
+    '_preview' snapshot slot (served via …/sweeps/_preview/snapshot/{i})."""
+    import shutil
+    p = store.load(pid)
+    pc = p.model_copy(deep=True)               # work on a COPY; never saved
+    sw = ops.add_sweep(pc, kind=req.kind, layer=req.layer, em_name=req.em_name, axis=req.axis,
+                       side=req.side, from_ng=req.from_ng, to_ng=req.to_ng,
+                       from_nm=req.from_nm, to_nm=req.to_nm, start_s=req.start_s,
+                       duration_s=req.duration_s, easing=req.easing, mirror=req.mirror,
+                       commit=False)
+    n = 5 if sw.mirror else 3
+    dur = sw.duration_s or 1e-9
+    times = [sw.start_s + dur * k / (n - 1) for k in range(n)]
+    out = config.PROJECTS_DIR / pid / "assets" / "snapshots" / "_preview"
+    key = f"{pid}/_preview"
+    _snap_state[key] = {"status": "running", "count": n}
+
+    def _run():
+        try:
+            shutil.rmtree(out, ignore_errors=True)
+            settings = RenderSettings(width=240, height=160, samples=12, fps=2, draft=True)
+            worker = RenderWorker(pc, RenderJob(id="snap_preview", settings=settings))
+            paths = worker.render_snapshots(times, out)
+            _snap_state[key] = {"status": "done", "count": len(paths)}
+        except Exception as e:  # noqa: BLE001
+            _snap_state[key] = {"status": "error", "error": str(e)}
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "running", "count": n}
+
+
 @app.get("/api/projects/{pid}/sweeps/{sid}/snapshot/{idx}")
 def get_sweep_snapshot(pid: str, sid: str, idx: int):
     path = config.PROJECTS_DIR / pid / "assets" / "snapshots" / sid / f"frame_{idx:05d}.png"

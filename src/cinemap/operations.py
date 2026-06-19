@@ -358,7 +358,8 @@ def _plane_default_range(project: Project, base: Keyframe, ax_i: int,
 def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, side: int = 1,
               from_nm=None, to_nm=None, start_s=None, duration_s=None,
               from_ng=None, to_ng=None, easing: str = "linear",
-              kind: str = "cutaway", em_name: str = "", mirror: bool = False) -> Sweep:
+              kind: str = "cutaway", em_name: str = "", mirror: bool = False,
+              commit: bool = True) -> Sweep:
     """Add an independent plane sweep on its OWN timeline (decoupled from the camera).
     kind='cutaway' slides a mesh layer's clip plane; kind='slice' sweeps an EM cross-section.
     Slides from `from_nm` to `to_nm` over [start_s, start_s+duration_s]. Defaults: the full
@@ -372,8 +373,14 @@ def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, s
         fx, tx, a, b = _ng_coords_to_nm(base, project, axis, from_ng, to_ng)
         if fx and tx:
             normal = _unit([tx[i] - fx[i] for i in range(3)]); axis = _dominant_axis(normal)
-            from_nm = sum(normal[j] * fx[j] for j in range(3))
-            to_nm = sum(normal[j] * tx[j] for j in range(3))
+            # From/To set the cut DIRECTION; the sweep range fits the layer's extent along
+            # that normal (falls back to the literal point offsets if no mesh bounds).
+            rng = _layer_offset_range(project, base, bbox_layer, normal) if kind == "cutaway" else None
+            if rng:
+                from_nm, to_nm = rng
+            else:
+                from_nm = sum(normal[j] * fx[j] for j in range(3))
+                to_nm = sum(normal[j] * tx[j] for j in range(3))
             oblique = True
         else:
             from_nm = a if a is not None else from_nm
@@ -399,7 +406,8 @@ def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, s
                duration_s=float(duration_s if duration_s is not None else total),
                easing=easing, mirror=bool(mirror))
     project.sweeps.append(sw)
-    store.save(project)
+    if commit:                 # commit=False -> build the sweep for a preview without saving
+        store.save(project)
     return sw
 
 
@@ -419,6 +427,26 @@ def update_sweep(project: Project, sweep_id: str, **fields) -> Sweep | None:
             setattr(sw, k, v)
     store.save(project)
     return sw
+
+
+def _layer_offset_range(project: Project, base: Keyframe, layer, normal):
+    """[lo, hi] of the mesh layer's extent projected onto `normal` (nm), or None — so an
+    OBLIQUE cutaway sweeps across the actual mesh instead of running far past it (using the
+    literal From/To point offsets often spans the whole volume, so most of the sweep shows
+    no change)."""
+    lo = hi = None
+    for m in (base.meshes if base else []):
+        if (layer and m.mesh_name != layer) or not m.segment_ids:
+            continue
+        src = next((s for s in project.manifest.meshes if s.name == m.mesh_name), None)
+        bb = mesh_bbox_nm(src.mesh_url, m.segment_ids) if src else None
+        if not bb:
+            continue
+        c, r = bb
+        off = sum(c[i] * normal[i] for i in range(3))
+        lo = off - r if lo is None else min(lo, off - r)
+        hi = off + r if hi is None else max(hi, off + r)
+    return (lo, hi) if lo is not None else None
 
 
 def _unit(v):

@@ -291,7 +291,10 @@
   <label class="msg" title="How long the scan/cutaway takes on screen. Frames are filled in automatically from this and the fps — you set time, not frame count.">Duration (s)</label>
   <input id="planeDur" type="number" min="0.1" step="0.1" value="4" style="width:100%">
   <label class="chk" title="Ping-pong: sweep from start to end, then back — e.g. cut in to reveal, then close back up. Same duration."><input id="planeMirror" type="checkbox"> mirror (forward + back)</label>
-  <div style="margin-top:8px"><button class="primary" onclick="applyPlaneScan()"><span id="planeAddLbl">Add scan</span></button> <span id="planeMsg" class="msg"></span></div>
+  <div style="margin-top:8px"><button class="primary" onclick="applyPlaneScan()"><span id="planeAddLbl">Add scan</span></button>
+    <button onclick="previewPlaneScan()" title="render preview stills of this cut/slice WITHOUT adding it yet">👁 Preview</button>
+    <span id="planeMsg" class="msg"></span></div>
+  <div id="planeSnaps" style="display:flex;gap:4px;margin-top:6px"></div>
   <div class="msg" style="margin-top:2px">Tip: copy a position straight from neuroglancer. A single value scans along the axis; a full <b>x,y,z</b> in <i>both</i> boxes = an <b>oblique</b> scan along that line (axis ignored). Converted to nm via this view's grid.</div>
 </div>
 
@@ -869,6 +872,32 @@ function updateSideLabels() {
 // parse a box: full "x, y, z" -> [x,y,z] (oblique), single number -> scalar depth nm
 function planeNums(str) {
   return (str||'').trim().split(/[\s,]+/).map(parseFloat).filter(isFinite);
+}
+// preview the cut/slice from the create form WITHOUT committing it (renders into the
+// shared '_preview' snapshot slot, shown in the panel).
+async function previewPlaneScan() {
+  if (!PID) return;
+  const axis = $('planeAxis').value, mode = $('planeMode').value, side = parseInt($('planeSide').value,10);
+  const fn = planeNums($('planeFrom').value), tn = planeNums($('planeTo').value);
+  const dur = parseFloat($('planeDur').value) || 4, layer = $('planeLayer').value;
+  const kind = (mode === 'slice') ? 'slice' : 'cutaway';
+  if (kind === 'cutaway' && !layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
+  const body = { kind, axis, side, easing: 'linear', duration_s: dur, mirror: $('planeMirror').checked };
+  if (kind === 'cutaway') body.layer = layer;
+  if (fn.length) body.from_ng = fn;
+  if (tn.length) body.to_ng = tn;
+  $('planeMsg').textContent = 'rendering preview…';
+  try { await api('POST', `/api/projects/${PID}/sweeps/preview`, body); }
+  catch (e) { $('planeMsg').textContent = 'preview failed: ' + (e.message||e); return; }
+  const poll = async () => {
+    let st; try { st = await api('GET', `/api/projects/${PID}/sweeps/_preview/snapshots/status`); }
+    catch { st = {status:'error'}; }
+    if (st.status === 'running') { setTimeout(poll, 2000); return; }
+    if (st.status === 'error') { $('planeMsg').textContent = 'preview failed: ' + (st.error||''); return; }
+    showSnapStrip($('planeSnaps'), '_preview', st.count || 3, Date.now());
+    $('planeMsg').textContent = 'preview ready (not added yet)';
+  };
+  setTimeout(poll, 1500);
 }
 async function applyPlaneScan() {
   if(!PID) return;
