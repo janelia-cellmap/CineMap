@@ -829,19 +829,44 @@ async function refreshThumbs(ids) {
   }
   setStatus(`refreshed ${uniq.length} thumbnail(s)`);
 }
+// bake one sweep's preview stills (slice / cutaway / EM-plane clip) and wait for it
+function bakeSweepSnapAwait(id) {
+  return new Promise(async (resolve) => {
+    try { await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`); }
+    catch { return resolve(); }
+    const poll = async () => {
+      let st; try { st = await api('GET', `/api/projects/${PID}/sweeps/${id}/snapshots/status`); }
+      catch { return resolve(); }
+      if (st.status === 'running') { setTimeout(poll, 1500); return; }
+      SNAP_VER[id] = Date.now(); SNAP_COUNT[id] = st.count || 3;   // bust the lane-thumb cache
+      resolve();
+    };
+    setTimeout(poll, 1200);
+  });
+}
+// "Render all" / post-load bake: keyframe thumbnails AND every sweep's preview frames
+// (slice / cutaway / EM-plane clips), so the whole timeline — both lanes — fills in.
 async function autoRenderThumbs() {
   if (!PID) { setStatus('open a project first'); return; }
   const ids = KF_ORDER.slice();
-  if (!ids.length) return;
+  const sweepIds = ((CUR && CUR.sweeps) || []).map(s => s.id);
+  if (!ids.length && !sweepIds.length) return;
   AUTO_THUMBS = true;
   $('autoThumbBtn').textContent = '■ Stop';
-  for (let i = 0; i < ids.length; i++) {
-    if (!AUTO_THUMBS) { setStatus(`stopped (${i}/${ids.length} rendered)`); break; }
-    setStatus(`auto-rendering thumbnails ${i + 1}/${ids.length}…`);
-    await renderThumbAwait(ids[i]);
+  const total = ids.length + sweepIds.length;
+  let done = 0;
+  for (let i = 0; i < ids.length && AUTO_THUMBS; i++) {
+    setStatus(`baking keyframe ${i + 1}/${ids.length}…`);
+    await renderThumbAwait(ids[i]); done++;
     await reload();
   }
-  if (AUTO_THUMBS) setStatus(`done — rendered ${ids.length} thumbnail(s)`);
+  for (let j = 0; j < sweepIds.length && AUTO_THUMBS; j++) {
+    setStatus(`baking sweep ${j + 1}/${sweepIds.length}…`);
+    await bakeSweepSnapAwait(sweepIds[j]); done++;
+    if (CUR) renderSweeps(CUR);   // show each clip's preview on the lane as it finishes
+  }
+  setStatus(AUTO_THUMBS ? `done — baked ${ids.length} keyframe(s) + ${sweepIds.length} sweep(s)`
+                        : `stopped (${done}/${total} baked)`);
   AUTO_THUMBS = false;
   $('autoThumbBtn').textContent = '⟳ Render all';
 }
