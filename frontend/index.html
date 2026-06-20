@@ -154,6 +154,7 @@
       <label class="chk" title="Director: a non-destructive presentation pass that enhances the look WITHOUT changing your neuroglancer data — camera-relative key/fill/rim lighting, publication-quality materials, and subtle depth-of-field on the framed subject. Uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
       <label class="chk" title="Draw a thin wireframe box around each data source's extent (the EM volume and/or each rendered layer's label volume), like neuroglancer's bounding box. Falls back to a tight box around the rendered meshes when a layer has no volume source."><input id="showBbox" type="checkbox" /> bbox</label>
       <input id="bboxColor" type="color" value="#9ea8bd" title="bounding-box wireframe color" style="width:24px;height:20px;padding:0;border:1px solid var(--line);background:none;cursor:pointer" />
+      <select id="bboxSource" title="Which layer the bounding box is drawn from (its data/mesh extent) — works even if that layer is hidden. Auto = the EM volume, or all visible meshes." style="max-width:120px"><option value="">bbox: auto</option></select>
       <label title="Mesh level-of-detail strategy (how fine the meshes are): Single = one resolution for the whole shot (used automatically when cutting away). Per-frame = coarser when a layer is far/small, finer on close-ups, like neuroglancer (free on orbits). Per-chunk = different detail within one mesh by on-screen size (experimental).">lod
         <select id="lodMode">
           <option value="frame" selected>per-frame</option>
@@ -515,8 +516,18 @@ async function setKfTiming(id, fields) {
 const TL_PX = 64, MARKER = 92;                 // px per second; keyframe thumbnail width
 let TL_XOF = (t)=>t*TL_PX + MARKER/2, TL_WIDTH = 0;   // shared time->x (set by renderKeyframes)
 const fmtS = v => (+v).toFixed(2).replace(/\.?0+$/, '');
+function populateBboxSources(p) {
+  const sel = $('bboxSource'); if (!sel) return;
+  const cur = sel.value, m = (p && p.manifest) || {};
+  let opts = '<option value="">bbox: auto</option>';
+  if (m.em && m.em.name) opts += `<option value="${m.em.name}">bbox: ${m.em.name} (EM)</option>`;
+  (m.meshes || []).forEach(ms => { opts += `<option value="${ms.name}">bbox: ${ms.name}</option>`; });
+  sel.innerHTML = opts;
+  sel.value = cur;   // keep the current pick if it still exists
+}
 function renderKeyframes(p) {
   CUR = p; const tl = $('timeline'); const kfs = p.keyframes;
+  populateBboxSources(p);
   LAST_KF_ID = kfs.length ? kfs[kfs.length-1].id : null;
   KF_ORDER = kfs.map(k => k.id);
   if (!kfs.length) {
@@ -1110,7 +1121,7 @@ function saveRenderPrefs() {
     samples: +$('samples').value, mesh_detail: +$('detail').value || 1,
     auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
     show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
-    preview_ratio: +$('ratio').value || 10 };
+    bbox_source: $('bboxSource').value, preview_ratio: +$('ratio').value || 10 };
   api('PUT', `/api/projects/${PID}/render_prefs`, prefs).catch(() => {});
 }
 // apply a project's saved render controls back onto the UI (only if it has any)
@@ -1123,6 +1134,7 @@ function applyRenderPrefs(p) {
   if (rp.auto_direct != null) $('autoDirect').checked = !!rp.auto_direct;
   if (rp.show_bbox != null) $('showBbox').checked = !!rp.show_bbox;
   if (rp.bbox_color) $('bboxColor').value = rgb01ToHex(rp.bbox_color);
+  if (rp.bbox_source != null) $('bboxSource').value = rp.bbox_source;
 }
 async function startRender(mode) {
   AUTO_THUMBS = false;   // stop any thumbnail auto-sweep before a full render
@@ -1138,7 +1150,8 @@ async function startRender(mode) {
   const body = { width:+$('w').value, height:+$('h').value, fps, samples:+$('samples').value,
                  draft: mode === 'preview', mesh_detail: +$('detail').value || 1,
                  auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
-                 show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value) };
+                 show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
+                 bbox_source: $('bboxSource').value };
   if (mode === 'blend') body.export_blend = true;   // bake an animated .blend, no video
   let job_id;
   try { ({ job_id } = await api('POST', `/api/projects/${PID}/render`, body)); }

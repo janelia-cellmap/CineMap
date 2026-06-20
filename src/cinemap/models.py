@@ -159,6 +159,9 @@ class RenderSettings(BaseModel):
     # box. Falls back to a tight box around the rendered meshes when no volume source.
     show_bbox: bool = False
     bbox_color: list[float] = Field(default_factory=lambda: [0.62, 0.66, 0.74])  # wireframe rgb (0–1)
+    # which layer the box is drawn from: "" = auto (EM / all visible meshes), or a layer
+    # NAME (EM image or a mesh/seg layer) — drawn even if that layer is currently hidden.
+    bbox_source: str = ""
     # By default a layer's precomputed meshes are downloaded (fast, LOD-adaptive,
     # matches neuroglancer). Set this to instead regenerate watertight meshes from
     # the OME-Zarr label volume via marching cubes when one is available.
@@ -230,6 +233,7 @@ class RenderPrefs(BaseModel):
     lod_mode: str = "frame"
     show_bbox: bool = False
     bbox_color: list[float] = Field(default_factory=lambda: [0.62, 0.66, 0.74])
+    bbox_source: str = ""
     preview_ratio: int = 10
 
 

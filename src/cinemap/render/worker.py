@@ -130,6 +130,7 @@ class RenderWorker:
         # draw a wireframe box around each data source's extent (neuroglancer-style)
         self._show_bbox = bool(getattr(job.settings, "show_bbox", False))
         self._bbox_color = list(getattr(job.settings, "bbox_color", None) or [0.62, 0.66, 0.74])
+        self._bbox_source = getattr(job.settings, "bbox_source", "") or ""   # "" = auto
 
     # ---- asset preparation ----
     def _em_vol(self) -> EMVolume:
@@ -368,6 +369,35 @@ class RenderWorker:
                           an.point_radius_nm, an.line_radius_nm], sort_keys=True)
         return f"ann_{hashlib.md5(sig.encode()).hexdigest()[:10]}"
 
+    def _extent_for_layer(self, name: str, kfs):
+        """(lo_xyz, hi_xyz) nm extent of one named layer for the bounding box — the EM
+        image's volume extent, a seg layer's label-volume extent, or (precomputed-mesh
+        layer) its mesh AABB. Works even if the layer is hidden in the keyframes."""
+        em = self.manifest.em
+        if em and name == em.name:
+            try:
+                return self._em_vol().extent_nm()
+            except Exception as e:  # noqa: BLE001
+                print(f"[worker] bbox: EM extent failed: {e}")
+                return None
+        src = next((s for s in self.manifest.meshes if s.name == name), None)
+        if src is None:
+            return None
+        if src.label_zarr:
+            try:
+                return self._label_vol(src.label_zarr).extent_nm()
+            except Exception as e:  # noqa: BLE001
+                print(f"[worker] bbox: {name} label extent failed: {e}")
+        if src.mesh_url:
+            from ..operations import mesh_aabb_nm
+            ids = sorted({i for kf in kfs for m in kf.meshes
+                          if m.mesh_name == name for i in m.segment_ids})
+            try:
+                return mesh_aabb_nm(src.mesh_url, ids)   # ids=[] -> samples the layer
+            except Exception as e:  # noqa: BLE001
+                print(f"[worker] bbox: {name} mesh AABB failed: {e}")
+        return None
+
     def _bbox_boxes(self) -> list[tuple[list[float], list[float]]]:
         """Data-source extent boxes to outline (neuroglancer-style): the EM volume's
         box plus each rendered layer's label-volume box. When there's NO volume source
@@ -386,6 +416,10 @@ class RenderWorker:
 
         kfs = getattr(self, "_kfs", None) or self.project.keyframes
         used = {m.mesh_name for kf in kfs for m in kf.meshes}
+        # explicit source: box THAT layer's extent, even if it's currently hidden
+        if self._bbox_source:
+            add(*( self._extent_for_layer(self._bbox_source, kfs) or (None, None) ))
+            return boxes
         if self.manifest.em:
             try:
                 add(*self._em_vol().extent_nm())
