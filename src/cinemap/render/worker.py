@@ -370,8 +370,9 @@ class RenderWorker:
 
     def _bbox_boxes(self) -> list[tuple[list[float], list[float]]]:
         """Data-source extent boxes to outline (neuroglancer-style): the EM volume's
-        box plus each rendered layer's label-volume box. Falls back to a tight AABB
-        around the rendered meshes when a layer has no volume source. (lo_xyz, hi_xyz) nm."""
+        box plus each rendered layer's label-volume box. When there's NO volume source
+        (precomputed-mesh-only layers), falls back to a SINGLE union box around all the
+        rendered meshes (not one per layer). (lo_xyz, hi_xyz) nm."""
         boxes: list[tuple[list[float], list[float]]] = []
         seen: set = set()
 
@@ -396,8 +397,9 @@ class RenderWorker:
                     add(*self._label_vol(src.label_zarr).extent_nm())
                 except Exception as e:  # noqa: BLE001
                     print(f"[worker] bbox: {src.name} label extent failed: {e}")
-        if not boxes:   # no volume source -> tight box around the rendered meshes
+        if not boxes:   # no volume source -> ONE box around all the rendered meshes
             from ..operations import mesh_aabb_nm
+            ulo = uhi = None
             for src in self.manifest.meshes:
                 if src.name not in used or not src.mesh_url:
                     continue
@@ -408,8 +410,12 @@ class RenderWorker:
                 except Exception as e:  # noqa: BLE001
                     print(f"[worker] bbox: {src.name} mesh AABB failed: {e}")
                     continue
-                if bb:
-                    add(*bb)
+                if not bb:
+                    continue
+                blo, bhi = bb
+                ulo = list(blo) if ulo is None else [min(a, b) for a, b in zip(ulo, blo)]
+                uhi = list(bhi) if uhi is None else [max(a, b) for a, b in zip(uhi, bhi)]
+            add(ulo, uhi)   # a single union box, not one per layer
         return boxes
 
     def _bbox_annotation(self) -> FrameAnnotation | None:
@@ -418,9 +424,10 @@ class RenderWorker:
         boxes = self._bbox_boxes()
         if not boxes:
             return None
-        # tube radius scaled to the box so it reads as a hairline at any dataset size
+        # tube radius scaled to the box so it's a visible (not hairline) edge at any
+        # dataset size — ~0.3% of the largest span, floored so small boxes still show
         span = max((hi[i] - lo[i]) for lo, hi in boxes for i in range(3))
-        radius = max(20.0, span * 0.0012)
+        radius = max(60.0, span * 0.003)
         return FrameAnnotation(
             name="__bbox__", color=self._bbox_color, opacity=1.0,
             boxes=[[lo, hi] for lo, hi in boxes], line_radius_nm=radius)
