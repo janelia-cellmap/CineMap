@@ -61,6 +61,7 @@ class OrbitReq(BaseModel):
     n: int = 12
     elevation_deg: float = 22.0
     total_duration_s: float | None = None
+    axis: str = "z"          # orbit pole: 'z' circles in XY, 'y' in XZ, 'x' in YZ
 
 
 class SweepReq(BaseModel):
@@ -501,7 +502,7 @@ def _scan_resp(kfs):
 def orbit(pid: str, req: OrbitReq):
     p = store.load(pid)
     kfs = ops.make_orbit(p, degrees=req.degrees, n=req.n, elevation_deg=req.elevation_deg,
-                         total_duration_s=req.total_duration_s)
+                         total_duration_s=req.total_duration_s, axis=req.axis)
     return _scan_resp(kfs)
 
 

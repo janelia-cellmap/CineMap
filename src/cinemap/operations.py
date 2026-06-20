@@ -117,11 +117,17 @@ def mesh_bbox_nm(mesh_url: str, segment_ids: list[int]):
     return center, max(radius, 1.0)
 
 
-def frame_camera(center, radius_nm, fov_deg=40.0, azimuth_deg=35.0, elevation_deg=22.0) -> Camera:
-    """Place a camera that frames a sphere of `radius_nm` around `center`."""
+def frame_camera(center, radius_nm, fov_deg=40.0, azimuth_deg=35.0, elevation_deg=22.0,
+                 axis: str = "z") -> Camera:
+    """Place a camera that frames a sphere of `radius_nm` around `center`. `axis` is the
+    orbit POLE: the camera circles in the plane perpendicular to it (azimuth) and tilts
+    toward it (elevation). 'z' = circle in XY (default), 'y' = XZ, 'x' = YZ."""
     dist = radius_nm / max(0.1, math.sin(math.radians(fov_deg) / 2)) * 1.1
     az, el = math.radians(azimuth_deg), math.radians(elevation_deg)
-    dirv = [math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)]
+    c, s = math.cos(el) * math.cos(az), math.cos(el) * math.sin(az)
+    pole = math.sin(el)
+    # order the (in-plane, in-plane, pole) components onto world axes by the chosen pole
+    dirv = {"z": [c, s, pole], "y": [c, pole, s], "x": [pole, c, s]}.get(axis, [c, s, pole])
     pos = [center[i] + dirv[i] * dist for i in range(3)]
     return Camera(position_nm=pos, look_at_nm=list(center), fov_deg=fov_deg)
 
@@ -353,23 +359,26 @@ def _base_framing(project: Project, target, radius_nm):
 def make_orbit(project: Project, degrees: float = 360.0, n: int = 12,
                elevation_deg: float = 22.0, target=None, radius_nm=None,
                duration_per_kf_s: float = 0.6,
-               total_duration_s: float | None = None) -> list[Keyframe]:
+               total_duration_s: float | None = None, axis: str = "z") -> list[Keyframe]:
     base, target, radius = _base_framing(project, target, radius_nm)
-    # start the orbit at the current camera's azimuth so the first keyframe doesn't
-    # swing away from the framing the user/agent set (fall back to 35°).
+    # start the orbit at the current camera's azimuth (in the orbit plane) so the first
+    # keyframe doesn't swing away from the framing the user/agent set (fall back to 35°).
+    # The two in-plane world axes depend on the orbit pole `axis`.
+    plane_ax = {"z": (0, 1), "y": (0, 2), "x": (1, 2)}.get(axis, (0, 1))
     az0 = 35.0
     if base is not None:
-        dx = base.camera.position_nm[0] - target[0]
-        dy = base.camera.position_nm[1] - target[1]
-        if dx or dy:
-            az0 = math.degrees(math.atan2(dy, dx))
+        d0 = base.camera.position_nm[plane_ax[0]] - target[plane_ax[0]]
+        d1 = base.camera.position_nm[plane_ax[1]] - target[plane_ax[1]]
+        if d0 or d1:
+            az0 = math.degrees(math.atan2(d1, d0))
     gid = _uid("grp"); glabel = f"orbit {int(degrees)}° ×{n}"
     new = []
     for i in range(n):
         az = az0 + degrees * i / max(1, n - 1)
         kf = Keyframe(
             id=_uid("kf"), label=f"orbit {int(az)}°",
-            camera=frame_camera(target, radius, azimuth_deg=az, elevation_deg=elevation_deg),
+            camera=frame_camera(target, radius, azimuth_deg=az,
+                                elevation_deg=elevation_deg, axis=axis),
             slices=[s.model_copy() for s in (base.slices if base else [])],
             meshes=[m.model_copy() for m in (base.meshes if base else [])],
             # duration-driven: spread total_duration_s across the orbit's keyframes so the

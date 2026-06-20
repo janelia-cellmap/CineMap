@@ -190,7 +190,7 @@
 <footer>
   <div class="pane-title">Keyframe timeline — <span id="kfCount" class="msg">0 frames</span>
     <span class="grow"></span>
-    <button onclick="orbit()" title="Add a 360° orbit move: the camera circles the current target while the scene holds. Set its duration in seconds.">↻ Orbit 360°</button>
+    <button onclick="openOrbitPanel()" title="Add an orbit move: the camera circles the current target. Choose the rotation axis, sweep degrees, duration, elevation, and sample count.">↻ Orbit</button>
     <button onclick="openPlanePanel()" title="Add a plane move: an EM slice sweep or a cutaway, as an independent clip on the timeline (start→stop over a duration).">▤ Plane scan</button>
     <span style="width:12px"></span>
     <label class="msg" title="Opacity of the 3D meshes on the SELECTED keyframe. Slide down to fade the meshes and reveal the EM cross-section behind them (0 = meshes hidden, only the EM slice shows).">3D mesh opacity</label>
@@ -332,6 +332,29 @@
     <span id="planeMsg" class="msg"></span></div>
   <div id="planeSnaps" style="display:flex;gap:4px;margin-top:6px"></div>
   <div class="msg" style="margin-top:2px">Tip: copy a position straight from neuroglancer. A single value scans along the axis; a full <b>x,y,z</b> in <i>both</i> boxes = an <b>oblique</b> scan along that line (axis ignored). Converted to nm via this view's grid.</div>
+</div>
+
+<div id="orbitPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #5a5fcf;border-radius:8px;padding:12px 14px;width:300px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.9">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <b>↻ Orbit</b><span onclick="$('orbitPanel').style.display='none'" style="cursor:pointer;opacity:.7">✕</span>
+  </div>
+  <div class="msg" style="margin:2px 0 6px">Circle the camera around the current target (fixed scene).</div>
+  <label class="msg" title="The orbit pole — the camera circles in the plane perpendicular to this axis.">Rotate around (axis)</label>
+  <select id="orbitAxis" style="width:100%">
+    <option value="z">z — circle in the XY plane (default)</option>
+    <option value="y">y — circle in the XZ plane</option>
+    <option value="x">x — circle in the YZ plane</option>
+  </select>
+  <label class="msg">Sweep (degrees)</label>
+  <input id="orbitDeg" type="number" min="1" step="5" value="360" style="width:100%">
+  <label class="msg" title="How long the whole orbit takes on screen.">Duration (s)</label>
+  <input id="orbitDur" type="number" min="0.1" step="0.5" value="8" style="width:100%">
+  <label class="msg" title="Camera tilt above/below the orbit plane.">Elevation (deg)</label>
+  <input id="orbitElev" type="number" step="1" value="22" style="width:100%">
+  <label class="msg" title="How many camera keyframes sample the arc — more = smoother for big sweeps (they share the duration).">Samples</label>
+  <input id="orbitN" type="number" min="2" step="1" value="12" style="width:100%">
+  <div style="margin-top:8px"><button class="primary" onclick="applyOrbit()">Add orbit</button>
+    <span id="orbitMsg" class="msg"></span></div>
 </div>
 
 <div id="sweepPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #5a5fcf;border-radius:8px;padding:12px 14px;width:300px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.9">
@@ -933,7 +956,27 @@ function toggleClaude() {
 }
 async function addKeyframe() { if(!PID)return; await api('POST', `/api/projects/${PID}/keyframes`); reload(); }
 async function delKf(id)     { await api('DELETE', `/api/projects/${PID}/keyframes/${id}`); reload(); }
-async function orbit()       { if(!PID)return; const secs=parseFloat(prompt('Orbit duration (seconds)?','8'))||8; setStatus('adding orbit…'); const r = await api('POST', `/api/projects/${PID}/orbit`, {degrees:360,n:12,total_duration_s:secs}); await reload(); if (r.thumb_id) renderThumbnail(r.thumb_id); setStatus(`orbit added (${secs}s)`); }
+function openOrbitPanel() {
+  if (!PID) { setStatus('open a project first'); return; }
+  ['lookPanel','propPanel','planePanel'].forEach(id => { const e=$(id); if(e) e.style.display='none'; });
+  $('orbitMsg').textContent = ''; $('orbitPanel').style.display = 'block';
+}
+async function applyOrbit() {
+  if (!PID) return;
+  const body = { degrees: parseFloat($('orbitDeg').value) || 360,
+    n: parseInt($('orbitN').value, 10) || 12,
+    elevation_deg: parseFloat($('orbitElev').value) || 0,
+    total_duration_s: parseFloat($('orbitDur').value) || 8,
+    axis: $('orbitAxis').value };
+  $('orbitMsg').textContent = 'adding…';
+  try {
+    const r = await api('POST', `/api/projects/${PID}/orbit`, body);
+    await reload();
+    if (r.thumb_id) renderThumbnail(r.thumb_id);
+    $('orbitMsg').textContent = `added (${body.degrees}° around ${body.axis}, ${body.total_duration_s}s)`;
+    setStatus('orbit added');
+  } catch (e) { $('orbitMsg').textContent = 'error: ' + e.message; }
+}
 async function openPlanePanel() {
   if(!PID) return;
   $('lookPanel').style.display='none'; $('propPanel').style.display='none';
