@@ -244,7 +244,7 @@ class RenderPrefs(BaseModel):
     bbox_color: list[float] = Field(default_factory=lambda: [0.62, 0.66, 0.74])
     bbox_source: str = ""
     preview_ratio: int = 10
-    fast_sample: bool = False   # ⚡ fast: 32 samples + 0.06 noise threshold + denoiser
+    fast_sample: bool = True    # ⚡ fast (default on): 32 samples + 0.06 noise threshold + denoiser
 
 
 class Project(BaseModel):
