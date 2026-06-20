@@ -36,8 +36,13 @@ def _setup_render(scene_spec: dict) -> None:
             for d in prefs.devices:
                 d.use = d.type in ("OPTIX", "CPU")
             scene.cycles.device = "GPU"
+            # make it obvious in the log whether we're actually on the GPU (OPTIX) or
+            # silently fell back to CPU — a CPU fallback is a ~10-50x slowdown.
+            gpus = [d.name for d in prefs.devices if d.use and d.type == "OPTIX"]
+            print(f"[blender] cycles device=GPU compute=OPTIX gpus={gpus or 'NONE -> CPU fallback!'}",
+                  flush=True)
         except Exception as e:  # noqa: BLE001
-            print(f"[blender] GPU unavailable, CPU: {e}")
+            print(f"[blender] GPU unavailable, CPU: {e}", flush=True)
         scene.cycles.samples = r.get("samples", 64)
         # Adaptive sampling + a denoiser do most of the work: `samples` becomes a CEILING,
         # Cycles stops early on pixels that already look clean (flat areas, the black bg)
@@ -54,6 +59,9 @@ def _setup_render(scene_spec: dict) -> None:
                     break
                 except Exception:  # noqa: BLE001
                     continue
+            print(f"[blender] sampling: max_samples={scene.cycles.samples} "
+                  f"adaptive_threshold={scene.cycles.adaptive_threshold} "
+                  f"denoiser={scene.cycles.denoiser}", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[blender] denoise/adaptive unavailable: {e}")
     scene.render.resolution_x = r["width"]

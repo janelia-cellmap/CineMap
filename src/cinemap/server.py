@@ -96,6 +96,7 @@ class RenderReq(BaseModel):
     height: int = 720
     fps: int = 30
     samples: int = 48
+    noise_threshold: float = 0.01   # adaptive-sampling bail threshold (higher = faster)
     kf_range: list[int] | None = None
     export_blend: bool = False  # produce a self-contained .blend instead of a video
     draft: bool = False         # fast low-res preview (coarse EM + low-voxel meshes)
@@ -768,7 +769,8 @@ def _evict_finished_states(keep: int = 200) -> None:
 @app.post("/api/projects/{pid}/render")
 def render(pid: str, req: RenderReq):
     settings = RenderSettings(width=req.width, height=req.height, fps=req.fps,
-                              samples=req.samples, export_blend=req.export_blend, draft=req.draft,
+                              samples=req.samples, noise_threshold=req.noise_threshold,
+                              export_blend=req.export_blend, draft=req.draft,
                               mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels,
                               auto_direct=req.auto_direct, lod_mode=req.lod_mode,
                               show_bbox=req.show_bbox,

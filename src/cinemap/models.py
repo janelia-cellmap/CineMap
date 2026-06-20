@@ -149,6 +149,10 @@ class RenderSettings(BaseModel):
     height: int = 720
     fps: int = 30
     samples: int = 64
+    # adaptive-sampling noise threshold: Cycles stops a pixel once it's this clean, then
+    # the denoiser removes the rest. Higher = faster (bails sooner), still clean thanks to
+    # OIDN. 0.01 = conservative/clean; ~0.06 = the fast "denoise does the work" setting.
+    noise_threshold: float = 0.01
     engine: Literal["CYCLES", "BLENDER_EEVEE_NEXT"] = "CYCLES"
     # when set, the job produces a self-contained .blend (camera, mesh and slice
     # animation baked to F-curves; textures packed in) instead of rendering frames.
@@ -240,6 +244,7 @@ class RenderPrefs(BaseModel):
     bbox_color: list[float] = Field(default_factory=lambda: [0.62, 0.66, 0.74])
     bbox_source: str = ""
     preview_ratio: int = 10
+    fast_sample: bool = False   # ⚡ fast: 32 samples + 0.06 noise threshold + denoiser
 
 
 class Project(BaseModel):
