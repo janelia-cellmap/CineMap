@@ -592,14 +592,12 @@ _snap_state: dict[str, dict] = {}
 
 
 def _snapshot_times(sw) -> list[float]:
-    """Global times (s) to sample a sweep for its preview stills. A CUTAWAY is expensive
-    (per-frame geometric slice + cap on the whole layer), so it gets ONE still — the
-    fully-revealed end (or the mid-peak for a mirror). A SLICE is cheap, so it gets 3
-    across the sweep (5 for mirror, since start≈end)."""
-    dur = sw.duration_s or 1e-9
-    if sw.kind == "cutaway":
-        return [sw.start_s + dur * (0.5 if getattr(sw, "mirror", False) else 1.0)]
+    """Global times (s) to sample a sweep for its preview stills — 3 across the sweep
+    (5 for a mirror, since start≈end) so the strip shows the progression (cutaway
+    revealing, slice sweeping). The mesh geometry is decoded once and reused across
+    these frames, so the cost is dominated by the first decode, not the frame count."""
     n = 5 if getattr(sw, "mirror", False) else 3
+    dur = sw.duration_s or 1e-9
     return [sw.start_s + dur * k / (n - 1) for k in range(n)]
 
 
