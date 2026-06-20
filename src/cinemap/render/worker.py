@@ -701,7 +701,10 @@ class RenderWorker:
                 except Exception as e:  # noqa: BLE001
                     print(f"[worker] slice {sl.em_name}:{sl.axis} failed: {e}")
                     continue
-                slices.append({**png, "opacity": sl.opacity, "slot": f"{sl.em_name}:{sl.axis}"})
+                # occlude=True -> the EM plane renders as a SOLID cross-section (blocks what's
+                # behind it) instead of a see-through additive overlay. opacity still fades it.
+                slices.append({**png, "opacity": sl.opacity, "occlude": True,
+                               "slot": f"{sl.em_name}:{sl.axis}"})
             overrides = {}
             for m in fr.meshes:
                 if frame_layer_uid is not None:           # chunk mode: per-frame selection
@@ -779,7 +782,11 @@ class RenderWorker:
         # weld) keyed by the geometry+look signature. Previews/thumbnails (draft) skip it —
         # they're already fast and the multi-GB .blend save would only slow them. Cache
         # lives in fast local /tmp (not NFS), and is purely a speedup (safe to evict).
-        if not self._draft and not self.job.settings.export_blend:
+        # Apply to BOTH draft (thumbnails / sweep previews) and full renders — the cache is
+        # keyed by GEOMETRY, not project, so re-importing the same movie or re-baking the
+        # same keyframe/sweep reuses the built scene instead of re-importing every time.
+        # (draft and full get separate keys: the mesh ids already encode draft + budget.)
+        if not self.job.settings.export_blend:
             import hashlib
             import tempfile
             # The key must include EVERY input _import_meshes uses to BUILD geometry+materials,
@@ -801,12 +808,17 @@ class RenderWorker:
         return spec
 
     @staticmethod
-    def _evict_warm_cache(warm_dir: Path, keep: int = 4) -> None:
-        """Keep only the few most-recent warm .blend files (each can be GBs)."""
+    def _evict_warm_cache(warm_dir: Path, max_total_gb: float = 20.0) -> None:
+        """Keep the most-recently-used warm .blend files up to a total size budget (they
+        can be GBs each for full renders, much smaller for draft) — newest first, evict the
+        rest. Size-based so it works whether there are a few huge or many small scenes."""
         try:
             blends = sorted(warm_dir.glob("*.blend"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for p in blends[keep:]:
-                p.unlink(missing_ok=True)
+            total = 0
+            for p in blends:
+                total += p.stat().st_size
+                if total > max_total_gb * 1e9:
+                    p.unlink(missing_ok=True)
         except Exception:  # noqa: BLE001
             pass
 
@@ -846,6 +858,10 @@ class RenderWorker:
             if line.startswith("[blender] frame"):
                 done += 1
                 self._progress(0.6 + 0.3 * done / nframes, line.strip())
+            elif line.startswith("[blender]"):
+                # surface Blender's own status (GPU device, sampling, warm-cache reuse) in
+                # the server log so it's visible without reading the subprocess directly.
+                print(line.rstrip(), flush=True)
         proc.wait()
         if self.cancel.is_set():
             return False
