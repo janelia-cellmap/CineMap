@@ -330,6 +330,7 @@ def _import_meshes(scene_spec: dict) -> dict:
             with bpy.context.temp_override(active_object=obj, selected_editable_objects=new):
                 bpy.ops.object.join()
         bpy.context.view_layer.objects.active = obj
+        obj.name = m["id"]   # stable name so a warm-cached .blend can recover this object
         # flat (per-face) shading by default — each face shades dark/light on its own,
         # giving the crisp faceted definition neuroglancer has; smooth blurs it to blobs.
         if scene_spec.get("direction", {}).get("material", {}).get("flat_shading", True):
@@ -548,6 +549,8 @@ def _import_meshes(scene_spec: dict) -> dict:
             except Exception:  # noqa: BLE001
                 pass
             bmw.to_mesh(orig); bmw.free()
+            orig.name = f"orig_{m['id']}"   # stable + fake-user so the warm cache keeps it
+            orig.use_fake_user = True
             _orig_mesh[obj.name] = orig
         if out_node is not None:
             nt.links.new(surf, out_node.inputs["Surface"])
@@ -794,17 +797,65 @@ def _set_camera(frame: dict) -> None:
         cam.data.dof.use_dof = False
 
 
+def _recover_meshes(spec: dict):
+    """Rebuild the {id: (obj, mat)} map (and the _orig_mesh / _mat_base globals) from a
+    warm-cached .blend that was just opened — so we skip the expensive re-import + weld.
+    Returns None if any expected object is missing (treat as a cache miss -> rebuild)."""
+    out = {}
+    for m in spec["meshes"]:
+        obj = bpy.data.objects.get(m["id"])
+        if obj is None:
+            return None
+        mat = obj.active_material
+        out[m["id"]] = (obj, mat)
+        if mat and mat.use_nodes:
+            mv = mat.node_tree.nodes.get("cm_metal")
+            rv = mat.node_tree.nodes.get("cm_rough")
+            if mv is not None:
+                _mat_base[obj.name] = (mv.outputs[0].default_value,
+                                       rv.outputs[0].default_value if rv else 0.35)
+        og = bpy.data.meshes.get(f"orig_{m['id']}")
+        if og is not None:
+            _orig_mesh[obj.name] = og
+    return out
+
+
 def main(scene_path: str) -> None:
+    import os as _os
     with open(scene_path) as f:
         spec = json.load(f)
     if spec.get("export_blend"):
         export_blend(spec)
         return
-    _clear()
+    # Warm-scene reuse: the expensive part (import 1000s of .ply + weld for cutaways) is
+    # cached as a .blend keyed by geometry signature. If it exists, open it and re-drive
+    # the cheap per-frame state instead of rebuilding. Render settings / lights / camera
+    # are (re)applied fresh below either way, so the fast toggle + resolution still take.
+    warm = spec.get("warm_blend")
+    meshes = None
+    if warm and _os.path.exists(warm):
+        try:
+            bpy.ops.wm.open_mainfile(filepath=warm)
+            meshes = _recover_meshes(spec)
+            print(f"[blender] warm scene {'REUSED' if meshes else 'miss (rebuilding)'}: {warm}",
+                  flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[blender] warm open failed ({e}); rebuilding", flush=True)
+            meshes = None
+    if meshes is None:
+        _clear()
+        meshes = _import_meshes(spec)           # the expensive build
+        if warm:                                # cache it (a copy; current session untouched)
+            try:
+                _os.makedirs(_os.path.dirname(warm), exist_ok=True)
+                bpy.ops.wm.save_as_mainfile(filepath=warm, copy=True)
+                print(f"[blender] warm scene cached: {warm}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[blender] warm cache save failed: {e}", flush=True)
+    # always (re)apply render settings + lights + bloom fresh (cheap; they change per render)
     _setup_render(spec)
     _add_light(spec)
     _setup_bloom(spec)
-    meshes = _import_meshes(spec)
     scene = bpy.context.scene
     out_dir = spec["output_dir"]
     rig = spec.get("direction", {}).get("lighting", {})

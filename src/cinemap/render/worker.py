@@ -775,7 +775,40 @@ class RenderWorker:
             if plan["dof"]["enabled"]:
                 for fr in spec["frames"]:
                     fr["camera"]["dof"] = {"fstop": plan["dof"]["fstop"]}
+        # Warm-scene cache: full-quality renders reuse a built .blend (skip re-import +
+        # weld) keyed by the geometry+look signature. Previews/thumbnails (draft) skip it —
+        # they're already fast and the multi-GB .blend save would only slow them. Cache
+        # lives in fast local /tmp (not NFS), and is purely a speedup (safe to evict).
+        if not self._draft and not self.job.settings.export_blend:
+            import hashlib
+            import tempfile
+            # The key must include EVERY input _import_meshes uses to BUILD geometry+materials,
+            # so a stale cache can never be reused: per-mesh (id=geometry+color+LOD, clip=weld,
+            # color=tint), the whole material profile (direction.material -> roughness/metallic/
+            # ao/cavity/edge/ng_shader/flat_shading/backface_cull/…), engine, nm_per_bu scale,
+            # and auto_direct. Per-frame state (camera/opacity/metallic OVERRIDES/clip position/
+            # slices/lights) is re-driven on the cached geometry, so it correctly does NOT key.
+            geom = sorted((mm["id"], bool(mm.get("clip")), tuple(mm.get("color") or ()))
+                          for mm in mesh_specs.values())
+            sig_src = json.dumps([geom, spec.get("direction", {}).get("material", {}),
+                                  self.job.settings.engine, round(self.nm_per_bu, 6),
+                                  bool(self._auto_direct)],
+                                 sort_keys=True, default=str)
+            sig = hashlib.md5(sig_src.encode()).hexdigest()[:16]
+            warm_dir = Path(tempfile.gettempdir()) / "cinemap_warm"
+            spec["warm_blend"] = str(warm_dir / f"{sig}.blend")
+            self._evict_warm_cache(warm_dir)
         return spec
+
+    @staticmethod
+    def _evict_warm_cache(warm_dir: Path, keep: int = 4) -> None:
+        """Keep only the few most-recent warm .blend files (each can be GBs)."""
+        try:
+            blends = sorted(warm_dir.glob("*.blend"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for p in blends[keep:]:
+                p.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---- run ----
     def _progress(self, p, msg):
