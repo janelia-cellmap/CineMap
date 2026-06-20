@@ -119,17 +119,12 @@ class RenderWorker:
         # neuroglancer; free on orbits), or "chunk" (per-chunk spatial — not yet
         # implemented, treated as "frame").
         self._lod_mode = getattr(job.settings, "lod_mode", "frame") or "frame"
-        # A cutaway needs a watertight cross-section to cap. Mixed LODs (per-chunk, and
-        # per-frame's zoom buckets) place non-matching fragment boundaries next to each
-        # other, so the seams don't weld and the cap can't close (plus the surface cracks).
-        # Whenever any layer has a clip plane, force ONE consistent LOD for the whole shot
-        # so fragment boundaries line up and the cap fills cleanly.
-        has_clip = any(_clip_params(getattr(m, "clip", None))
-                       for kf in project.keyframes for m in kf.meshes)
-        has_sweep = any(getattr(s, "enabled", True) and getattr(s, "kind", "") == "cutaway"
-                        for s in getattr(project, "sweeps", []) or [])
-        if has_clip or has_sweep:
-            self._lod_mode = "single"
+        # A cutaway needs a watertight cross-section to cap, which requires the CUT LAYER
+        # at ONE consistent LOD across the frames where it's clipped (mixed LODs leave
+        # non-welding fragment seams -> the cap cracks/can't close). We DON'T force that on
+        # the whole movie anymore — _build_scene_spec pins only the cut layer, and only in
+        # its cutaway window, to a single LOD; every other layer/frame keeps adaptive LOD
+        # (coarse when far) so the rest of the shot stays light.
         # non-destructive presentation pass (lighting rig / materials / DOF)
         self._auto_direct = bool(getattr(job.settings, "auto_direct", True))
         # draw a wireframe box around each data source's extent (neuroglancer-style)
@@ -611,6 +606,24 @@ class RenderWorker:
         # references only its bucket's variant and the others auto-hide, so far frames
         # render a coarse mesh and close-ups a fine one.
         mesh_specs: dict[str, dict] = {}
+        # Cutaway LOD pinning: a clipped layer must be ONE consistent LOD across the frames
+        # where it's cut (else the cross-section cap cracks). Find, per layer, the frames it
+        # is clipped in, and pin those to the finest nmpp among them — so ONLY the cut layer,
+        # and ONLY in its cutaway window, is forced to a single LOD; everything else keeps
+        # adaptive (coarse-when-far) LOD and stays light.
+        def _ft(i):
+            return frame_times[i] if frame_times else (index_offset + i) / max(1, self.job.settings.fps)
+        clip_frames: dict[str, set] = {}
+        for fi, fr in enumerate(frames):
+            t = _ft(fi)
+            for m in fr.meshes:
+                if self._clip_from_sweeps(m.mesh_name, t) or _clip_params(getattr(m, "clip", None)):
+                    clip_frames.setdefault(m.mesh_name, set()).add(fi)
+        clip_nmpp = {layer: min(frame_lod_nmpp[i] for i in fis) for layer, fis in clip_frames.items()}
+
+        def _eff_nmpp(layer, fi):   # pinned LOD inside a layer's cutaway window, else adaptive
+            return clip_nmpp[layer] if (layer in clip_nmpp and fi in clip_frames[layer]) else frame_lod_nmpp[fi]
+
         # "chunk" mode: per-frame frustum cull + per-segment on-screen LOD (see
         # _build_chunk_assets); other modes: one combined mesh per (layer, segset, bucket).
         frame_layer_uid = (self._build_chunk_assets(frames, mesh_specs)
@@ -618,11 +631,11 @@ class RenderWorker:
         for fi, fr in enumerate(frames):
             if self.cancel.is_set():
                 raise RenderCancelled()
-            nmpp = frame_lod_nmpp[fi]
             if frame_layer_uid is None:
                 for m in fr.meshes:
                     if not m.render_3d:       # label-only layer -> slice overlay only
                         continue
+                    nmpp = _eff_nmpp(m.mesh_name, fi)
                     lc = self._frame_colors(m)
                     uid = self._mesh_uid(m.mesh_name, m.segment_ids, lc.cache_key(), nmpp)
                     if uid not in mesh_specs:
@@ -695,7 +708,7 @@ class RenderWorker:
                     uid = frame_layer_uid[fi].get(m.mesh_name)
                 else:
                     uid = self._mesh_uid(m.mesh_name, m.segment_ids,
-                                         self._frame_colors(m).cache_key(), frame_lod_nmpp[fi])
+                                         self._frame_colors(m).cache_key(), _eff_nmpp(m.mesh_name, fi))
                 if uid and uid in mesh_specs:
                     # effective 3D alpha = cinematic fade (opacity) * NG "Opacity (3d)"
                     oa = getattr(m, "object_alpha", 1.0)
