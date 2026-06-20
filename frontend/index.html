@@ -829,6 +829,18 @@ async function refreshThumbs(ids) {
   }
   setStatus(`refreshed ${uniq.length} thumbnail(s)`);
 }
+// after a propagate: refresh the edited keyframe thumbnails AND re-bake the sweep
+// previews (a layer's color/visibility change also shows in cutaways and slice overlays).
+async function refreshPreviews(kfIds) {
+  await refreshThumbs(kfIds);
+  const sweepIds = ((CUR && CUR.sweeps) || []).map(s => s.id);
+  for (let i = 0; i < sweepIds.length; i++) {
+    setStatus(`refreshing slice/cutaway preview ${i + 1}/${sweepIds.length}…`);
+    await bakeSweepSnapAwait(sweepIds[i]);
+    if (CUR) renderSweeps(CUR);
+  }
+  if (sweepIds.length) setStatus(`refreshed thumbnails + ${sweepIds.length} sweep preview(s)`);
+}
 // bake one sweep's preview stills (slice / cutaway / EM-plane clip) and wait for it
 function bakeSweepSnapAwait(id) {
   return new Promise(async (resolve) => {
@@ -1375,7 +1387,7 @@ async function applyPropagate() {
     $('propMsg').textContent = `changed ${r.count} keyframe(s) — refreshing thumbnails…`;
     setStatus(`propagated ${f} → ${r.count} keyframe(s)`);
     reload();
-    refreshThumbs(r.changed);   // re-render the edited keyframes so thumbnails aren't stale
+    refreshPreviews(r.changed);   // re-render edited keyframes + sweep previews so nothing's stale
   } catch (e) { $('propMsg').textContent = 'error: ' + e.message; }
 }
 
@@ -1412,7 +1424,7 @@ async function applyNgPropagate() {
     $('ngPropMsg').textContent = `propagated to ${total} other keyframe(s) — refreshing thumbnails…`;
     setStatus(`propagated ${NG_CHANGES.length} change(s) to ${total} keyframe(s)`);
     reload();
-    refreshThumbs([...changedIds]);   // re-render edited keyframes so thumbnails aren't stale
+    refreshPreviews([...changedIds]);   // re-render edited keyframes + sweep previews so nothing's stale
     setTimeout(() => $('ngPropPanel').style.display = 'none', 1500);
   } catch (e) { $('ngPropMsg').textContent = 'error: ' + e.message; }
 }

@@ -225,6 +225,38 @@ def diff_layer_settings(old_meshes, new_meshes) -> list[dict]:
     return changes
 
 
+def _rgb_to_hex(rgb) -> str:
+    """[r,g,b] in 0–1 -> '#rrggbb' (neuroglancer color string)."""
+    r, g, b = (max(0, min(255, round(float(c) * 255))) for c in rgb[:3])
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _patch_ng_state_field(ng_state: dict, mesh_name: str, field, value, segment_id=None) -> None:
+    """Mirror a propagated MeshInstance change into the keyframe's neuroglancer state
+    layer, so the stored NG link reflects it (round-trips through gotoKf / re-capture).
+    Maps CineMap fields -> NG layer JSON keys; 'color' is a CineMap-only mesh tint with
+    no NG equivalent, so it's left alone."""
+    if not isinstance(ng_state, dict):
+        return
+    layer = next((L for L in ng_state.get("layers", []) if L.get("name") == mesh_name), None)
+    if layer is None:
+        return
+    if field == "segment_color" and segment_id is not None:
+        layer.setdefault("segmentColors", {})[str(segment_id)] = _rgb_to_hex(value)
+    elif field == "default_color":
+        layer["segmentDefaultColor"] = _rgb_to_hex(value)
+    elif field == "color_seed":
+        layer["colorSeed"] = int(value)
+    elif field == "visible":
+        layer["visible"] = bool(value)
+    elif field == "object_alpha":
+        layer["objectAlpha"] = float(value)
+    elif field == "silhouette":
+        layer["meshSilhouetteRendering"] = float(value)
+    elif field == "saturation":
+        layer["saturation"] = float(value)
+
+
 def propagate_layer_field(project: Project, from_keyframe_id: str, mesh_name: str,
                           field: str, value, segment_id: int | None = None,
                           direction: str = "right", match_old: bool = True,
@@ -288,7 +320,15 @@ def propagate_layer_field(project: Project, from_keyframe_id: str, mesh_name: st
         else:
             new_meshes = [m.model_copy(update={field: value})
                           if m.mesh_name == mesh_name else m for m in kfs[i].meshes]
-        kfs[i] = kfs[i].model_copy(update={"meshes": new_meshes})
+        upd = {"meshes": new_meshes}
+        # mirror the change into the keyframe's stored neuroglancer state too, so the NG
+        # link round-trips (gotoKf / re-capture keep the new value instead of reverting).
+        if kfs[i].ng_state:
+            import copy
+            ng = copy.deepcopy(kfs[i].ng_state)
+            _patch_ng_state_field(ng, mesh_name, field, value, segment_id)
+            upd["ng_state"] = ng
+        kfs[i] = kfs[i].model_copy(update=upd)
         changed.append(kfs[i].id)
     project.keyframes = kfs
     store.save(project)
