@@ -504,6 +504,7 @@ async function loadNg() {
 }
 
 async function reload() {
+  TVER = Date.now();   // fresh cache-buster so any blank/stale thumbnails refetch this reload
   const p = await api('GET', `/api/projects/${PID}`);
   try {
     const d = await api('GET', `/api/projects/${PID}/keyframes/diffs`);
@@ -525,10 +526,12 @@ function diffBadge(id) {
 function openPropForKf(id) { ACTIVE_KF = id; openPropPanel(); }
 
 let LAST_KF_ID = null, KF_ORDER = [], THUMB_VER = {}, CUR = null, EXPANDED_GROUPS = new Set();
+let TVER = 0;   // shared thumbnail cache-buster, bumped every reload so cards never get
+                // stuck on a stale/404-cached '?v=0' image (e.g. fetched before the jpg landed)
 let KF_TIME = {};   // keyframe id -> its time on the timeline (seconds), set by renderKeyframes
 function thumbBg(k) {
   return k.thumbnail_path
-    ? `background-image:url('/api/projects/${PID}/keyframes/${k.id}/thumbnail?v=${THUMB_VER[k.id]||0}');background-size:cover;background-position:center;`
+    ? `background-image:url('/api/projects/${PID}/keyframes/${k.id}/thumbnail?v=${THUMB_VER[k.id]||TVER}');background-size:cover;background-position:center;`
     : '';
 }
 async function setKfTiming(id, fields) {
@@ -822,7 +825,7 @@ function showKeyframeThumb(id) {
   const img = new Image();
   img.onload = () => { $('preview').innerHTML = ''; $('preview').appendChild(img); };
   img.onerror = () => { $('preview').innerHTML = '<span class="msg">this keyframe hasn’t been rendered yet — hit Preview, or “Render all” to fill the timeline</span>'; };
-  img.src = `/api/projects/${PID}/keyframes/${id}/thumbnail?v=${THUMB_VER[id] || 0}`;
+  img.src = `/api/projects/${PID}/keyframes/${id}/thumbnail?v=${THUMB_VER[id] || TVER}`;
 }
 
 // render the single keyframe to a still; show it live and keep it as the frame thumbnail
