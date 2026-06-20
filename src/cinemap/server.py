@@ -50,6 +50,48 @@ _render_state: dict[str, dict] = {}
 _workers: dict[str, RenderWorker] = {}
 
 
+@app.on_event("shutdown")
+def _shutdown_cleanup() -> None:
+    """On a graceful stop (SIGTERM/Ctrl-C, e.g. a restart), tear down in-flight renders so
+    their Blender + mesh-decode subprocesses don't get orphaned (reparented to init) and
+    spin forever eating CPU. Cancels each worker (kills its Blender subprocess), then
+    SIGKILLs any remaining direct children (multiprocessing decode workers, etc.)."""
+    import signal as _signal
+    for w in list(_workers.values()):
+        try:
+            w.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+    try:  # kill any child processes this server spawned that didn't exit on their own
+        for child_pid in _own_child_pids():
+            try:
+                os.kill(child_pid, _signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _own_child_pids() -> list[int]:
+    """PIDs whose parent is this process (Blender subprocess, multiprocessing workers)."""
+    me = os.getpid()
+    out = []
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    ppid = int(f.read().split(") ", 1)[1].split()[1])
+                if ppid == me:
+                    out.append(int(pid))
+            except (OSError, IndexError, ValueError):
+                continue
+    except OSError:
+        pass
+    return out
+
+
 # ----------------------------- request bodies -----------------------------
 class CreateProject(BaseModel):
     name: str
@@ -621,18 +663,24 @@ def render_sweep_snapshots(pid: str, sid: str):
     key = f"{pid}/{sid}"
     _snap_state[key] = {"status": "running", "count": n}
 
+    job_id = f"snap_{sid}"
+
     def _run():
+        settings = RenderSettings(width=240, height=160, samples=12, fps=2, draft=True)
+        worker = RenderWorker(p, RenderJob(id=job_id, settings=settings))
+        _workers[job_id] = worker   # registered so Stop/cancel + shutdown can kill it
         try:
             shutil.rmtree(out, ignore_errors=True)
-            settings = RenderSettings(width=240, height=160, samples=12, fps=2, draft=True)
-            worker = RenderWorker(p, RenderJob(id=f"snap_{sid}", settings=settings))
             paths = worker.render_snapshots(times, out)
-            _snap_state[key] = {"status": "done", "count": len(paths)}
+            _snap_state[key] = ({"status": "cancelled", "count": 0} if worker.cancel.is_set()
+                                else {"status": "done", "count": len(paths)})
         except Exception as e:  # noqa: BLE001
             _snap_state[key] = {"status": "error", "error": str(e)}
+        finally:
+            _workers.pop(job_id, None)
 
     threading.Thread(target=_run, daemon=True).start()
-    return {"status": "running", "count": n}
+    return {"status": "running", "count": n, "job_id": job_id}
 
 
 @app.get("/api/projects/{pid}/sweeps/{sid}/snapshots/status")

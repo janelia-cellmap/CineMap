@@ -829,12 +829,26 @@ class RenderWorker:
         if self._cb:
             self._cb(p, msg)
 
-    def terminate(self) -> None:
-        """Request cancellation; kills the Blender subprocess if it is running."""
-        self.cancel.set()
+    def _kill_proc(self) -> None:
+        """SIGKILL the Blender subprocess AND its whole process group (it's launched in its
+        own session), so OptiX/denoiser/helper children die too — no orphans on Stop."""
         proc = self._proc
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
+        if proc is None or proc.poll() is not None:
+            return
+        import signal as _signal
+        try:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def terminate(self) -> None:
+        """Stop the render: set the cancel flag (the asset/frame loops bail at their next
+        check) and hard-kill the Blender subprocess group so nothing keeps running."""
+        self.cancel.set()
+        self._kill_proc()
 
     def _run_blender(self, scene_path, nframes: int) -> bool:
         """Launch the Blender render subprocess and stream progress. Returns True if it
@@ -844,12 +858,13 @@ class RenderWorker:
             [sys.executable, "-m", "cinemap.render.blender_script", str(scene_path)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            start_new_session=True,   # own process group -> terminate() can kill the whole tree
         )
         proc = self._proc
         done, oom = 0, False
         for line in proc.stdout:  # type: ignore
             if self.cancel.is_set():
-                proc.terminate()
+                self._kill_proc()
                 break
             low = line.lower()
             if ("out of memory" in low or "out of gpu memory" in low

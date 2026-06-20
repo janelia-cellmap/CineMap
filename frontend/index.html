@@ -462,8 +462,9 @@ async function importProject(e) {
     const p = await api('POST', '/api/projects/import', data);
     PID = p.id; await refreshProjects(); $('projectSel').value = PID;
     applyRenderPrefs(p); await loadNg(); renderKeyframes(p);
-    setStatus('imported: ' + (p.name || p.id) + ' — auto-rendering thumbnails…');
-    autoRenderThumbs();   // thumbnails were cleared on import; refill the timeline strip
+    // NOTE: don't auto-bake on import — it kicks off a long render the user didn't ask for
+    // (and is awkward to stop). They hit ⟳ Render all when ready.
+    setStatus('imported: ' + (p.name || p.id) + ' — hit ⟳ Render all to bake thumbnails/previews');
   } catch (err) { setStatus('import failed: ' + err.message); }
   e.target.value = '';
 }
@@ -486,8 +487,7 @@ async function importStates(e) {
     }
     let msg = `imported ${r.count} keyframe${r.count === 1 ? '' : 's'}`;
     if (r.errors && r.errors.length) { msg += ` (${r.errors.length} skipped)`; }
-    setStatus(msg + ' — auto-rendering thumbnails…');
-    autoRenderThumbs();   // fill the timeline at the bottom so you can watch them appear
+    setStatus(msg + ' — hit ⟳ Render all to bake thumbnails/previews');   // no auto-bake
   } catch (err) { setStatus('import states failed: ' + err.message); }
   e.target.value = '';
 }
@@ -883,15 +883,18 @@ async function refreshPreviews(kfIds) {
   if (sweepIds.length) setStatus(`refreshed thumbnails + ${sweepIds.length} sweep preview(s)`);
 }
 // bake one sweep's preview stills (slice / cutaway / EM-plane clip) and wait for it
+let SNAP_JOB = null;   // id of the in-flight sweep-snapshot render, so Stop can cancel it
 function bakeSweepSnapAwait(id) {
   return new Promise(async (resolve) => {
-    try { await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`); }
+    try { const r = await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`); SNAP_JOB = r.job_id || `snap_${id}`; }
     catch { return resolve(); }
     const poll = async () => {
+      if (!AUTO_THUMBS) { SNAP_JOB = null; return resolve(); }   // stopped
       let st; try { st = await api('GET', `/api/projects/${PID}/sweeps/${id}/snapshots/status`); }
-      catch { return resolve(); }
+      catch { SNAP_JOB = null; return resolve(); }
       if (st.status === 'running') { setTimeout(poll, 1500); return; }
       SNAP_VER[id] = Date.now(); SNAP_COUNT[id] = st.count || 3;   // bust the lane-thumb cache
+      SNAP_JOB = null;
       resolve();
     };
     setTimeout(poll, 1200);
@@ -923,7 +926,14 @@ async function autoRenderThumbs() {
   AUTO_THUMBS = false;
   $('autoThumbBtn').textContent = '⟳ Render all';
 }
-function toggleAutoThumbs() { if (AUTO_THUMBS) AUTO_THUMBS = false; else autoRenderThumbs(); }
+function toggleAutoThumbs() {
+  if (AUTO_THUMBS) {
+    AUTO_THUMBS = false;                 // stop the sweep
+    if (THUMB_JOB) api('POST', `/api/renders/${THUMB_JOB}/cancel`).catch(() => {});  // and the in-flight bake
+    if (SNAP_JOB) api('POST', `/api/renders/${SNAP_JOB}/cancel`).catch(() => {});    // ...incl a sweep snapshot
+    setStatus('stopping…');
+  } else autoRenderThumbs();
+}
 
 async function setMeshOpacity() {
   const id = ACTIVE_KF || LAST_KF_ID;
