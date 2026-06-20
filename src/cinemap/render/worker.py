@@ -97,7 +97,12 @@ class RenderWorker:
         # crop; meshes by marching-cubes voxel budget (per-segment / union).
         draft = bool(getattr(job.settings, "draft", False))
         self._draft = draft
-        self._em_target_px = 768 if draft else 1600
+        # EM slice resolution: how many voxels to pull across the on-screen region. The
+        # region already scales with the camera (zoom), and slice_loader.pick_level then
+        # picks the finest pyramid level giving ~this many voxels — so zoomed-in views get
+        # finer EM automatically, exactly like neuroglancer. Tie it to the OUTPUT width
+        # (~1.25 voxels/pixel) so higher-res exports pull sharper EM (no change at 1280).
+        self._em_target_px = 768 if draft else min(2560, max(1280, int(job.settings.width * 1.25)))
         self._mesh_voxels_single = 1_500_000 if draft else 8_000_000
         self._mesh_voxels_union = 3_000_000 if draft else 20_000_000
         # mesh sourcing: precomputed (LOD-adaptive) by default; opt in to watertight

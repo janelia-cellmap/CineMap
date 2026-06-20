@@ -434,15 +434,21 @@ def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, s
         fx, tx, a, b = _ng_coords_to_nm(base, project, axis, from_ng, to_ng)
         if fx and tx:
             normal = _unit([tx[i] - fx[i] for i in range(3)]); axis = _dominant_axis(normal)
-            # From/To set the cut DIRECTION; the sweep range fits the layer's extent along
-            # that normal (falls back to the literal point offsets if no mesh bounds).
-            rng = _layer_offset_range(project, base, bbox_layer, normal) if kind == "cutaway" else None
-            if rng:
-                from_nm, to_nm = rng
+            ai = {"x": 0, "y": 1, "z": 2}[axis]
+            # If the travel is along ONE axis, this is an axis-aligned slice — keep it
+            # axis-aligned (fast read_slice + correct sign) rather than an oblique resample.
+            if kind == "slice" and abs(normal[ai]) > 0.999:
+                from_nm, to_nm = fx[ai], tx[ai]    # literal coordinate (positive), axis read
             else:
-                from_nm = sum(normal[j] * fx[j] for j in range(3))
-                to_nm = sum(normal[j] * tx[j] for j in range(3))
-            oblique = True
+                # From/To set the cut DIRECTION; the sweep range fits the layer's extent
+                # along that normal (falls back to the literal point offsets if no bounds).
+                rng = _layer_offset_range(project, base, bbox_layer, normal) if kind == "cutaway" else None
+                if rng:
+                    from_nm, to_nm = rng
+                else:
+                    from_nm = sum(normal[j] * fx[j] for j in range(3))
+                    to_nm = sum(normal[j] * tx[j] for j in range(3))
+                oblique = True
         else:
             from_nm = a if a is not None else from_nm
             to_nm = b if b is not None else to_nm

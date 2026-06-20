@@ -222,6 +222,7 @@
     <b>✎ Propagate layer edit</b>
     <span onclick="$('propPanel').style.display='none'" style="cursor:pointer;opacity:.7">✕</span>
   </div>
+  <div class="msg" style="margin:2px 0 4px;color:#8a93a6">Set a layer property here (incl. CineMap-only <b>metallic / roughness</b>, which neuroglancer doesn't have) and push it to other keyframes. For things you changed <i>in neuroglancer</i>, use “Update current frame” instead — it detects them and offers to propagate.</div>
   <div class="msg" id="propKf" style="margin:2px 0 6px"></div>
   <label class="msg">Layer</label><select id="propLayer" onchange="propLayerChanged()" style="width:100%"></select>
   <label class="msg">Field</label>
@@ -231,6 +232,8 @@
     <option value="object_alpha">opacity (3d)</option>
     <option value="silhouette">silhouette (3d)</option>
     <option value="saturation">saturation</option>
+    <option value="metallic">metallic (reflective)</option>
+    <option value="roughness">roughness</option>
     <option value="color_seed">color seed</option>
     <option value="visible">visible</option>
   </select>
@@ -398,10 +401,10 @@
 
 <div id="ngPropPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #3a8f5a;border-radius:8px;padding:12px 14px;width:360px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.7">
   <div style="display:flex;justify-content:space-between;align-items:center">
-    <b>You changed settings in this keyframe</b>
+    <b>You changed settings in neuroglancer</b>
     <span onclick="$('ngPropPanel').style.display='none'" style="cursor:pointer;opacity:.7">✕</span>
   </div>
-  <div class="msg" style="margin:2px 0">Propagate to other keyframes? (replaces only where they currently match the old value)</div>
+  <div class="msg" style="margin:2px 0">These are edits captured from the neuroglancer view. Propagate to other keyframes? (replaces only where they currently match the old value.) For material (metallic/roughness), use ✎ Propagate edit.</div>
   <div id="ngChangeList" style="max-height:140px;overflow:auto;margin:6px 0;padding:6px;background:#0e1013;border-radius:6px"></div>
   <label class="msg">Apply to</label>
   <select id="ngPropDir" style="width:100%">
@@ -1451,11 +1454,12 @@ async function applyPropagate() {
 let NG_CHANGES = [], NG_PROP_KID = null;
 const FIELD_LABELS = { segment_color: 'segment color', default_color: 'default color',
   object_alpha: 'opacity (3d)', silhouette: 'silhouette (3d)', saturation: 'saturation',
-  color_seed: 'color seed', visible: 'visible', color: 'color' };
+  color_seed: 'color seed', visible: 'visible', color: 'color',
+  metallic: 'metallic', roughness: 'roughness' };
 function changeLabel(c) {
   let s = `${c.mesh_name} • ${FIELD_LABELS[c.field] || c.field}`;
   if (c.field === 'segment_color') s += ` (seg ${c.segment_id})`;
-  if (['object_alpha', 'silhouette', 'saturation', 'color_seed', 'visible'].includes(c.field))
+  if (['object_alpha', 'silhouette', 'saturation', 'color_seed', 'visible', 'metallic', 'roughness'].includes(c.field))
     s += `: ${c.old} → ${c.new}`;
   return s;
 }
