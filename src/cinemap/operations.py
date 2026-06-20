@@ -180,7 +180,7 @@ def update_keyframe(project: Project, keyframe_id: str, **fields) -> Keyframe:
 # segment_colors is handled specially (per-segment override keyed by segment id).
 _PROPAGATABLE_FIELDS = {
     "color", "color_seed", "default_color", "object_alpha", "silhouette",
-    "visible", "saturation", "render_3d",
+    "visible", "saturation", "render_3d", "metallic", "roughness",
 }
 
 

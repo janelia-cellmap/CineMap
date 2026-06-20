@@ -27,6 +27,17 @@ def _ease(t: float, mode: str) -> float:
     return t                                    # linear (constant velocity)
 
 
+def _mat_lerp(av, bv, t: float, default: float):
+    """Interpolate a per-keyframe material knob (metallic/roughness). Returns None when
+    NEITHER keyframe sets it (so the render leaves the global look/director base intact);
+    otherwise treats an unset side as `default` and lerps — a clean ramp into reflective."""
+    if av is None and bv is None:
+        return None
+    a = default if av is None else av
+    b = default if bv is None else bv
+    return a * (1 - t) + b * t
+
+
 def _cam_basis(cam):
     """(center, world<-view Rotation, eye->center distance) for a Camera. The
     rotation R maps view axes to world: forward = R@[0,0,-1], up = R@[0,1,0], the
@@ -83,6 +94,8 @@ class FrameMesh:
     object_alpha: float = 1.0   # NG "Opacity (3d)"
     silhouette: float = 0.0     # NG "Silhouette (3d)"
     clip: dict | None = None    # cutaway plane {axis, position_nm, side} or None
+    metallic: float | None = None    # per-frame material override (None = leave look base)
+    roughness: float | None = None
 
 
 @dataclass
@@ -169,15 +182,22 @@ def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
             oa = ma.object_alpha * (1 - t) + mb.object_alpha * t       # Opacity (3d) lerps
             si = ma.silhouette * (1 - t) + mb.silhouette * t           # Silhouette (3d) lerps
             clip = _lerp_clip(ma.clip, mb.clip, t)                     # cutaway scrolls
+            # material lerps too -> a layer can turn reflective over a transition. Only
+            # emitted when a keyframe actually sets it, else None (leave the look base).
+            mtl = _mat_lerp(getattr(ma, "metallic", None), getattr(mb, "metallic", None), t, 0.0)
+            rgh = _mat_lerp(getattr(ma, "roughness", None), getattr(mb, "roughness", None), t, 0.5)
             fs.meshes.append(FrameMesh(name, ids, mb.color, op, mb.render_3d,
-                                       object_alpha=oa, silhouette=si, clip=clip, **cc))
+                                       object_alpha=oa, silhouette=si, clip=clip,
+                                       metallic=mtl, roughness=rgh, **cc))
         else:
             m = ma or mb
             base = (m.opacity if m.visible else 0.0)
             op = base * (1 - t) if ma else base * t   # ma-only fades out; mb-only fades in
             fs.meshes.append(FrameMesh(name, ids, m.color, op, m.render_3d,
                                        object_alpha=m.object_alpha, silhouette=m.silhouette,
-                                       clip=_clip_dict(m.clip), **cc))
+                                       clip=_clip_dict(m.clip),
+                                       metallic=getattr(m, "metallic", None),
+                                       roughness=getattr(m, "roughness", None), **cc))
     # annotations matched by layer name; geometry is identical frame-to-frame, so
     # only opacity fades (appearing/disappearing layers fade in/out).
     a_an = {an.name: an for an in a.annotations}

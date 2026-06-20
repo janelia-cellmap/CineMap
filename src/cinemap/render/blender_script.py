@@ -346,6 +346,17 @@ def _import_meshes(scene_spec: dict) -> dict:
         _set_in(bsdf, "Roughness", prof.get("roughness", 0.35))
         _set_in(bsdf, "Specular IOR Level", prof.get("specular", 0.5))
         _set_in(bsdf, "Metallic", prof.get("metallic", 0.0))
+        # per-frame material override: value nodes drive Metallic/Roughness so a layer can
+        # turn reflective over the movie (set per frame in _set_mesh_state; default = the
+        # look/director base, so meshes that never set it look exactly as before).
+        base_metal = float(prof.get("metallic", 0.0)); base_rough = float(prof.get("roughness", 0.35))
+        metal_v = nt.nodes.new("ShaderNodeValue"); metal_v.name = "cm_metal"; metal_v.outputs[0].default_value = base_metal
+        rough_v = nt.nodes.new("ShaderNodeValue"); rough_v.name = "cm_rough"; rough_v.outputs[0].default_value = base_rough
+        if "Metallic" in bsdf.inputs:
+            nt.links.new(metal_v.outputs[0], bsdf.inputs["Metallic"])
+        if "Roughness" in bsdf.inputs:
+            nt.links.new(rough_v.outputs[0], bsdf.inputs["Roughness"])
+        _mat_base[obj.name] = (base_metal, base_rough)
         _set_in(bsdf, "Transmission Weight", prof.get("transmission", 0.0))
         _set_in(bsdf, "Subsurface Weight", prof.get("subsurface", 0.0))
         _set_in(bsdf, "Sheen Weight", prof.get("sheen", 0.0))
@@ -542,6 +553,7 @@ def _import_meshes(scene_spec: dict) -> dict:
 
 _orig_mesh: dict = {}      # obj.name -> pristine (unclipped) mesh datablock
 _clip_state: dict = {}     # obj.name -> last applied clip signature (skip redundant rebuilds)
+_mat_base: dict = {}       # obj.name -> (base_metallic, base_roughness) for per-frame override
 
 
 def _geometric_clip(obj, clip) -> None:
@@ -634,6 +646,15 @@ def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> N
             ev.outputs[0].default_value = base_emit + ov.get("emphasis", 0.0)
         if av is None and "Alpha" in nt.nodes["Principled BSDF"].inputs:
             nt.nodes["Principled BSDF"].inputs["Alpha"].default_value = opacity
+        # per-frame material: override metallic/roughness when this frame sets them, else
+        # fall back to the layer's base (the global look / director value).
+        mv, rv = nt.nodes.get("cm_metal"), nt.nodes.get("cm_rough")
+        if mv is not None:
+            bm, br = _mat_base.get(obj.name, (0.0, 0.35))
+            m_ov, r_ov = ov.get("metallic"), ov.get("roughness")
+            mv.outputs[0].default_value = bm if m_ov is None else float(m_ov)
+            if rv is not None:
+                rv.outputs[0].default_value = br if r_ov is None else float(r_ov)
         _apply_clip(nt, ov.get("clip"))
 
 

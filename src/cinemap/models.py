@@ -96,6 +96,11 @@ class MeshInstance(BaseModel):
     object_alpha: float = 1.0   # NG "Opacity (3d)"  (objectAlpha)
     silhouette: float = 0.0     # NG "Silhouette (3d)" (meshSilhouetteRendering)
     clip: Optional[ClipPlane] = None   # cutaway plane (render-only; per layer)
+    # per-keyframe material override (render-only) so the look can CHANGE over the movie
+    # (e.g. turn reflective at the end). None = use the global look / director default;
+    # set on a keyframe and it interpolates into it like opacity/silhouette do.
+    metallic: Optional[float] = None     # 0 = matte, 1 = fully reflective/metal
+    roughness: Optional[float] = None     # 0 = mirror-sharp, 1 = fully diffuse
 
 
 class AnnotationInstance(BaseModel):

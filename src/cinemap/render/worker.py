@@ -703,6 +703,10 @@ class RenderWorker:
                         "visible": eff > 0.001,
                         "silhouette": getattr(m, "silhouette", 0.0),
                     }
+                    if getattr(m, "metallic", None) is not None:    # per-frame material override
+                        ov["metallic"] = m.metallic
+                    if getattr(m, "roughness", None) is not None:
+                        ov["roughness"] = m.roughness
                     if is_hero and emph_glow > 0.0:
                         ov["emphasis"] = emph_glow       # brief emission glow on the hero
                     # a sweep (independent timeline) overrides the keyframe's own clip
