@@ -130,6 +130,10 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
         if (link and name in by_name and ldict.get("visible", True) is not False
                 and not vis.get(name) and vis.get(link)):
             vis[name] = list(vis[link])
+    # CineMap-only material (metallic/roughness) isn't in the neuroglancer state, so a
+    # freshly-baked keyframe would lose it. Inherit it per-layer from the previous keyframe
+    # so "set reflective, then add a keyframe" carries the look forward (incl. after import).
+    prev_by_name = {m.mesh_name: m for m in (prev or [])}
     meshes: list[MeshInstance] = []
     for name, ids in vis.items():
         lc = lcolors.get(name)
@@ -140,6 +144,12 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
                           saturation=lc.saturation)
         if name in layers:
             fields.update(_colors.render3d_from_layer(layers[name]))  # Opacity/Silhouette (3d)
+        pm = prev_by_name.get(name)
+        if pm is not None:
+            if getattr(pm, "metallic", None) is not None:
+                fields["metallic"] = pm.metallic
+            if getattr(pm, "roughness", None) is not None:
+                fields["roughness"] = pm.roughness
         meshes.append(MeshInstance(mesh_name=name, **fields))
     return meshes
 
@@ -160,7 +170,8 @@ def _scene_from_view(project: Project, st: dict | None = None):
     show_slice = layer_vis.get(em_name, True) and st.get("layout") != "3d"
     slices = ([SlicePlane(em_name=em_name, axis="z", position_nm=cam.look_at_nm[2])]
               if show_slice else [])
-    meshes = _meshes_from_visible(project, st=st)
+    prev = project.keyframes[-1].meshes if project.keyframes else None
+    meshes = _meshes_from_visible(project, prev=prev, st=st)   # inherit material from last kf
     annotations = _annotations_from_view(project, st)
     return cam, slices, meshes, annotations, st
 
