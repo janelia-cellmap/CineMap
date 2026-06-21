@@ -146,6 +146,11 @@
       <label title="Frames per second of the output video (motion smoothness). Total frames rendered = total duration (sum of keyframe durations) × fps.">fps</label><input id="fps" value="30" />
       <label title="Cycles render samples per pixel: higher = less grain/noise but slower to render. ~16–32 for previews, 48+ for final.">samples</label><input id="samples" value="48" />
       <label class="chk" title="Fast mode: 32 samples + aggressive adaptive sampling (noise threshold 0.06) and let the AI denoiser (OpenImageDenoise) clean the rest. ~2x faster frames at near-identical quality. Overrides the samples box."><input id="fastSample" type="checkbox" checked /> ⚡ fast</label>
+      <label title="Render engine. Cycles = photoreal path tracing (true transparency/AO/soft shadows) but slow — seconds–minutes per frame. Eevee = real-time rasterizer, ~10–50× faster per frame; shadows/transparency are approximate. Use Eevee for fast previews and movie drafts, Cycles for finals.">engine
+        <select id="engine">
+          <option value="CYCLES" selected>Cycles (photoreal)</option>
+          <option value="BLENDER_EEVEE_NEXT">Eevee (⚡ fast)</option>
+        </select></label>
       <label title="Mesh quality = the per-layer vertex budget. Higher = crisper but more GPU memory (auto-retries lower if it runs out).">quality
         <select id="detail">
           <option value="1" selected>basic (~5M/layer)</option>
@@ -1215,6 +1220,7 @@ async function startRender(mode) {
   const body = { width:+$('w').value, height:+$('h').value, fps,
                  samples: fast ? 32 : (+$('samples').value || 48),
                  noise_threshold: fast ? 0.06 : 0.01,
+                 engine: $('engine').value,
                  draft: mode === 'preview', mesh_detail: +$('detail').value || 1,
                  auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
                  show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),

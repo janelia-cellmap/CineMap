@@ -27,7 +27,22 @@ def _clear() -> None:
 def _setup_render(scene_spec: dict) -> None:
     scene = bpy.context.scene
     r = scene_spec["render"]
-    scene.render.engine = r.get("engine", "CYCLES")
+    # Resolve the requested engine to an id this Blender build actually exposes. Eevee was
+    # renamed across versions: "BLENDER_EEVEE" (≤4.1 and again in ≥4.4/5.0) vs
+    # "BLENDER_EEVEE_NEXT" (only 4.2–4.3). Assigning an id not in the enum raises and the
+    # whole render dies, so pick whichever Eevee this build has and fall back to Cycles.
+    req_engine = r.get("engine", "CYCLES")
+    valid = {i.identifier for i in
+             bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items}
+    if req_engine not in valid:
+        if req_engine.startswith("BLENDER_EEVEE"):
+            req_engine = ("BLENDER_EEVEE_NEXT" if "BLENDER_EEVEE_NEXT" in valid
+                          else "BLENDER_EEVEE")
+        else:
+            req_engine = "CYCLES"
+        print(f"[blender] engine '{r.get('engine')}' -> '{req_engine}' (not in this build)",
+              flush=True)
+    scene.render.engine = req_engine
     if scene.render.engine == "CYCLES":
         try:
             prefs = bpy.context.preferences.addons["cycles"].preferences
@@ -64,6 +79,18 @@ def _setup_render(scene_spec: dict) -> None:
                   f"denoiser={scene.cycles.denoiser}", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[blender] denoise/adaptive unavailable: {e}")
+    elif scene.render.engine.startswith("BLENDER_EEVEE"):
+        # Eevee = rasterizer (no path tracing) -> ~10-50x faster per frame. `samples`
+        # here is TAA samples (anti-alias accumulation), NOT light bounces. The look is
+        # approximate (screen-space shadows/AO, no true transmission) but ideal for fast
+        # previews and movie drafts where Cycles' per-frame cost dominates. The shared
+        # material edge-glow / emission / compositor bloom still apply (engine-agnostic).
+        try:
+            scene.eevee.taa_render_samples = int(r.get("samples", 64))
+            print(f"[blender] engine=EEVEE taa_render_samples={scene.eevee.taa_render_samples}",
+                  flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[blender] eevee config: {e}", flush=True)
     scene.render.resolution_x = r["width"]
     scene.render.resolution_y = r["height"]
     scene.render.image_settings.file_format = "PNG"
@@ -308,35 +335,85 @@ def _apply_clip(nt, clip, f=None) -> None:
                 n.outputs[0].keyframe_insert("default_value", frame=f)
 
 
+def _load_npz_mesh(path: str, name: str):
+    """Fast direct-to-bpy mesh loader: read a `.npz` of verts/faces/colors and
+    populate a `bpy.types.Mesh` via `foreach_set` (vectorized). Avoids
+    `bpy.ops.wm.ply_import`, the undo stack, and operator selection state — the
+    dominant cost of cold-starting a render with many large meshes."""
+    import numpy as np
+
+    arrs = np.load(path)
+    v = np.ascontiguousarray(arrs["v"], dtype=np.float32)
+    f = np.ascontiguousarray(arrs["f"], dtype=np.int32)
+    Nv, Nf = int(len(v)), int(len(f))
+    mesh = bpy.data.meshes.new(name)
+    mesh.vertices.add(Nv)
+    mesh.vertices.foreach_set("co", v.ravel())
+    mesh.loops.add(Nf * 3)
+    mesh.loops.foreach_set("vertex_index", f.ravel())
+    mesh.polygons.add(Nf)
+    mesh.polygons.foreach_set("loop_start",
+                              (np.arange(Nf, dtype=np.int32) * 3))
+    mesh.polygons.foreach_set("loop_total", np.full(Nf, 3, dtype=np.int32))
+    if "c" in arrs.files:                 # per-vertex (per-segment) colors
+        c = np.ascontiguousarray(arrs["c"], dtype=np.uint8)
+        if c.ndim == 2 and c.shape[1] == 3:    # add opaque alpha
+            c = np.concatenate([c, np.full((len(c), 1), 255, dtype=np.uint8)], axis=1)
+        cf = (c.astype(np.float32) / 255.0).ravel()
+        ca = mesh.color_attributes.new(name="Col", type="FLOAT_COLOR", domain="POINT")
+        ca.data.foreach_set("color", cf)
+    # calc_edges builds the edge layer from the loops (needed downstream for the
+    # cutaway bisect/weld). We deliberately SKIP mesh.validate(): it's a full
+    # single-threaded pass over every face, and on multi-million-face meshes it was
+    # the dominant cold-load cost — minutes per mesh. The verts/faces come straight
+    # from our own decode pipeline (already well-formed), so there's nothing to fix.
+    mesh.update(calc_edges=True)
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.collection.objects.link(obj)
+    return obj
+
+
 def _import_meshes(scene_spec: dict) -> dict:
     """Import each mesh once; return name -> (object, material).
 
-    PLY assets may carry per-vertex colors (distinct color per segment); if so the
-    material drives Base Color from the color attribute. Otherwise a solid color.
+    `.npz` assets (verts + faces + optional per-vertex colors) load via the fast
+    direct path; `.ply`/`.obj` legacy assets fall back to Blender's import operators.
+    Per-vertex colors (distinct color per segment) drive Base Color from the color
+    attribute; otherwise a solid color.
     """
+    import numpy as np
+
     out = {}
+    flat_shading = scene_spec.get("direction", {}).get("material", {}).get("flat_shading", True)
     for m in scene_spec["meshes"]:
         path = m["obj_path"]
-        before = set(bpy.data.objects)
-        if path.lower().endswith(".ply"):
-            bpy.ops.wm.ply_import(filepath=path)
+        if path.lower().endswith(".npz"):
+            obj = _load_npz_mesh(path, m["id"])
         else:
-            bpy.ops.wm.obj_import(filepath=path)
-        new = [o for o in bpy.data.objects if o not in before]
-        if not new:
-            continue
-        obj = new[0]
-        if len(new) > 1:
-            with bpy.context.temp_override(active_object=obj, selected_editable_objects=new):
-                bpy.ops.object.join()
+            # legacy fallback for any pre-existing .ply / .obj cached assets
+            before = set(bpy.data.objects)
+            if path.lower().endswith(".ply"):
+                bpy.ops.wm.ply_import(filepath=path)
+            else:
+                bpy.ops.wm.obj_import(filepath=path)
+            new = [o for o in bpy.data.objects if o not in before]
+            if not new:
+                continue
+            obj = new[0]
+            if len(new) > 1:
+                with bpy.context.temp_override(active_object=obj, selected_editable_objects=new):
+                    bpy.ops.object.join()
+            obj.name = m["id"]
         bpy.context.view_layer.objects.active = obj
-        obj.name = m["id"]   # stable name so a warm-cached .blend can recover this object
         # flat (per-face) shading by default — each face shades dark/light on its own,
         # giving the crisp faceted definition neuroglancer has; smooth blurs it to blobs.
-        if scene_spec.get("direction", {}).get("material", {}).get("flat_shading", True):
-            bpy.ops.object.shade_flat()
-        else:
-            bpy.ops.object.shade_smooth()
+        # Direct attribute write (no operator) — `bpy.ops.object.shade_flat()` goes
+        # through selection/undo and is slow per-mesh.
+        Np = len(obj.data.polygons)
+        if Np:
+            smooth = np.zeros(Np, dtype=bool) if flat_shading else np.ones(Np, dtype=bool)
+            obj.data.polygons.foreach_set("use_smooth", smooth)
+            obj.data.update()
         s = 1.0 / scene_spec["world"]["nm_per_bu"]  # nm -> BU
         obj.scale = (s, s, s)
 
@@ -544,8 +621,13 @@ def _import_meshes(scene_spec: dict) -> dict:
             # Then close any tiny leftover artifact holes (a few stray boundary edges) so
             # the cross-section is fully watertight and caps solid even where pieces nearly
             # meet. Genuine large openings have many edges and are left alone.
+            # Pass ONLY boundary edges (the open seams) — not bmw.edges[:]. holes_fill
+            # over the full edge set forced a scan of all ~9M edges on the big meshes and
+            # was a multi-minute single-threaded stall; boundary edges are a tiny subset.
             try:
-                bmesh.ops.holes_fill(bmw, edges=bmw.edges[:], sides=8)
+                boundary = [e for e in bmw.edges if e.is_boundary]
+                if boundary:
+                    bmesh.ops.holes_fill(bmw, edges=boundary, sides=8)
             except Exception:  # noqa: BLE001
                 pass
             bmw.to_mesh(orig); bmw.free()

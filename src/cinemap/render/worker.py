@@ -33,6 +33,27 @@ def _bu(p, nm_per_bu):
     return [c / nm_per_bu for c in p]
 
 
+def _export_mesh_npz(mesh, out: Path) -> None:
+    """Write a trimesh-like object as a compact `.npz` (vertices float32, faces
+    int32, optional uint8 vertex colors). Blender loads this ~5–10× faster than
+    going through `bpy.ops.wm.ply_import` (which routes through the operator
+    system + undo stack)."""
+    import numpy as np
+
+    v = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
+    f = np.ascontiguousarray(mesh.faces, dtype=np.int32)
+    arrs: dict = {"v": v, "f": f}
+    vc = None
+    try:
+        vc = mesh.visual.vertex_colors      # Nx4 uint8 (trimesh)
+    except Exception:  # noqa: BLE001
+        vc = None
+    if vc is not None and len(vc) == len(v):
+        arrs["c"] = np.ascontiguousarray(vc, dtype=np.uint8)
+    # raw save (no compression) — load speed in Blender matters more than disk
+    np.savez(str(out), **arrs)
+
+
 def _ease(t: float, mode: str) -> float:
     if mode == "ease-in-out":
         return t * t * (3 - 2 * t)
@@ -200,7 +221,7 @@ class RenderWorker:
                     continue
                 rgb[lab == u] = (np.array(lc.rgb(iu)) * 255 if lc else np.array([230.0, 180.0, 90.0]))
             path = self.assets_dir / f"slice_{sl.axis}_{abs(hash(key)) % 10**8}.png"
-            Image.fromarray(rgb.clip(0, 255).astype(np.uint8)).save(path)
+            self._atomic_save(Image.fromarray(rgb.clip(0, 255).astype(np.uint8)), path)
             out = {"image_path": str(path), "origin_bu": _bu(res.origin_nm, self.nm_per_bu),
                    "u_bu": _bu(res.u_nm, self.nm_per_bu), "v_bu": _bu(res.v_nm, self.nm_per_bu)}
             self._slice_cache[key] = out
@@ -230,7 +251,7 @@ class RenderWorker:
             rgb = np.where(m, rgb * (1 - a) + color * 255 * a, rgb)
 
         path = self.assets_dir / f"slice_{sl.axis}_{abs(hash(key)) % 10**8}.png"
-        Image.fromarray(rgb.clip(0, 255).astype(np.uint8)).save(path)
+        self._atomic_save(Image.fromarray(rgb.clip(0, 255).astype(np.uint8)), path)
         out = {
             "image_path": str(path),
             "origin_bu": _bu(res.origin_nm, self.nm_per_bu),
@@ -326,6 +347,54 @@ class RenderWorker:
             saturation=getattr(m, "saturation", 1.0),
         )
 
+    # --- slice-read derivation (shared by the parallel warm pass and the build loop, so
+    # the two can never drift) -------------------------------------------------------
+    def _frame_region(self, fr):
+        """EM crop around the camera target, sized to what's on screen this frame."""
+        dist = math.dist(fr.position_nm, fr.look_at_nm)
+        half = max(500.0, dist * math.tan(math.radians(fr.fov_deg) / 2) * 1.25)
+        return (tuple(fr.look_at_nm), half)
+
+    def _frame_seg_overlays(self, fr):
+        """Segmentation layers in this frame to overlay on the EM slice."""
+        out = []
+        for m in fr.meshes:
+            src = next((s for s in self.manifest.meshes if s.name == m.mesh_name), None)
+            if src and src.label_zarr and m.segment_ids:
+                out.append((src.label_zarr, m.segment_ids, self._frame_colors(m)))
+        return out
+
+    def _frame_slice_reads(self, fr, t_global):
+        """Visible slices in this frame as (FrameSlice, slice_seg) — keyframe slices plus
+        any 'slice' sweeps on the global timeline. slice_seg=(ids, colors) when the slice
+        points at a SEGMENTATION layer (so it renders colored labels), else None."""
+        out = []
+        for sl in list(fr.slices) + self._slices_from_sweeps(t_global):
+            if sl.opacity <= 0.001:
+                continue
+            _, is_label = self._vol_for(sl.em_name)
+            slice_seg = None
+            if is_label:
+                sm = next((mm for mm in fr.meshes
+                           if mm.mesh_name == sl.em_name and mm.segment_ids), None)
+                if sm:
+                    slice_seg = (list(sm.segment_ids), self._frame_colors(sm))
+            out.append((sl, slice_seg))
+        return out
+
+    def _t_global(self, fi, frame_times, index_offset):
+        return (frame_times[fi] if frame_times
+                else (index_offset + fi) / max(1, self.job.settings.fps))
+
+    @staticmethod
+    def _atomic_save(img, path) -> None:
+        """Save a PNG so parallel writers of the SAME path can't leave/observe a partial
+        file: write a per-thread temp, then atomically rename into place (last wins).
+        Identical-key slices (e.g. a camera hold fetched concurrently) hit the same path."""
+        tmp = f"{path}.{threading.get_ident()}.tmp"
+        img.save(tmp)
+        os.replace(tmp, path)
+
     def _mesh_obj(self, mesh_name, segment_ids, lc, nmpp=None) -> str | None:
         src = next((m for m in self.manifest.meshes if m.name == mesh_name), None)
         if not src:
@@ -334,7 +403,11 @@ class RenderWorker:
         if not ids:
             return None
         uid = self._mesh_uid(mesh_name, ids, lc.cache_key(), nmpp)
-        out = self.assets_dir / f"mesh_{uid}.ply"  # PLY keeps vertex colors
+        # `.npz` (verts + faces + optional vertex colors) instead of `.ply`: Blender's
+        # `bpy.ops.wm.ply_import` routes through the operator/undo system and is the
+        # dominant cost of cold-starting a render; a numpy → `foreach_set` load is
+        # ~5–10× faster on big meshes.
+        out = self.assets_dir / f"mesh_{uid}.npz"
         if out.exists():
             return str(out)
         try:
@@ -356,7 +429,7 @@ class RenderWorker:
             print(f"[worker] mesh {mesh_name} ({len(ids)} segs) failed: {e}")
             return None
         os.makedirs(out.parent, exist_ok=True)
-        combined.export(str(out))
+        _export_mesh_npz(combined, out)
         return str(out)
 
     @staticmethod
@@ -470,7 +543,7 @@ class RenderWorker:
         from ..data.annotations import annotations_to_mesh
 
         uid = self._ann_uid(an)
-        out = self.assets_dir / f"{uid}.ply"
+        out = self.assets_dir / f"{uid}.npz"
         if out.exists():
             return str(out)
         prims = {"points": an.points, "lines": an.lines, "boxes": an.boxes,
@@ -479,7 +552,7 @@ class RenderWorker:
         if mesh is None:
             return None
         os.makedirs(out.parent, exist_ok=True)
-        mesh.export(str(out))
+        _export_mesh_npz(mesh, out)
         return str(out)
 
     # rough draco bytes per vertex, only used to turn the layer vertex budget into a
@@ -570,9 +643,9 @@ class RenderWorker:
                         per.pop(m.mesh_name, None)
                         continue
                     combined = trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
-                    out = self.assets_dir / f"mesh_{uid}.ply"
+                    out = self.assets_dir / f"mesh_{uid}.npz"
                     os.makedirs(out.parent, exist_ok=True)
-                    combined.export(str(out))
+                    _export_mesh_npz(combined, out)
                     mesh_specs[uid] = {"id": uid, "obj_path": str(out), "color": m.color}
             frame_layer_uid.append(per)
             self._progress(0.1 + 0.35 * (fi + 1) / len(frames),
@@ -659,43 +732,59 @@ class RenderWorker:
             from . import director
             emph_track = director.emphasis_track(getattr(self, "_kfs", self.project.keyframes),
                                                  self.job.settings.fps)
+        # Warm the slice-image cache in PARALLEL before the (serial) build loop. Slice
+        # reads are network-bound (zarr chunks over HTTP) and frames sweep through heavily
+        # overlapping regions, so fetching them one-at-a-time was the dominant pre-render
+        # cost (~50s per cold slice, ~40min total on big shots). Fan the reads out across
+        # threads (tensorstore releases the GIL during IO); the shared cache pool in
+        # slice_loader dedups the overlapping chunks. _slice_png memoizes into
+        # self._slice_cache, so the build loop below becomes pure-CPU cache hits.
+        from concurrent.futures import ThreadPoolExecutor
+        from ..data.mesh_loader import _FETCH_WORKERS
+        warm_jobs = []
+        for fi, fr in enumerate(frames):
+            region = self._frame_region(fr)
+            seg_overlays = self._frame_seg_overlays(fr)
+            for sl, slice_seg in self._frame_slice_reads(fr, self._t_global(fi, frame_times, index_offset)):
+                warm_jobs.append((sl, region, seg_overlays, slice_seg))
+
+        def _warm(job):
+            sl, region, seg_overlays, slice_seg = job
+            try:
+                self._slice_png(sl, region, seg_overlays, slice_seg=slice_seg)
+            except Exception:  # noqa: BLE001 (failures re-surface in the build loop below)
+                pass
+
+        if warm_jobs and not self.cancel.is_set():
+            self._progress(0.45, f"fetching {len(warm_jobs)} slices…")
+            with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
+                done = 0
+                for _ in ex.map(_warm, warm_jobs):
+                    done += 1
+                    if done % 8 == 0:
+                        self._progress(0.45 + 0.10 * done / len(warm_jobs),
+                                       f"fetching slices {done}/{len(warm_jobs)}")
+
         frame_specs = []
         for fi, fr in enumerate(frames):
             if self.cancel.is_set():
                 raise RenderCancelled()
             emph_hero, emph_glow, emph_spot = (
                 emph_track[fi] if emph_track and fi < len(emph_track) else (None, 0.0, 1.0))
-            # region to crop EM around the camera target, sized to what's on screen
-            dist = math.dist(fr.position_nm, fr.look_at_nm)
-            half = max(500.0, dist * math.tan(math.radians(fr.fov_deg) / 2) * 1.25)
-            region = (tuple(fr.look_at_nm), half)
-            # segmentation layers in this frame -> overlaid on the EM slice.
-            # Decoupled from the 3D mesh opacity: the slice shows the cross-section
-            # even when the 3D meshes are faded/hidden (so they don't occlude it).
-            seg_overlays = []
-            for m in fr.meshes:
-                src = next((s for s in self.manifest.meshes if s.name == m.mesh_name), None)
-                if src and src.label_zarr and m.segment_ids:
-                    seg_overlays.append((src.label_zarr, m.segment_ids, self._frame_colors(m)))
+            region = self._frame_region(fr)
+            # segmentation layers in this frame -> overlaid on the EM slice. Decoupled from
+            # the 3D mesh opacity: the slice shows the cross-section even when the 3D meshes
+            # are faded/hidden (so they don't occlude it).
+            seg_overlays = self._frame_seg_overlays(fr)
             slices = []
             # keyframe slices PLUS any 'slice' sweeps evaluated on the global timeline
-            t_global = (frame_times[fi] if frame_times else (index_offset + fi) / max(1, self.job.settings.fps))
-            for sl in list(fr.slices) + self._slices_from_sweeps(t_global):
-                if sl.opacity <= 0.001:
-                    continue
+            t_global = self._t_global(fi, frame_times, index_offset)
+            for sl, slice_seg in self._frame_slice_reads(fr, t_global):
                 # slot is stable across frames (matches interpolate's slice identity)
                 # so the blend exporter can group a slice's per-frame images into one
                 # animated image-sequence plane. A slice that can't be read (e.g. a
                 # non-OME-Zarr EM source) is skipped, not fatal to the whole render.
-                # If the slice points at a SEGMENTATION layer, pass its (ids, colors) so
-                # _slice_png renders the labels colored (resolved from the frame's mesh).
-                _, is_label = self._vol_for(sl.em_name)
-                slice_seg = None
-                if is_label:
-                    sm = next((mm for mm in fr.meshes
-                               if mm.mesh_name == sl.em_name and mm.segment_ids), None)
-                    if sm:
-                        slice_seg = (list(sm.segment_ids), self._frame_colors(sm))
+                # _slice_png is already cached from the parallel warm pass above.
                 try:
                     png = self._slice_png(sl, region, seg_overlays, slice_seg=slice_seg)
                 except Exception as e:  # noqa: BLE001

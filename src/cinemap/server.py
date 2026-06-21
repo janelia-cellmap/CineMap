@@ -9,7 +9,7 @@ import asyncio
 import os
 import shutil
 import threading
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -46,16 +46,44 @@ if not os.environ.get("ANTHROPIC_API_KEY"):
 
 # in-memory render progress: job_id -> {progress, message, status, output}
 _render_state: dict[str, dict] = {}
-# live workers (so a render can be cancelled): job_id -> RenderWorker
-_workers: dict[str, RenderWorker] = {}
+# live workers (so a render can be cancelled): job_id -> RenderWorker (thumbnails)
+# OR _SubprocHandle (full video renders). Both expose .terminate().
+_workers: dict[str, Any] = {}
+
+
+class _SubprocHandle:
+    """Wraps the Popen of a `cinemap.render.run_job` subprocess so it presents the same
+    `.terminate()` + `.frames_dir` interface as an in-process RenderWorker.
+    terminate() sends SIGKILL to the entire process group — Blender + cloud-volume
+    mp pool + asset threads all die in one syscall, no orphans, no half-cancelled
+    tasks."""
+
+    def __init__(self, proc, frames_dir):
+        self.proc = proc
+        # Mirror RenderWorker.frames_dir so `latest_frame` works the same way for
+        # both handle types — no special case in the live-preview endpoint.
+        self.frames_dir = frames_dir
+
+    def terminate(self) -> None:
+        import signal as _signal
+        p = self.proc
+        if p is None or p.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(p.pid), _signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 @app.on_event("shutdown")
 def _shutdown_cleanup() -> None:
     """On a graceful stop (SIGTERM/Ctrl-C, e.g. a restart), tear down in-flight renders so
-    their Blender + mesh-decode subprocesses don't get orphaned (reparented to init) and
-    spin forever eating CPU. Cancels each worker (kills its Blender subprocess), then
-    SIGKILLs any remaining direct children (multiprocessing decode workers, etc.)."""
+    nothing they launched (Blender, cloud-volume mp pool, etc.) gets reparented to init
+    and keeps eating CPU. Subprocess renders terminate their whole group; thumbnail
+    threads cancel their Blender child. Then SIGKILL any leftover direct children."""
     import signal as _signal
     for w in list(_workers.values()):
         try:
@@ -139,6 +167,9 @@ class RenderReq(BaseModel):
     fps: int = 30
     samples: int = 48
     noise_threshold: float = 0.01   # adaptive-sampling bail threshold (higher = faster)
+    # render engine: CYCLES (path-traced, photoreal, slow) or BLENDER_EEVEE_NEXT
+    # (rasterized, ~10-50x faster per frame — ideal for fast previews / movie drafts).
+    engine: Literal["CYCLES", "BLENDER_EEVEE_NEXT"] = "CYCLES"
     kf_range: list[int] | None = None
     export_blend: bool = False  # produce a self-contained .blend instead of a video
     draft: bool = False         # fast low-res preview (coarse EM + low-voxel meshes)
@@ -247,8 +278,18 @@ def import_project(body: dict):
     store.save(p)
     try:
         scouting.load_dataset(p.data_path)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        print(f"[import] load_dataset failed: {e}", flush=True)
+    # Drive the viewer to the first keyframe right away — without this, an import
+    # leaves the iframe on whatever the dataset's default state is (often empty),
+    # which looks broken to the user. Same UX as clicking the first keyframe row.
+    # NOTE: deliberately NOT inside the try above — load_dataset failing shouldn't
+    # block goto, and goto failing shouldn't be swallowed silently.
+    if p.keyframes:
+        try:
+            scouting.goto_keyframe(p, p.keyframes[0].id)
+        except Exception as e:  # noqa: BLE001
+            print(f"[import] goto first keyframe failed: {e}", flush=True)
     return p.model_dump()
 
 
@@ -281,6 +322,13 @@ def _ng_url_for(request: Request) -> str:
 def open_project(pid: str, request: Request):
     p = store.load(pid)
     scouting.load_dataset(p.data_path)
+    # Drive the viewer to the first keyframe so opening a project shows something
+    # immediately — otherwise the iframe is blank/default until the user clicks a row.
+    if p.keyframes:
+        try:
+            scouting.goto_keyframe(p, p.keyframes[0].id)
+        except Exception:  # noqa: BLE001
+            pass
     return {"ng_url": _ng_url_for(request)}
 
 
@@ -323,7 +371,16 @@ def import_states_new_project(body: dict):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"could not analyze the first state: {e}") from e
     created, errors = scouting.import_states(project, links)
-    return {"project": _light_project(store.load(project.id)),
+    # `import_states` bakes each state by driving the viewer to it -> the viewer ends
+    # up sitting on the LAST state. Send it back to the FIRST keyframe so the user
+    # sees the start of their timeline, matching what /api/projects/import does.
+    final = store.load(project.id)
+    if final.keyframes:
+        try:
+            scouting.goto_keyframe(final, final.keyframes[0].id)
+        except Exception:  # noqa: BLE001
+            pass
+    return {"project": _light_project(final),
             "count": len(created), "errors": errors}
 
 
@@ -744,22 +801,24 @@ def get_sweep_snapshot(pid: str, sid: str, idx: int):
 
 
 # ----------------------------- render -----------------------------
-def _run_render(pid: str, job_id: str, worker: RenderWorker, thumbnail_for: str | None = None):
+def _run_thumbnail_render(pid: str, job_id: str, worker: RenderWorker, thumbnail_for: str):
+    """Thumbnail/preview path — in-process daemon thread. Sub-second jobs where the
+    subprocess fork overhead would dominate; full video renders go through
+    `_launch_render_subprocess` instead."""
     def cb(pr, msg):
         # keep status as "cancelling" once requested, until the worker bails out
         cur = _render_state.get(job_id, {}).get("status")
         status = "cancelling" if cur == "cancelling" else "running"
         _render_state[job_id] = {"progress": pr, "message": msg, "status": status}
 
-    # A full video render mutates the job (status/output) in project.renders, so it
-    # must be persisted. A thumbnail job is NOT in project.renders — it only ever
-    # touches the project if it sets a keyframe's thumbnail_path. Track that so we
-    # don't rewrite the whole project.json over NFS when nothing changed
-    # (cancelled/failed thumbnails, or thumbnails where the keyframe is gone).
-    dirty = thumbnail_for is None
+    # A thumbnail job is NOT in project.renders — it only ever touches the project if
+    # it sets a keyframe's thumbnail_path. Track that so we don't rewrite the whole
+    # project.json over NFS when nothing changed (cancelled/failed thumbnails, or
+    # thumbnails where the keyframe is gone).
+    dirty = False
     try:
         out = worker.run(progress=cb)
-        if thumbnail_for and out:  # keep a per-keyframe thumbnail and point the kf at it
+        if out:  # keep a per-keyframe thumbnail and point the kf at it
             from PIL import Image
 
             tdir = config.PROJECTS_DIR / pid / "thumbnails"
@@ -790,17 +849,109 @@ def _run_render(pid: str, job_id: str, worker: RenderWorker, thumbnail_for: str 
 
 
 def _start_render(pid: str, settings: RenderSettings, kf_range=None, thumbnail_for=None) -> str:
+    """Kick off a render. THUMBNAIL jobs (sub-second, frequent) run in-process on a
+    daemon thread — subprocess fork overhead would dominate. FULL VIDEO renders run
+    in their own process group via `cinemap.render.run_job`, so Stop can kill the
+    whole tree (Blender + cloud-volume mp pool + asset threads) in one syscall."""
     p = store.load(pid)
-    if thumbnail_for:  # don't clutter the render history with thumbnail jobs
-        job = RenderJob(id=ops.render_id(p, "thumb"), kf_range=kf_range, settings=settings)
-    else:
-        job = ops.create_render_job(p, settings, kf_range=kf_range)
-    worker = RenderWorker(p, job)
-    _workers[job.id] = worker
     _evict_finished_states()  # keep the in-memory job table from growing forever
+    if thumbnail_for:
+        job = RenderJob(id=ops.render_id(p, "thumb"), kf_range=kf_range, settings=settings)
+        worker = RenderWorker(p, job)
+        _workers[job.id] = worker
+        _render_state[job.id] = {"progress": 0.0, "message": "queued", "status": "pending"}
+        threading.Thread(target=_run_thumbnail_render,
+                         args=(pid, job.id, worker, thumbnail_for), daemon=True).start()
+        return job.id
+    # Full video: persist the job to project.renders first (so the subprocess can find
+    # it by id), then spawn run_job in its own session.
+    job = ops.create_render_job(p, settings, kf_range=kf_range)
     _render_state[job.id] = {"progress": 0.0, "message": "queued", "status": "pending"}
-    threading.Thread(target=_run_render, args=(pid, job.id, worker, thumbnail_for), daemon=True).start()
+    _launch_render_subprocess(pid, job.id)
     return job.id
+
+
+def _launch_render_subprocess(pid: str, job_id: str) -> None:
+    """Spawn `python -m cinemap.render.run_job <pid> <job_id>` in its own session,
+    register a `_SubprocHandle` (so cancel can SIGKILL the whole group), and start a
+    reader thread that translates the subprocess's JSON-line progress into the
+    in-memory render state."""
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "cinemap.render.run_job", pid, job_id],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        start_new_session=True,   # own process group -> SIGKILL takes everything down
+    )
+    # frames_dir must mirror RenderWorker's construction (worker.py:100-101).
+    frames_dir = config.PROJECTS_DIR / pid / "renders" / job_id / "frames"
+    _workers[job_id] = _SubprocHandle(proc, frames_dir)
+    threading.Thread(target=_drain_render_subprocess,
+                     args=(pid, job_id, proc), daemon=True).start()
+
+
+def _drain_render_subprocess(pid: str, job_id: str, proc) -> None:
+    """Read JSON-line progress from the render subprocess and mirror onto `_render_state`.
+    On `final` line OR EOF, finalize the state and unregister the handle. stderr is
+    drained on a sibling thread so a chatty subprocess can't deadlock on a full pipe."""
+    import json as _json
+
+    def _drain_stderr():
+        for line in proc.stderr:  # type: ignore
+            print(f"[run_job {job_id}] {line.rstrip()}", flush=True)
+
+    threading.Thread(target=_drain_stderr, daemon=True).start()
+
+    final: dict | None = None
+    try:
+        for line in proc.stdout:  # type: ignore
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = _json.loads(line)
+            except _json.JSONDecodeError:
+                # any non-JSON output from the subprocess goes to the server log
+                print(f"[run_job {job_id}] {line}", flush=True)
+                continue
+            if "final" in obj:
+                final = obj
+                break
+            if "p" in obj or "m" in obj:
+                # cancel requests flip status to 'cancelling' — keep that label until
+                # the subprocess actually exits, then we overwrite below.
+                cur = _render_state.get(job_id, {}).get("status")
+                status = "cancelling" if cur == "cancelling" else "running"
+                _render_state[job_id] = {"progress": float(obj.get("p", 0.0)),
+                                         "message": str(obj.get("m", "")),
+                                         "status": status}
+    finally:
+        proc.wait()
+        # Cancel/normal exit: translate the final marker (or exit code) into a status.
+        if final and final.get("final") == "done":
+            _render_state[job_id] = {"progress": 1.0, "message": "done",
+                                     "status": "done", "output": final.get("output")}
+        elif final and final.get("final") == "cancelled":
+            _render_state[job_id] = {"progress": 0.0, "message": "cancelled",
+                                     "status": "cancelled"}
+        elif final and final.get("final") == "error":
+            _render_state[job_id] = {"progress": 0.0,
+                                     "message": str(final.get("message", "render failed")),
+                                     "status": "error"}
+        else:
+            # process died without emitting a final marker (e.g. SIGKILL'd) — infer
+            # from the status that was set when cancel was requested, else error.
+            cur = _render_state.get(job_id, {}).get("status")
+            if cur == "cancelling" or proc.returncode in (-9, 143):  # SIGKILL / SIGTERM
+                _render_state[job_id] = {"progress": 0.0, "message": "cancelled",
+                                         "status": "cancelled"}
+            else:
+                _render_state[job_id] = {"progress": 0.0,
+                                         "message": f"render exited {proc.returncode}",
+                                         "status": "error"}
+        _workers.pop(job_id, None)
 
 
 def _evict_finished_states(keep: int = 200) -> None:
@@ -818,6 +969,7 @@ def _evict_finished_states(keep: int = 200) -> None:
 def render(pid: str, req: RenderReq):
     settings = RenderSettings(width=req.width, height=req.height, fps=req.fps,
                               samples=req.samples, noise_threshold=req.noise_threshold,
+                              engine=req.engine,
                               export_blend=req.export_blend, draft=req.draft,
                               mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels,
                               auto_direct=req.auto_direct, lod_mode=req.lod_mode,
