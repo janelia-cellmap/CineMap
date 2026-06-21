@@ -20,6 +20,18 @@ import tensorstore as ts
 # OME-Zarr axes are z,y,x; cinemap world coords are x,y,z (nm).
 _AXIS_TO_ZYX = {"z": 0, "y": 1, "x": 2}
 
+# Shared tensorstore context across ALL opened levels/volumes. The default context
+# gives each open its own cache pool with total_bytes_limit=0 (no caching), so every
+# slice re-fetched + re-decompressed its chunks over HTTP from scratch — and a render's
+# slices sweep through heavily OVERLAPPING regions, so the same chunks were paid for
+# dozens of times (cold slices were ~50s each). One shared pool with a real byte limit
+# lets overlapping reads hit cache, and the bumped concurrency fans out the cold chunk
+# fetches instead of serializing them. Sharing is safe: volume data is immutable.
+_TS_CONTEXT = ts.Context({
+    "cache_pool": {"total_bytes_limit": 4_000_000_000},  # 4 GB of decompressed chunks
+    "data_copy_concurrency": {"limit": 16},
+})
+
 
 @dataclass
 class SliceResult:
@@ -106,7 +118,7 @@ class EMVolume:
                 "driver": "zarr3",
                 "kvstore": {"driver": "http", "base_url": base},
                 "open": True,
-            }).result()
+            }, context=_TS_CONTEXT).result()
         # Zarr v2: some cellmap arrays add a non-standard "checksum" field to the
         # zstd compressor that tensorstore's strict parser rejects. Fetch the
         # .zarray, drop it, and open with assume_metadata to skip re-parsing.
@@ -121,7 +133,7 @@ class EMVolume:
             "metadata": meta,
             "open": True,
             "assume_metadata": True,
-        }).result()
+        }, context=_TS_CONTEXT).result()
 
     def level_shape_zyx(self, level: int) -> tuple[int, int, int]:
         return tuple(int(x) for x in self._open_level(level).shape)
