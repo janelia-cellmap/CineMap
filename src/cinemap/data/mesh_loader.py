@@ -7,15 +7,46 @@ for Blender import.
 """
 from __future__ import annotations
 
-import json
 import os
 import re
-import urllib.request
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+
+# segments are fetched concurrently (cloud-volume .get is network + draco decode =
+# I/O-bound, GIL released), a big win for many-segment layers (e.g. thousands of mitos).
+# Default to logical CPU count (includes hyperthreading); CINEMAP_FETCH_WORKERS overrides.
+_FETCH_WORKERS = int(os.environ.get("CINEMAP_FETCH_WORKERS") or (os.cpu_count() or 8))
 
 import numpy as np
 import trimesh
 from cloudvolume import CloudVolume
+
+from .local_paths import localized_url, read_bytes, read_json
+
+
+def _tune_http_pool():
+    """Size cloudfiles' shared HTTP connection pool to our parallel fetching, so it
+    doesn't churn connections under many workers (the 'Connection pool is full'
+    urllib3 warnings) — both a perf fix and silences the noise. Best-effort."""
+    pool = max(32, _FETCH_WORKERS * 2)
+    try:
+        import requests
+        from cloudfiles.interfaces import HttpInterface
+        HttpInterface.adaptor = requests.adapters.HTTPAdapter(
+            pool_connections=pool, pool_maxsize=pool)
+    except Exception:  # noqa: BLE001
+        pass
+    import logging  # also drop just this one message if anything else still emits it
+
+    class _PoolFilter(logging.Filter):
+        def filter(self, record):
+            return "Connection pool is full" not in record.getMessage()
+
+    logging.getLogger("urllib3.connectionpool").addFilter(_PoolFilter())
+
+
+_tune_http_pool()
 
 
 def _http(url: str) -> str:
@@ -30,20 +61,27 @@ def _http(url: str) -> str:
 def _segment_ids(mesh_url: str) -> list[int]:
     url = _http(f"{mesh_url.rstrip('/')}/segment_properties/info")
     try:
-        with urllib.request.urlopen(url, timeout=20) as r:
-            d = json.load(r)
+        d = read_json(url, timeout=20)
         return [int(x) for x in d.get("inline", {}).get("ids", [])]
     except Exception:
         return []
 
 
 class MeshLoader:
-    def __init__(self, mesh_url: str = "", label_zarr: str = ""):
+    def __init__(self, mesh_url: str = "", label_zarr: str = "", cache_dir=None):
         self.mesh_url = (mesh_url or "").rstrip("/")
         self.label_zarr = (label_zarr or "").rstrip("/")
+        self.mesh_source = localized_url(_http(self.mesh_url)).rstrip("/") if self.mesh_url else ""
         self.parent, self.subdir = (
-            self.mesh_url.rsplit("/", 1) if "/" in self.mesh_url else ("", self.mesh_url))
+            self.mesh_source.rsplit("/", 1) if "/" in self.mesh_source else ("", self.mesh_source))
         self._cv = None
+        self._manual = None   # lazily: does this source need our model-space draco decode?
+        self._manual_lock = threading.Lock()   # resolve _manual once, even under the fetch pool
+        self._raw_cache: dict = {}   # seg_id -> (index_bytes, data_bytes), fetched once
+        # persistent on-disk cache of RAW (uncolored) per-(segment, LOD) geometry,
+        # keyed by (mesh_url, seg, lod) — so re-rendering at a different quality/zoom
+        # only downloads the genuinely-new finer LODs and reuses the rest.
+        self._cache_dir = str(cache_dir) if cache_dir else None
 
     @property
     def cv(self) -> CloudVolume:
@@ -56,9 +94,10 @@ class MeshLoader:
             #    info that names this subdir as `mesh`.
             # CloudVolume reads gs://, s3://, https:// info itself; opening a bare mesh
             # dir as a volume raises (no `scales`), which sends us to the fabricate path.
+            use_https = not self.mesh_source.startswith("file://")
             try:
                 direct = CloudVolume(
-                    f"precomputed://{self.mesh_url}", use_https=True, progress=False
+                    f"precomputed://{self.mesh_source}", use_https=use_https, progress=False
                 )
                 if "scales" in direct.info and direct.info.get("mesh"):
                     self._cv = direct
@@ -77,7 +116,7 @@ class MeshLoader:
                     }],
                 }
                 self._cv = CloudVolume(
-                    f"precomputed://{self.parent}", info=info, use_https=True, progress=False
+                    f"precomputed://{self.parent}", info=info, use_https=use_https, progress=False
                 )
         return self._cv
 
@@ -85,23 +124,200 @@ class MeshLoader:
     def list_segments(self) -> tuple[int, ...]:
         return tuple(_segment_ids(self.mesh_url)) if self.mesh_url else ()
 
-    def _draco(self, seg_id: int, lod: int = 0) -> trimesh.Trimesh:
-        """Precomputed mesh for `seg_id` at level-of-detail `lod` (0 = finest).
-        Falls back to the finest mesh if the source isn't multi-resolution."""
+    def _manifest_bits(self) -> int:
+        try:
+            return int(self.cv.mesh.meta.info.get("vertex_quantization_bits", 16))
+        except Exception:  # noqa: BLE001
+            return 16
+
+    def _needs_manual_decode(self) -> bool:
+        """True for meshes from the DEPRECATED/legacy meshifying pipeline.
+
+        That old meshifier leaned on Draco's built-in position quantization
+        (`quantization_range=...`), so DracoPy dequantizes the points for us and they come
+        out already in (chunk) model space — fractional, ranging up to ~chunk_shape —
+        instead of the raw integer grid indices [0, 2^bits) that the CURRENT meshifier (and
+        standard igneous / neuroglancer) emit. cloud-volume assumes the integer form and
+        re-applies the chunk_shape*2^lod scaling, so on these legacy meshes it double-scales
+        and the fragments balloon/scatter. We detect the legacy form by sampling one fragment
+        (fractional or out-of-[0,2^bits) points) and decode it ourselves. Meshes from the
+        current pipeline take the cloud-volume path unchanged."""
+        if self._manual is not None:
+            return self._manual
+        # Resolve ONCE under a lock. The fetch pool calls _draco (-> here) from many
+        # threads at once; previously this set self._manual=False up front and computed
+        # the real value after a slow network probe, so concurrent threads saw False mid-
+        # probe and decoded via cloud-volume (which double-scales -> some segments scatter,
+        # others compact, the intermittent broken-mesh bug). Now _manual stays None until
+        # the final value is assigned, and the lock makes other threads wait for it.
+        with self._manual_lock:
+            if self._manual is not None:
+                return self._manual
+            result = False
+            try:
+                import struct
+
+                import DracoPy
+                seg = int(self.list_segments()[0])
+                bits = self._manifest_bits()
+                idx, data = self._raw_manifest_data(seg)
+                o = 24                                          # skip chunk_shape + grid_origin
+                nl = struct.unpack("<I", idx[o:o + 4])[0]; o += 4
+                o += 4 * nl + 12 * nl                           # lod_scales + vertex_offsets
+                nfrag = struct.unpack(f"<{nl}I", idx[o:o + 4 * nl]); o += 4 * nl
+                n0 = nfrag[0]
+                o += 12 * n0                                    # skip lod0 fragment_positions
+                fsz = struct.unpack(f"<{n0}I", idx[o:o + 4 * n0])
+                dp = 0
+                for sz in fsz:                                  # first NON-empty lod0 fragment
+                    if sz:
+                        pts = np.asarray(DracoPy.decode(data[dp:dp + sz]).points, float)
+                        # Raw-quantized draco gives INTEGER coords in [0, 2^bits); this export
+                        # bakes the dequantization in, so coords are fractional / far beyond
+                        # 2^bits (model space). Either signal => decode manually. Deterministic
+                        # (no cloud-volume comparison, which was flaky and flipped run to run).
+                        fractional = not np.allclose(pts, np.round(pts), atol=1e-3)
+                        result = bool(fractional or pts.max() > 1.5 * (2 ** bits))
+                        break
+                    dp += sz
+            except Exception:  # noqa: BLE001  (sharded / unreachable -> trust cloud-volume)
+                result = False
+            self._manual = result          # assign the final value exactly once
+        return self._manual
+
+    def _cv_mesh(self, seg_id: int, lod: int = 0):
+        """Raw cloud-volume mesh for a segment at a LOD (no manual-decode dispatch)."""
         try:
             m = self.cv.mesh.get(int(seg_id), lod=lod) if lod else self.cv.mesh.get(int(seg_id))
-        except TypeError:  # source has no LOD support -> finest only
+        except TypeError:  # source has no LOD support
             m = self.cv.mesh.get(int(seg_id))
-        mesh = m[seg_id] if isinstance(m, dict) else m
-        return trimesh.Trimesh(
+        return m[seg_id] if isinstance(m, dict) else m
+
+    def _raw_manifest_data(self, seg_id: int):
+        """(index_bytes, data_bytes) for a segment, fetched once and cached on the loader.
+        The LOD picker decodes several LODs of the same segment, so caching the raw bytes
+        avoids re-downloading the (possibly large) data file per LOD — the slow path that
+        could time out and drop big segments when many load at once."""
+        seg_id = int(seg_id)
+        hit = self._raw_cache.get(seg_id)
+        if hit is None:
+            idx = read_bytes(_http(f"{self.mesh_url}/{seg_id}.index"), timeout=60)
+            data = read_bytes(_http(f"{self.mesh_url}/{seg_id}"), timeout=180)
+            hit = (idx, data)
+            if len(self._raw_cache) < 256:        # bound memory across a many-segment layer
+                self._raw_cache[seg_id] = hit
+        return hit
+
+    def _draco_manual(self, seg_id: int, lod: int = 0) -> trimesh.Trimesh:
+        """Decode one LOD of a LEGACY-meshifier unsharded multilod mesh (see
+        _needs_manual_decode): Draco already dequantized the points to chunk model space,
+        so vertex = grid_origin + points. The same formula holds at every LOD (coarser LODs
+        are just lower-poly), so this supports LOD selection; it avoids cloud-volume's
+        double-scaling of this legacy (Draco-quantized) encoding."""
+        import struct
+
+        import DracoPy
+        idx, data = self._raw_manifest_data(seg_id)
+        o = 12                                                 # skip chunk_shape (unused here)
+        go = np.array(struct.unpack("<3f", idx[o:o + 12])); o += 12
+        nl = struct.unpack("<I", idx[o:o + 4])[0]; o += 4
+        o += 4 * nl + 12 * nl                                  # lod_scales + vertex_offsets
+        nfrag = struct.unpack(f"<{nl}I", idx[o:o + 4 * nl]); o += 4 * nl
+        want = min(max(int(lod), 0), nl - 1)
+        dp = 0; V = []; F = []; nv = 0
+        for cur in range(nl):                                  # fragments are stored LOD0..LODn
+            n = nfrag[cur]
+            o += 12 * n                                        # skip fragment_positions
+            fsz = struct.unpack(f"<{n}I", idx[o:o + 4 * n]); o += 4 * n
+            for i in range(n):
+                b = data[dp:dp + fsz[i]]; dp += fsz[i]
+                if cur == want and fsz[i]:
+                    mm = DracoPy.decode(b)
+                    V.append(go + np.asarray(mm.points, float))  # grid-origin-relative
+                    F.append(np.asarray(mm.faces, np.int64) + nv); nv += len(mm.points)
+        return trimesh.Trimesh(vertices=np.vstack(V), faces=np.vstack(F), process=False)
+
+    def _draco_manual_fragments(self, seg_id: int, lod: int, idxs) -> dict:
+        """Manually decode only the SELECTED fragments of `lod` for per-chunk LOD. Returns
+        {frag_index -> raw Trimesh}, where frag_index is the position among NON-EMPTY
+        fragments (matching fragment_boxes / select_fragments). Uses the same model-space
+        decode as _draco_manual (vertex = grid_origin + points) so the pieces land in the
+        correct nm space and stay aligned — cloud-volume's decode double-scales this
+        encoding and scatters them."""
+        import struct
+
+        import DracoPy
+        want_idx = {int(i) for i in (idxs or [])}
+        if not want_idx:
+            return {}
+        idx, data = self._raw_manifest_data(seg_id)
+        o = 12                                                 # skip chunk_shape
+        go = np.array(struct.unpack("<3f", idx[o:o + 12])); o += 12
+        nl = struct.unpack("<I", idx[o:o + 4])[0]; o += 4
+        o += 4 * nl + 12 * nl                                  # lod_scales + vertex_offsets
+        nfrag = struct.unpack(f"<{nl}I", idx[o:o + 4 * nl]); o += 4 * nl
+        want = min(max(int(lod), 0), nl - 1)
+        dp = 0; out: dict = {}
+        for cur in range(nl):
+            n = nfrag[cur]
+            o += 12 * n                                        # skip fragment_positions
+            fsz = struct.unpack(f"<{n}I", idx[o:o + 4 * n]); o += 4 * n
+            ni = 0                                             # index among NON-empty (per LOD)
+            for i in range(n):
+                b = data[dp:dp + fsz[i]]; dp += fsz[i]
+                if not fsz[i]:
+                    continue                                   # empty -> not counted (matches boxes)
+                if cur == want and ni in want_idx:
+                    mm = DracoPy.decode(b)
+                    out[ni] = trimesh.Trimesh(
+                        vertices=go + np.asarray(mm.points, float),
+                        faces=np.asarray(mm.faces, np.int64), process=False)
+                ni += 1
+        return out
+
+    def _draco(self, seg_id: int, lod: int = 0) -> trimesh.Trimesh:
+        """Precomputed mesh for `seg_id` at level-of-detail `lod` (0 = finest).
+        Falls back to the finest mesh if the source isn't multi-resolution. Raw
+        geometry is disk-cached (when a cache dir is set) so it's downloaded once."""
+        cache = None
+        if self._cache_dir:
+            import hashlib
+            # `decode2` tags the decoder version: bumping it invalidates geometry cached
+            # by an older (buggy) decode so a re-render can't reuse stale meshes.
+            key = hashlib.md5(f"{self.mesh_url}|{int(seg_id)}|{int(lod)}|decode4".encode()).hexdigest()
+            cache = os.path.join(self._cache_dir, f"{key}.ply")
+            if os.path.exists(cache):
+                try:
+                    return trimesh.load(cache, process=False)
+                except Exception:  # noqa: BLE001  (corrupt cache entry -> re-fetch)
+                    pass
+        if self._needs_manual_decode():
+            out = self._draco_manual(seg_id, lod)   # correct decode at the requested LOD
+            if cache:
+                try:
+                    os.makedirs(self._cache_dir, exist_ok=True); out.export(cache)
+                except Exception:  # noqa: BLE001
+                    pass
+            return out
+        mesh = self._cv_mesh(seg_id, lod)
+        out = trimesh.Trimesh(
             vertices=np.asarray(mesh.vertices, dtype=np.float64),
             faces=np.asarray(mesh.faces, dtype=np.int64),
             process=False,
         )
+        if cache:
+            try:
+                os.makedirs(self._cache_dir, exist_ok=True)
+                out.export(cache)
+            except Exception:  # noqa: BLE001  (cache write best-effort)
+                pass
+        return out
 
+    @lru_cache(maxsize=8192)
     def _max_lod(self, seg_id: int) -> int:
         """Coarsest available LOD index for a multi-resolution mesh (0 if single
-        resolution). Reads only the mesh manifest, not geometry."""
+        resolution). Network-probes the manifest, so it's cached per segment (it was
+        being re-probed for every LOD pick — a big chunk-mode slowdown)."""
         try:
             self.cv.mesh.get(int(seg_id), lod=999)
             return 0
@@ -111,19 +327,185 @@ class MeshLoader:
             m = re.search(r"-?\d+\s*-\s*(\d+)\)", str(e))
             return int(m.group(1)) if m else 0
 
+    def seg_bbox(self, seg_id: int):
+        """World-space ((x0,y0,z0),(x1,y1,z1)) bbox in nm from the coarsest LOD (a
+        cheap fetch) — used by the view-aware ('chunk') LOD mode to frustum-cull and
+        size each segment on screen. None if the segment can't be read."""
+        try:
+            b = self._draco(int(seg_id), lod=self._max_lod(seg_id)).bounds
+            return ((float(b[0][0]), float(b[0][1]), float(b[0][2])),
+                    (float(b[1][0]), float(b[1][1]), float(b[1][2])))
+        except Exception as e:  # noqa: BLE001
+            print(f"[mesh] bbox {seg_id} failed: {e}")
+            return None
+
+    @lru_cache(maxsize=4096)
+    def fragment_boxes(self, seg_id: int):
+        """The mesh's octree as per-LOD fragments with exact WORLD (nm) bounding
+        boxes — the basis for true per-chunk LOD (frustum-cull + per-fragment screen
+        size, like neuroglancer). Uses cloud-volume's own decode (multilod.py):
+
+            model = grid_origin + vertex_offsets[lod] + chunk_shape·2^lod·[pos, pos+1]
+            nm    = info `transform` · model        (transform carries the resolution)
+
+        No calibration — the resolution is read from the mesh info. EMPTY fragments
+        (byte size 0) are skipped, matching cloud-volume's decoder, and the index is
+        the position in the NON-EMPTY sequence so it lines up with get(...,concat=
+        False). Returns (per_lod, lod_scales_nm): per_lod[lod] is a list of
+        (frag_index, lo_nm(3,), hi_nm(3,), grid_pos, n_bytes); lod_scales_nm is each
+        LOD's spatial resolution in nm."""
+        m = self.cv.mesh
+        T = np.asarray(m.transform, float)               # 4x4, resolution baked in
+        man = m.get_manifest(int(seg_id))
+        go = np.asarray(man.grid_origin, float)
+        cs = np.asarray(man.chunk_shape, float)
+        vo = np.asarray(man.vertex_offsets, float)
+        scale = float(abs(np.linalg.det(T[:3, :3])) ** (1.0 / 3.0))  # nm per model unit
+        per_lod = []
+        for lod in range(man.num_lods):
+            cell = cs * (2 ** lod)
+            base = go + vo[lod]
+            offs = np.asarray(man.fragment_offsets[lod])
+            positions = np.asarray(man.fragment_positions[lod], float)
+            frags = []
+            ni = 0                                        # index among NON-empty fragments
+            for idx, p in enumerate(positions):
+                if offs[idx] == 0:                        # empty -> decoder skips it
+                    continue
+                lo_m, hi_m = base + cell * p, base + cell * (p + 1)
+                corners = np.array([[x, y, z] for x in (lo_m[0], hi_m[0])
+                                    for y in (lo_m[1], hi_m[1]) for z in (lo_m[2], hi_m[2])])
+                w = (T[:3, :3] @ corners.T).T + T[:3, 3]
+                frags.append((ni, w.min(0), w.max(0), tuple(int(v) for v in p), int(offs[idx])))
+                ni += 1
+            per_lod.append(frags)
+        # The manifest's lod_scales are RELATIVE octree multipliers (e.g. 1,2,4,8), not
+        # nm — using them directly makes select_fragments think the coarsest LOD is already
+        # sub-pixel, so it never refines (coarse/inflated meshes). Anchor them to real
+        # geometry: measure the coarsest LOD's resolution (cheap — few verts) the same way
+        # frame mode does, and scale the relative ladder to it. Falls back to the transform
+        # scale if the probe fails.
+        rel = np.asarray(man.lod_scales, float)
+        lod_scales_nm = rel * scale
+        if len(per_lod) and rel[-1] > 0:
+            try:
+                coarse = self._draco(int(seg_id), lod=len(per_lod) - 1)
+                anchor = self._mesh_resolution_nm(coarse)        # nm at the coarsest LOD
+                if anchor > 0:
+                    lod_scales_nm = rel / rel[-1] * anchor       # relative ladder -> nm
+            except Exception:  # noqa: BLE001
+                pass
+        return per_lod, lod_scales_nm
+
+    def _frag_cache_path(self, seg_id: int, lod: int, idx: int, tag: str = "cv"):
+        if not self._cache_dir:
+            return None
+        import hashlib
+        # `tag` versions the decoder (cv = cloud-volume, m = manual model-space) so a
+        # fragment cached by the wrong (scattering) decoder is never reused.
+        key = hashlib.md5(
+            f"{self.mesh_url}|{int(seg_id)}|f|{int(lod)}|{int(idx)}|{tag}".encode()).hexdigest()
+        return os.path.join(self._cache_dir, f"{key}.ply")
+
+    def get_fragments(self, seg_id: int, selection: dict, colorize=None) -> trimesh.Trimesh | None:
+        """Fetch only the SELECTED octree fragments and combine them. `selection` is
+        {lod: [frag_index, ...]} (indices from fragment_boxes). Each RAW fragment is
+        disk-cached individually (per mesh_url/seg/lod/index), so a re-render or a
+        different zoom reuses fragments already fetched; a whole-LOD download happens
+        only when some needed fragment isn't cached yet. Fine where near, coarse where
+        far — like neuroglancer."""
+        # Decode the selected fragments with the SAME decoder the full-segment path uses:
+        # cloud-volume double-scales the model-space-baked encoding, so in per-chunk mode
+        # its fragments come out mis-scaled and scattered. Manual decode keeps them aligned.
+        manual = self._needs_manual_decode()
+        tag = "m" if manual else "cv"
+        parts = []
+        for lod, idxs in selection.items():
+            idxs = sorted({int(i) for i in (idxs or [])})
+            if not idxs:
+                continue
+            meshes: dict[int, trimesh.Trimesh] = {}      # idx -> raw (uncolored)
+            need = []
+            for i in idxs:
+                cp = self._frag_cache_path(seg_id, lod, i, tag)
+                if cp and os.path.exists(cp):
+                    try:
+                        meshes[i] = trimesh.load(cp, process=False)
+                    except Exception:  # noqa: BLE001
+                        need.append(i)
+                else:
+                    need.append(i)
+            if need and manual:
+                try:
+                    decoded = self._draco_manual_fragments(seg_id, lod, need)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[chunk] {seg_id} lod{lod} manual frags failed: {e}")
+                    decoded = {}
+                for j, raw in decoded.items():
+                    cp = self._frag_cache_path(seg_id, lod, j, tag)
+                    if cp:
+                        try:
+                            os.makedirs(self._cache_dir, exist_ok=True)
+                            raw.export(cp)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    meshes[j] = raw
+            elif need:
+                try:
+                    got = self.cv.mesh.get(int(seg_id), lod=int(lod), concat=False)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[chunk] {seg_id} lod{lod} frags failed: {e}")
+                    got = None
+                frags = (got.get(int(seg_id)) if isinstance(got, dict) else got) or []
+                for j, fm in enumerate(frags):           # cache the WHOLE lod's fragments
+                    raw = trimesh.Trimesh(vertices=np.asarray(fm.vertices, dtype=np.float64),
+                                          faces=np.asarray(fm.faces, dtype=np.int64), process=False)
+                    cp = self._frag_cache_path(seg_id, lod, j, tag)
+                    if cp:
+                        try:
+                            os.makedirs(self._cache_dir, exist_ok=True)
+                            raw.export(cp)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if j in idxs and j not in meshes:
+                        meshes[j] = raw
+            for i in idxs:
+                mesh = meshes.get(i)
+                if mesh is None:
+                    continue
+                if colorize is not None:
+                    r, g, b = colorize(int(seg_id))
+                    mesh.visual.vertex_colors = np.tile(
+                        (np.array([r, g, b, 1.0]) * 255).astype(np.uint8), (len(mesh.vertices), 1))
+                parts.append(mesh)
+        if not parts:
+            return None
+        return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+
+    @staticmethod
+    def _mesh_resolution_nm(mesh: trimesh.Trimesh) -> float:
+        """A LOD's spatial resolution (nm) ~ its mean triangle edge length. A robust
+        stand-in for the multilod manifest's lodScale, measured from the geometry."""
+        try:
+            el = mesh.edges_unique_length
+            if len(el):
+                return float(el.mean())
+        except Exception:  # noqa: BLE001
+            pass
+        ext = mesh.bounds[1] - mesh.bounds[0]   # fallback: cube-root volume per vertex
+        return float((float(np.prod(ext)) / max(1, len(mesh.vertices))) ** (1 / 3))
+
     def _draco_lod_for_screen(self, seg_id: int, nm_per_px: float, draft: bool,
                               max_verts: float | None = None) -> trimesh.Trimesh | None:
-        """Fetch the precomputed mesh at the coarsest LOD that still looks sharp at
-        the given on-screen scale (`nm_per_px`). Like neuroglancer: a mesh that's
-        small on screen loads coarse, a close-up loads fine. Fetches coarse->fine and
-        stops once vertex spacing is finer than ~1-2 px, so little data is wasted."""
-        # target world-space vertex spacing that projects to ~px_spacing pixels.
-        # The (extent/spacing)^2 budget below treats the mesh as a full sheet, which
-        # over-counts for thin neurites, so px_spacing is set generously — large for
-        # draft previews (coarse, fast), tighter for the final video.
-        px_spacing = 8.0 if draft else 2.0
-        spacing_nm = max(px_spacing * nm_per_px, 1e-6)
-        target = None
+        """Pick the coarsest LOD that still looks sharp at the given on-screen scale
+        (`nm_per_px`) — neuroglancer's criterion: render a LOD once its spatial
+        resolution (lodScale) is finer than one screen pixel times a tolerance
+        (`lodScale <= nm_per_px * detailCutoff`; NG's default cutoff is ~1). We
+        estimate each LOD's resolution from its mean edge length, which — unlike a
+        sheet-area vertex count — doesn't over-refine thin neurites. Capped at
+        `max_verts` (the offline budget NG doesn't need, since it streams)."""
+        tol = 3.0 if draft else 1.0      # px of mesh resolution to allow (matches NG's ~1)
+        target_nm = max(tol * nm_per_px, 1e-6)
         chosen = None
         for lod in range(self._max_lod(seg_id), -1, -1):  # coarse -> fine
             try:
@@ -131,15 +513,12 @@ class MeshLoader:
             except Exception as e:  # noqa: BLE001
                 print(f"[mesh] {seg_id} lod{lod} failed: {e}")
                 continue
-            if target is None:  # size the screen budget from the (cheap) coarsest mesh
-                extent = float(np.max(mesh.bounds[1] - mesh.bounds[0]))
-                target = (extent / spacing_nm) ** 2  # ~verts for a surface at that spacing
             # hard budget ceiling: if going this fine would exceed max_verts, keep the
             # previous (coarser, in-budget) LOD instead.
             if max_verts is not None and len(mesh.vertices) > max_verts and chosen is not None:
                 break
             chosen = mesh
-            if len(mesh.vertices) >= target:  # enough on-screen detail
+            if self._mesh_resolution_nm(mesh) <= target_nm:  # fine enough on screen
                 break
         return chosen
 
@@ -207,9 +586,21 @@ class MeshLoader:
         combined vertex count — split evenly across segments — so a layer with many
         segments (e.g. 50 neurons) stays bounded even when the camera zooms in on one
         frame; a single segment can still use the whole budget for a sharp close-up."""
+        seg_ids = list(seg_ids)
         per_seg = (total_budget / max(1, len(seg_ids))) if total_budget else None
-        parts = [self._precomputed(s, colorize, nm_per_px, draft, max_verts=per_seg)
-                 for s in seg_ids]
+
+        def _fetch(s):
+            try:
+                return self._precomputed(s, colorize, nm_per_px, draft, max_verts=per_seg)
+            except Exception as e:  # noqa: BLE001  (one bad segment shouldn't sink the layer)
+                print(f"[mesh] segment {s} failed: {e}")
+                return None
+
+        if len(seg_ids) > 1:
+            with ThreadPoolExecutor(max_workers=min(_FETCH_WORKERS, len(seg_ids))) as ex:
+                parts = list(ex.map(_fetch, seg_ids))
+        else:
+            parts = [_fetch(seg_ids[0])]
         parts = [p for p in parts if p is not None]
         if not parts:
             return None

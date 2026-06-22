@@ -7,11 +7,13 @@ UI and the Claude agent mutate (through operations.py).
 """
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
 Axis = Literal["x", "y", "z"]
+TransitionStyle = Literal["glide", "cut", "fade"]
+LayerTransitionStyle = Literal["fade", "cut"]
 
 
 # ----------------------------- data sources -----------------------------
@@ -57,10 +59,24 @@ class Camera(BaseModel):
 class SlicePlane(BaseModel):
     em_name: str = "em"
     axis: Axis = "z"
-    position_nm: float = 0.0
+    position_nm: float = 0.0           # offset of the plane = dot(point, normal)
+    # None => axis-aligned plane (perpendicular to `axis`). A unit xyz vector =>
+    # an oblique plane with that normal (the EM is resampled on the tilted plane).
+    normal: Optional[list[float]] = None
     scale_level: Optional[int] = None  # None => auto-pick from on-screen extent
     opacity: float = 1.0
     visible: bool = True
+
+
+class ClipPlane(BaseModel):
+    """A cutaway plane for a single mesh layer: geometry on the hidden side of the
+    plane is made transparent in the 3D render, revealing what's inside/behind.
+    Independent of EM slices, and applied per layer (cut the cell, keep the mitos)."""
+    axis: Axis = "z"
+    position_nm: float = 0.0          # offset of the plane = dot(point, normal)
+    normal: Optional[list[float]] = None  # unit xyz; None => axis-aligned (e_axis)
+    side: int = 1          # +1 hides the +normal side of the plane; -1 hides the other
+    enabled: bool = False
 
 
 class MeshInstance(BaseModel):
@@ -81,6 +97,12 @@ class MeshInstance(BaseModel):
     # neuroglancer 3D mesh render state (per keyframe -> can change frame to frame)
     object_alpha: float = 1.0   # NG "Opacity (3d)"  (objectAlpha)
     silhouette: float = 0.0     # NG "Silhouette (3d)" (meshSilhouetteRendering)
+    clip: Optional[ClipPlane] = None   # cutaway plane (render-only; per layer)
+    # per-keyframe material override (render-only) so the look can CHANGE over the movie
+    # (e.g. turn reflective at the end). None = use the global look / director default;
+    # set on a keyframe and it interpolates into it like opacity/silhouette do.
+    metallic: Optional[float] = None     # 0 = matte, 1 = fully reflective/metal
+    roughness: Optional[float] = None     # 0 = mirror-sharp, 1 = fully diffuse
 
 
 class AnnotationInstance(BaseModel):
@@ -102,7 +124,7 @@ class AnnotationInstance(BaseModel):
 
 class Lighting(BaseModel):
     key_energy: float = 3000.0
-    background: list[float] = Field(default_factory=lambda: [0.02, 0.02, 0.03])
+    background: list[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])  # black, like NG
 
 
 class Keyframe(BaseModel):
@@ -113,10 +135,25 @@ class Keyframe(BaseModel):
     meshes: list[MeshInstance] = Field(default_factory=list)
     annotations: list[AnnotationInstance] = Field(default_factory=list)
     lighting: Lighting = Field(default_factory=Lighting)
-    duration_in_s: float = 2.0  # transition duration INTO this keyframe
-    easing: Literal["linear", "ease-in-out"] = "ease-in-out"
+    duration_in_s: float = 2.0  # transition duration INTO this keyframe (the move)
+    hold_in_s: float = 0.0      # rest/dwell ON this keyframe's pose before moving on
+    easing: Literal["linear", "ease-in-out", "ease-in", "ease-out"] = "ease-in-out"
+    # Camera/edit transition into this keyframe. Layer appearance/style changes are controlled
+    # separately by layer_transition below.
+    transition: TransitionStyle = "glide"
+    # How meshes/slices/annotations change during the camera move into this keyframe:
+    # fade = old behavior, cross-fade layer visibility/opacity; cut = keep source layers
+    # through the move and switch hard at layer_transition_at.
+    layer_transition: LayerTransitionStyle = "fade"
+    # Normalized time in the transition where cut layer changes switch from source to target:
+    # 0.0 = start of move, 0.5 = halfway, 1.0 = at keyframe arrival.
+    layer_transition_at: float = 1.0
     ng_state: Optional[dict] = None  # originating scouting state (round-trip)
     thumbnail_path: Optional[str] = None
+    # keyframes produced together by a generated move (plane scan, orbit, …) share a
+    # group id + label so the timeline can collapse them into one stacked card.
+    group: Optional[str] = None
+    group_label: str = ""
 
 
 class RenderSettings(BaseModel):
@@ -124,6 +161,10 @@ class RenderSettings(BaseModel):
     height: int = 720
     fps: int = 30
     samples: int = 64
+    # adaptive-sampling noise threshold: Cycles stops a pixel once it's this clean, then
+    # the denoiser removes the rest. Higher = faster (bails sooner), still clean thanks to
+    # OIDN. 0.01 = conservative/clean; ~0.06 = the fast "denoise does the work" setting.
+    noise_threshold: float = 0.01
     engine: Literal["CYCLES", "BLENDER_EEVEE_NEXT"] = "CYCLES"
     # when set, the job produces a self-contained .blend (camera, mesh and slice
     # animation baked to F-curves; textures packed in) instead of rendering frames.
@@ -131,6 +172,17 @@ class RenderSettings(BaseModel):
     # draft = fast preview/thumbnail quality: coarse EM slice level + low-voxel
     # meshes (see RenderWorker). Off = full resolution for the final video.
     draft: bool = False
+    # still = render exactly ONE frame (a per-keyframe thumbnail), ignoring holds and
+    # sweep timeline-extension so it stays a single PNG (not an mp4).
+    still: bool = False
+    # show_bbox = draw a thin wireframe box around each data source's extent (the EM
+    # volume and/or each rendered layer's label volume), like neuroglancer's bounding
+    # box. Falls back to a tight box around the rendered meshes when no volume source.
+    show_bbox: bool = False
+    bbox_color: list[float] = Field(default_factory=lambda: [0.62, 0.66, 0.74])  # wireframe rgb (0–1)
+    # which layer the box is drawn from: "" = auto (EM / all visible meshes), or a layer
+    # NAME (EM image or a mesh/seg layer) — drawn even if that layer is currently hidden.
+    bbox_source: str = ""
     # By default a layer's precomputed meshes are downloaded (fast, LOD-adaptive,
     # matches neuroglancer). Set this to instead regenerate watertight meshes from
     # the OME-Zarr label volume via marching cubes when one is available.
@@ -139,6 +191,17 @@ class RenderSettings(BaseModel):
     # 1.2M draft). Higher = crisper meshes but more VRAM; the worker hard-caps the
     # budget and auto-retries at lower detail if the GPU runs out of memory.
     mesh_detail: float = 1.0
+    # Auto-direction: a non-destructive presentation pass (camera-relative key/fill/
+    # rim lighting, publication materials, subtle depth-of-field on the framed
+    # subject). On by default; off renders the plain neuroglancer-faithful scene.
+    auto_direct: bool = True
+    # Mesh LOD strategy:
+    #   "single" — one LOD for the whole shot (built at the closest frame's scale).
+    #   "frame"  — per-frame LOD: coarser when a layer is far/small on screen, finer
+    #              on close-ups (like neuroglancer); collapses to one build on orbits.
+    #   "chunk"  — per-chunk spatial LOD (different LODs within one mesh); not yet
+    #              implemented, currently falls back to "frame".
+    lod_mode: Literal["single", "frame", "chunk"] = "frame"
 
 
 class RenderJob(BaseModel):
@@ -151,6 +214,52 @@ class RenderJob(BaseModel):
     output_path: Optional[str] = None
 
 
+class Sweep(BaseModel):
+    """An animated effect on its OWN timeline, independent of the camera keyframes.
+    A cutaway sweep slides a layer's clip plane from `from_nm` to `to_nm` over a span of
+    the movie's global time [start_s, start_s+duration_s]; the camera meanwhile does
+    whatever its keyframes say. This decouples 'what the plane does' from 'where the
+    camera is' — a sweep is one self-contained thing laid on top of the camera track."""
+    id: str
+    # cutaway = slice a mesh layer's clip plane; slice = sweep an EM cross-section plane.
+    kind: Literal["cutaway", "slice"] = "cutaway"
+    layer: str = ""                        # mesh layer name the clip plane cuts (cutaway)
+    em_name: str = ""                      # EM layer name the slice shows (slice)
+    axis: Axis = "z"
+    normal: Optional[list[float]] = None   # oblique plane; None => axis-aligned
+    side: int = 1
+    from_nm: float = 0.0
+    to_nm: float = 0.0
+    start_s: float = 0.0                   # global-timeline start (seconds)
+    duration_s: float = 2.0
+    easing: Literal["linear", "ease-in-out", "ease-in", "ease-out"] = "linear"
+    opacity: float = 1.0                   # EM slice overlay strength (slice kind)
+    mirror: bool = False                   # ping-pong: sweep from->to then back to->from
+    cap: bool = True                       # cutaway: fill the cut face (slower, solid)
+    enabled: bool = True
+
+
+class RenderPrefs(BaseModel):
+    """The UI's render-control choices, persisted on the project so they survive a
+    reload and travel with export/import. These are PREFERENCES (resolution, quality,
+    director, LOD, bounding box, preview ratio) — not the transient per-job flags
+    (still/draft/export_blend) which are decided per render. None on a project that
+    has never rendered, so old projects keep the UI defaults until first use."""
+    width: int = 1280
+    height: int = 720
+    fps: int = 30
+    samples: int = 48
+    mesh_detail: float = 1.0
+    mesh_from_labels: bool = False
+    auto_direct: bool = True
+    lod_mode: str = "frame"
+    show_bbox: bool = False
+    bbox_color: list[float] = Field(default_factory=lambda: [0.62, 0.66, 0.74])
+    bbox_source: str = ""
+    preview_ratio: int = 10
+    fast_sample: bool = True    # ⚡ fast (default on): 32 samples + 0.06 noise threshold + denoiser
+
+
 class Project(BaseModel):
     id: str
     name: str
@@ -158,4 +267,9 @@ class Project(BaseModel):
     manifest: Manifest = Field(default_factory=Manifest)
     lighting: Lighting = Field(default_factory=Lighting)
     keyframes: list[Keyframe] = Field(default_factory=list)
+    # independent animated effects (cutaway sweeps) overlaid on the camera timeline
+    sweeps: list[Sweep] = Field(default_factory=list)
     renders: list[RenderJob] = Field(default_factory=list)
+    look: dict[str, Any] = Field(default_factory=dict)  # render look overrides (preset +
+    # glow/roughness/specular/ng_shader/view) — the look-experiment panel writes this.
+    render_prefs: Optional[RenderPrefs] = None  # last-used render-control settings (UI)

@@ -82,13 +82,20 @@ def annotations_to_mesh(prims: dict, color_rgb, point_radius_nm: float = DEFAULT
     return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
 
 
-def parse_inline(layer: dict, voxel_size_nm) -> dict:
-    """Normalized primitive dict (nm) from a state layer's inline `annotations`.
-    Annotation coords are in the layer's voxel space, so we scale by voxel size."""
-    vx, vy, vz = (float(v) for v in voxel_size_nm)
+def parse_inline(layer: dict, voxel_size_nm, perm=(0, 1, 2)) -> dict:
+    """Normalized primitive dict (nm, xyz) from a state layer's inline `annotations`.
+    Annotation coords are in the NG dimension order/units, so `voxel_size_nm` is the
+    per-dimension scale (from the NG state, not the manifest) and `perm` reorders a
+    dimension-ordered vector to (x, y, z) — same convention as the camera path."""
+    vox = [float(v) for v in voxel_size_nm]
 
     def to_nm(p):
-        return [float(p[0]) * vx, float(p[1]) * vy, float(p[2]) * vz]
+        scaled = [float(p[i]) * vox[i] for i in range(3)]   # NG dimension order
+        return [scaled[perm[0]], scaled[perm[1]], scaled[perm[2]]]  # -> x, y, z
+
+    def radii_nm(r):
+        scaled = [abs(float(r[i])) * vox[i] for i in range(3)]
+        return [scaled[perm[0]], scaled[perm[1]], scaled[perm[2]]]
 
     out: dict = {"points": [], "lines": [], "boxes": [], "ellipsoids": []}
     for a in layer.get("annotations") or []:
@@ -105,8 +112,7 @@ def parse_inline(layer: dict, voxel_size_nm) -> dict:
         elif t == "ellipsoid" and a.get("center") and a.get("radii"):
             out["ellipsoids"].append({
                 "center": to_nm(a["center"]),
-                "radii": [abs(float(a["radii"][0])) * vx, abs(float(a["radii"][1])) * vy,
-                          abs(float(a["radii"][2])) * vz],
+                "radii": radii_nm(a["radii"]),
             })
     return out
 

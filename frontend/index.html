@@ -20,8 +20,12 @@
   .grow { flex:1; }
   main { flex:1; display:flex; min-height:0; }
   .col { display:flex; flex-direction:column; min-width:0; }
-  .left { flex:2; border-right:1px solid var(--line); }
+  .left { flex:2; }
   .right { flex:1.1; }
+  .resizer { flex:0 0 6px; cursor:col-resize; background:var(--line); transition:background .1s; }
+  .resizer:hover, body.resizing .resizer { background:#5a5fcf; }
+  body.resizing { cursor:col-resize; user-select:none; }
+  body.resizing iframe { pointer-events:none; }   /* let drag cross the NG iframe */
   .chatcol { flex:1.1; border-left:1px solid var(--line); }
   #chat { flex:1; overflow:auto; padding:10px; display:flex; flex-direction:column; gap:8px; }
   .bubble { padding:7px 10px; border-radius:8px; font-size:12.5px; max-width:92%; white-space:pre-wrap; line-height:1.4; }
@@ -42,22 +46,78 @@
   #preview img, #preview video { max-width:100%; max-height:100%; }
   .controls { padding:8px 10px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; border-top:1px solid var(--line); }
   .controls label { font-size:12px; color:var(--mut); }
-  .controls input { width:64px; }
+  .controls input:not([type=checkbox]) { width:64px; }
+  .controls input[type=checkbox] { width:auto; margin:0 2px 0 0; vertical-align:middle; }
+  .controls label.chk { color:var(--fg); }  /* toggle labels read as active controls */
   #bar { height:6px; background:#222734; border-radius:3px; overflow:hidden; }
   #barFill { height:100%; width:0%; background:var(--accent); transition:width .2s; }
   footer { height:200px; border-top:1px solid var(--line); background:#12151c; display:flex; flex-direction:column; }
-  #timeline { flex:1; display:flex; gap:8px; padding:10px; overflow-x:auto; }
-  .kf { flex:0 0 150px; height:150px; border:1px solid var(--line); border-radius:6px; background:linear-gradient(#1b2430,#10161e); position:relative; padding:6px; font-size:11px; cursor:pointer; }
-  .kf:hover { border-color:#5a6473; }
-  .kf.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
-  .kf.drop { border-color:#5aff7a; box-shadow:-3px 0 0 #5aff7a; }
-  .kf .lbl { cursor:grab; }
-  .kf.hasthumb .lbl, .kf.hasthumb .meta { text-shadow:0 1px 3px #000, 0 0 2px #000; }
-  .kf.hasthumb .lbl { background:linear-gradient(#000a,#0000); margin:-6px -6px 0; padding:4px 6px; border-radius:6px 6px 0 0; }
-  .kf .lbl { font-weight:600; }
-  .kf .meta { color:var(--mut); position:absolute; bottom:6px; left:6px; right:6px; }
-  .kf .del { position:absolute; top:4px; right:6px; color:var(--mut); cursor:pointer; }
+  /* timeline: a left track-header gutter (Frames / Moves / Sweeps) + a horizontally
+     scrolling lane area. Keyframe markers (instants) sit over transition bars (the
+     moves); the sweep lane runs underneath — all on one shared time scale. Thin
+     separators divide the three bands. */
+  #tlWrap { position:relative; display:flex; align-items:stretch; }
+  #tlGutter { flex:0 0 60px; position:relative; border-right:1px solid var(--line); }
+  #tlGutter .trk { position:absolute; right:7px; left:0; text-align:right; font-size:9px;
+                   font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:#7a8194; }
+  #tlGutter .trk.frames { top:32px; color:#aab3c4; }   /* aligns with kfmark band (8–68) */
+  #tlGutter .trk.moves  { top:74px; color:#9aa0c8; }   /* aligns with transition band (72–90) */
+  #tlGutter .trk.sweeps { top:101px; color:#8a8fff; }  /* aligns with the sweep lane below */
+  .tlsep { position:absolute; left:60px; right:0; height:1px; background:var(--line); pointer-events:none; z-index:0; }
+  #tlScroll { flex:1; overflow-x:auto; overflow-y:hidden; padding:8px 8px 10px; }
+  #timeline { position:relative; height:86px; min-width:100%; }
+  .kfmark { position:absolute; top:0; width:92px; height:60px; border:1px solid var(--line); border-radius:6px; background:linear-gradient(#1b2430,#10161e); background-size:cover; background-position:center; font-size:11px; cursor:pointer; overflow:hidden; z-index:2; }
+  .kfmark:hover { border-color:#5a6473; }
+  .kfmark.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); z-index:4; }
+  .kfmark.drop { border-color:#5aff7a; box-shadow:-3px 0 0 #5aff7a; }
+  .kfmark .lbl { font-weight:600; cursor:grab; padding:2px 5px; background:linear-gradient(#000a,#0000); text-shadow:0 1px 2px #000; border-radius:6px 6px 0 0; }
+  .kfmark .kftools { position:absolute; top:2px; right:3px; display:flex; gap:2px; opacity:0; transition:opacity .1s; }
+  .kfmark:hover .kftools, .kfmark.active .kftools { opacity:1; }
+  .kfmark .kfbtn { width:18px; height:18px; padding:0; border:0; border-radius:4px; background:#0009; color:#fff; font-size:11px; line-height:18px; text-align:center; text-shadow:0 1px 2px #000; }
+  .kfmark .kfbtn:hover { background:#2d3545; }
+  .kfmark .kfbtn.on { background:var(--accent); }
+  .kfmark .kfbtn.danger:hover { background:#7d2e2e; }
+  .kfmark .del { position:absolute; top:2px; right:5px; color:#fff; opacity:.7; cursor:pointer; text-shadow:0 1px 2px #000; }
+  .kfmark .del:hover { opacity:1; }
+  .tltrans { position:absolute; top:64px; height:18px; background:linear-gradient(90deg,#3a4358,#566184); border-radius:4px; display:flex; align-items:center; padding:0 5px; cursor:pointer; overflow:hidden; z-index:1; }
+  .tltrans.hold { background:repeating-linear-gradient(45deg,#262b36,#262b36 5px,#323847 5px,#323847 10px); }
+  .tltrans.cut { background:#4c5667; }
+  .tltrans.fade { background:linear-gradient(90deg,#566184,#090b10 50%,#566184); }
+  .tltrans.layercut { box-shadow:inset 0 -3px 0 #ffbf4d; }
+  .tltrans .trlbl { font-size:10px; color:#cdd3ff; white-space:nowrap; text-shadow:0 1px 2px #000; }
+  .tltrans .trgrip { position:absolute; right:0; top:0; width:7px; height:100%; cursor:ew-resize; background:rgba(255,255,255,.28); }
+  .tltrans .trgrip:hover { background:#8a8fff; }
+  #sweepLane { position:relative; }
+  #sweepLane:not(:empty) { min-height:30px; }
+  #sweepLane:empty::after { content:'no plane sweeps — add an Orbit or Plane scan below'; position:absolute; top:6px; left:0; font-size:10px; color:#5a6473; font-style:italic; }
+  #sweepLane:empty { min-height:24px; }
+  .sweepbar { position:absolute; top:6px; height:18px; background:linear-gradient(90deg,#5a5fcf,#8a8fff); border-radius:4px; display:flex; align-items:center; padding:0 6px; box-shadow:0 1px 3px #0009; overflow:hidden; cursor:grab; }
+  .sweepbar .swlbl { font-size:11px; color:#fff; white-space:nowrap; text-shadow:0 1px 2px #000, 0 0 3px #000; }
+  .sweepbar .del { margin-left:auto; color:#fff; opacity:.7; cursor:pointer; padding-left:6px; }
+  .sweepbar .del:hover { opacity:1; }
+  .sweepbar.slicebar { background:linear-gradient(90deg,#2f8f8f,#46c2c2); }   /* EM slice = teal */
+  .sweepbar.disabled { opacity:.45; filter:grayscale(.85); outline:1px dashed #c8cfdd; }
+  .sweepbar.dragging { opacity:.85; box-shadow:0 0 0 1px #fff, 0 2px 8px #000; }
+  .sweepbar .grip { position:absolute; right:0; top:0; width:8px; height:100%; cursor:ew-resize; background:rgba(255,255,255,.25); }
+  .sweepbar .grip:hover { background:#fff; }
+  .swsnap { position:absolute; top:4px; height:22px; width:2px; background:#8a8fff; pointer-events:none; box-shadow:0 0 4px #8a8fff; }
+  #swHover .swhovcap { font-size:10px; color:#aab0ff; margin-bottom:4px; }
+  /* click-to-edit popover for a transition (duration + easing) */
+  #transEdit { position:fixed; z-index:80; display:none; width:228px; background:#1a1d22;
+               border:1px solid #3a3f47; border-radius:8px; padding:10px 12px; font-size:12px;
+               box-shadow:0 6px 24px rgba(0,0,0,.55); }
+  #transEdit .te-hd { display:flex; justify-content:space-between; align-items:center; font-weight:600; margin-bottom:8px; }
+  #transEdit .te-x { cursor:pointer; opacity:.7; }
+  #transEdit .te-x:hover { opacity:1; }
+  #transEdit label { display:flex; align-items:center; gap:6px; margin:6px 0; color:var(--mut); }
+  #transEdit input, #transEdit select { background:#11151f; border:1px solid var(--line); color:#cdd3ff; border-radius:4px; padding:2px 4px; }
+  #transEdit input { width:58px; }
+  #transEdit select { flex:1; }
+  #transEdit .te-row { display:flex; gap:6px; justify-content:flex-end; margin-top:9px; }
+  #transEdit .te-hint { color:var(--mut); font-size:10px; margin-top:7px; }
   .msg { font-size:12px; color:var(--mut); }
+  /* hover the before/after strip -> big side-by-side overlay (see #lookZoom) */
+  #lookCompare { cursor: zoom-in; }
 </style>
 </head>
 <body>
@@ -78,25 +138,45 @@
 <main>
   <div class="col left">
     <div class="pane-title">◆ Neuroglancer — scouting
-      <button class="accent" onclick="bake()">★ Bake keyframe</button>
+      <button class="accent" onclick="bake()" title="Capture the current Neuroglancer view as a keyframe — a saved pose in the movie (camera + layers + segments). The movie is built by rendering/interpolating between keyframes. You need at least one keyframe before you can scan or render.">★ Bake keyframe</button>
       <button onclick="updateFrame()" title="overwrite the selected keyframe with the current Neuroglancer view (camera + layers + segments)">⟳ Update current frame</button>
-      <button onclick="addKeyframe()">+ Duplicate last</button>
+      <button onclick="duplicateCurrentKeyframe()" title="duplicate the selected keyframe after itself">⧉ Duplicate selected</button>
       <button onclick="document.getElementById('statesFile').click()" title="upload a list of neuroglancer states (one link per line, or a CSV with a state column) — each becomes a keyframe">⭱ Import states</button>
       <input type="file" id="statesFile" accept=".csv,.txt,text/csv,text/plain" style="display:none" onchange="importStates(event)" />
     </div>
     <div id="ngWrap"><iframe id="ng"></iframe></div>
   </div>
+  <div class="resizer" id="resizeLR" onmousedown="startResize(event)" title="drag to resize scouting ↔ preview"></div>
   <div class="col right">
     <div class="pane-title">⬡ Render preview</div>
     <div id="preview"><span class="msg">render output appears here</span></div>
     <div class="controls">
-      <button onclick="orbit()">Orbit 360°</button>
-      <button onclick="sweep()">Sweep z-slice</button>
-      <label>w</label><input id="w" value="1280" />
-      <label>h</label><input id="h" value="720" />
-      <label>fps</label><input id="fps" value="30" />
-      <label>samples</label><input id="samples" value="48" />
-      <label title="mesh detail multiplier (1 = default ~5M verts/layer). Higher = crisper but more GPU memory; auto-retries lower if it runs out.">detail</label><input id="detail" value="1" style="width:44px" />
+      <label title="output width in pixels">w</label><input id="w" value="1280" />
+      <label title="output height in pixels">h</label><input id="h" value="720" />
+      <label title="Frames per second of the output video (motion smoothness). Total frames rendered = total duration (sum of keyframe durations) × fps.">fps</label><input id="fps" value="30" />
+      <label title="Cycles render samples per pixel: higher = less grain/noise but slower to render. ~16–32 for previews, 48+ for final.">samples</label><input id="samples" value="48" />
+      <label class="chk" title="Fast mode: 32 samples + aggressive adaptive sampling (noise threshold 0.06) and let the AI denoiser (OpenImageDenoise) clean the rest. ~2x faster frames at near-identical quality. Overrides the samples box."><input id="fastSample" type="checkbox" checked /> ⚡ fast</label>
+      <label title="Render engine. Cycles = photoreal path tracing (true transparency/AO/soft shadows) but slow — seconds–minutes per frame. Eevee = real-time rasterizer, ~10–50× faster per frame; shadows/transparency are approximate. Use Eevee for fast previews and movie drafts, Cycles for finals.">engine
+        <select id="engine">
+          <option value="CYCLES" selected>Cycles (photoreal)</option>
+          <option value="BLENDER_EEVEE_NEXT">Eevee (⚡ fast)</option>
+        </select></label>
+      <label title="Mesh quality = the per-layer vertex budget. Higher = crisper but more GPU memory (auto-retries lower if it runs out).">quality
+        <select id="detail">
+          <option value="1" selected>basic (~5M/layer)</option>
+          <option value="2">high (~10M/layer)</option>
+          <option value="3">max (~15M/layer)</option>
+        </select></label>
+      <label class="chk" title="Director: a non-destructive presentation pass that enhances the look WITHOUT changing your neuroglancer data — camera-relative key/fill/rim lighting, publication-quality materials, and subtle depth-of-field on the framed subject. Uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
+      <label class="chk" title="Draw a thin wireframe box around each data source's extent (the EM volume and/or each rendered layer's label volume), like neuroglancer's bounding box. Falls back to a tight box around the rendered meshes when a layer has no volume source."><input id="showBbox" type="checkbox" /> bbox</label>
+      <input id="bboxColor" type="color" value="#9ea8bd" title="bounding-box wireframe color" style="width:24px;height:20px;padding:0;border:1px solid var(--line);background:none;cursor:pointer" />
+      <select id="bboxSource" title="Which layer the bounding box is drawn from (its data/mesh extent) — works even if that layer is hidden. Auto = the EM volume, or all visible meshes." style="max-width:120px"><option value="">bbox: auto</option></select>
+      <label title="Mesh level-of-detail strategy (how fine the meshes are): Single = one resolution for the whole shot (used automatically when cutting away). Per-frame = coarser when a layer is far/small, finer on close-ups, like neuroglancer (free on orbits). Per-chunk = different detail within one mesh by on-screen size (experimental).">lod
+        <select id="lodMode">
+          <option value="frame" selected>per-frame</option>
+          <option value="single">single</option>
+          <option value="chunk">per-chunk (exp)</option>
+        </select></label>
       <button id="previewBtn" onclick="startRender('preview')">▷ Preview</button>
       <label title="preview renders at fps ÷ this">1/</label><input id="ratio" value="10" style="width:44px" />
       <button id="cancelBtn" onclick="cancelRender()" style="display:none;background:#7d2e2e;border-color:transparent;color:#fff">■ Cancel</button>
@@ -126,14 +206,240 @@
 <footer>
   <div class="pane-title">Keyframe timeline — <span id="kfCount" class="msg">0 frames</span>
     <span class="grow"></span>
-    <label class="msg" title="3D mesh opacity for the selected frame; lower it to reveal the EM slice + its segmentation">3D meshes</label>
+    <button onclick="openOrbitPanel()" title="Add an orbit move: the camera circles the current target. Choose the rotation axis, sweep degrees, duration, elevation, and sample count.">↻ Orbit</button>
+    <button onclick="openPlanePanel()" title="Add a plane move: an EM slice sweep or a cutaway, as an independent clip on the timeline (start→stop over a duration).">▤ Plane scan</button>
+    <span style="width:12px"></span>
+    <label class="msg" title="Opacity of the 3D meshes on the SELECTED keyframe. Slide down to fade the meshes and reveal the EM cross-section behind them (0 = meshes hidden, only the EM slice shows).">3D mesh opacity</label>
     <input id="meshOp" type="range" min="0" max="1" step="0.05" value="1" style="width:90px"
-      onchange="setMeshOpacity()" title="3D mesh opacity (0 = show only the segmented EM slice)" />
+      onchange="setMeshOpacity()" title="Opacity of the 3D meshes on the selected keyframe (0 = hidden, reveals the EM slice; 1 = solid)." />
+    <button id="autoThumbBtn" onclick="toggleAutoThumbs()" title="Render a still thumbnail for every keyframe, one by one, so the timeline strip below fills in with previews. Thumbnails only — this is not the video (use Export for that).">⟳ Render all</button>
+    <button onclick="openLookPanel()" title="Open the Look panel: try render styles (glow, roughness, material presets, tone-mapping) and preview them on the selected keyframe — non-destructive, doesn't change your data.">✨ Look</button>
+    <button onclick="openPropPanel()" title="edit a layer setting on the selected keyframe and propagate it to later/earlier keyframes">✎ Propagate edit</button>
     <button id="exportBtn" class="primary" onclick="startRender('export')">⬇ Export video</button>
     <button id="blendBtn" onclick="startRender('blend')" title="bake the whole shot to a self-contained animated .blend (camera, meshes, EM slices; textures packed in)">⬇ Export .blend</button>
   </div>
-  <div id="timeline"></div>
+  <div id="tlWrap">
+    <div id="tlGutter">
+      <div class="trk frames" title="Keyframes — the poses (instants). Drag to reorder.">▣ Frames</div>
+      <div class="trk moves" title="Transitions — the camera moves between keyframes; each takes time. Drag a bar's right edge to change its length.">▶ Moves</div>
+      <div class="trk sweeps" title="Plane sweeps — cutaways / EM slices on their own clips. Drag to move, drag the right edge to resize, click to edit.">▤ Sweeps</div>
+    </div>
+    <div class="tlsep" style="top:70px"></div>
+    <div class="tlsep" style="top:92px"></div>
+    <div id="tlScroll">
+      <div id="timeline"></div>
+      <div id="sweepLane"></div>
+    </div>
+  </div>
 </footer>
+
+<div id="propPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #3a3f47;border-radius:8px;padding:12px 14px;width:330px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.9">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <b>✎ Propagate layer edit</b>
+    <span onclick="$('propPanel').style.display='none'" style="cursor:pointer;opacity:.7">✕</span>
+  </div>
+  <div class="msg" style="margin:2px 0 4px;color:#8a93a6">Set a layer property here (incl. CineMap-only <b>metallic / roughness</b>, which neuroglancer doesn't have) and push it to other keyframes. For things you changed <i>in neuroglancer</i>, use “Update current frame” instead — it detects them and offers to propagate.</div>
+  <div class="msg" id="propKf" style="margin:2px 0 6px"></div>
+  <label class="msg">Layer</label><select id="propLayer" onchange="propLayerChanged()" style="width:100%"></select>
+  <label class="msg">Field</label>
+  <select id="propField" onchange="propFieldChanged()" style="width:100%">
+    <option value="segment_color">segment color</option>
+    <option value="default_color">default color (all segments)</option>
+    <option value="object_alpha">opacity (3d)</option>
+    <option value="silhouette">silhouette (3d)</option>
+    <option value="saturation">saturation</option>
+    <option value="metallic">metallic (reflective)</option>
+    <option value="roughness">roughness</option>
+    <option value="color_seed">color seed</option>
+    <option value="visible">visible</option>
+  </select>
+  <div id="propSegWrap"><label class="msg">Segment</label><select id="propSeg" style="width:100%"></select></div>
+  <label class="msg">New value</label> <span id="propValInput"></span>
+  <label class="msg">Apply to</label>
+  <select id="propDir" style="width:100%">
+    <option value="right">this + later →</option>
+    <option value="left">this + earlier ←</option>
+    <option value="all">all keyframes</option>
+    <option value="this">this keyframe only</option>
+  </select>
+  <label class="msg" title="only change keyframes whose value currently matches this one (find &amp; replace) — won't clobber deliberate changes"><input type="checkbox" id="propMatch" checked /> replace only where it currently matches</label>
+  <div style="margin-top:8px"><button class="primary" onclick="applyPropagate()">Apply</button> <span id="propMsg" class="msg"></span></div>
+</div>
+
+<div id="lookPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #6a5acd;border-radius:8px;padding:12px 14px;width:320px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.9">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <b>✨ Look / glow</b><span onclick="$('lookPanel').style.display='none'" style="cursor:pointer;opacity:.7">✕</span>
+  </div>
+  <label class="msg">Preset</label>
+  <select id="lookPreset" onchange="lookPresetChanged()" style="width:100%">
+    <option value="neuvid">neuVid — glossy 3-point (default)</option>
+    <option value="ng">neuroglancer — flat headlight</option>
+    <option value="rake">raking — matte directional</option>
+    <option value="drama">drama — deep shadows</option>
+  </select>
+  <label class="msg">Material</label>
+  <select id="lookMat" onchange="lookMatChanged()" style="width:100%">
+    <option value="glossy">glossy (default)</option>
+    <option value="matte">matte / clay</option>
+    <option value="plastic">plastic</option>
+    <option value="metallic">metallic</option>
+    <option value="chrome">chrome / mirror</option>
+    <option value="ceramic">ceramic (clearcoat)</option>
+    <option value="waxy">waxy / velvet (sheen)</option>
+    <option value="subsurface">subsurface / jade</option>
+    <option value="glassy">glass (clear)</option>
+    <option value="frosted">frosted glass</option>
+    <option value="glow">glow / emissive</option>
+  </select>
+  <label class="msg">Glow <span id="glowVal" class="msg"></span></label>
+  <input type="range" id="lookGlow" min="0" max="0.6" step="0.01" style="width:100%" oninput="$('glowVal').textContent=(+this.value).toFixed(2)">
+  <label class="msg">Roughness <span id="roughVal" class="msg"></span></label>
+  <input type="range" id="lookRough" min="0" max="1" step="0.05" style="width:100%" oninput="$('roughVal').textContent=(+this.value).toFixed(2)">
+  <label class="msg">Specular <span id="specVal" class="msg"></span></label>
+  <input type="range" id="lookSpec" min="0" max="1" step="0.05" style="width:100%" oninput="$('specVal').textContent=(+this.value).toFixed(2)">
+  <div style="margin-top:8px"><button class="primary" onclick="applyLook()">Apply &amp; preview</button>
+    <button id="lookUndoBtn" onclick="undoLook()" style="display:none">↩ Undo</button>
+    <span id="lookMsg" class="msg"></span></div>
+  <div class="msg" style="margin-top:2px">applies to all renders; previews on the selected keyframe</div>
+  <div id="lookCompare" style="display:none;margin-top:8px" onmouseenter="showLookZoom()" onmouseleave="hideLookZoom()" title="hover to enlarge both">
+    <div style="display:flex;gap:6px">
+      <div style="flex:1"><div class="msg" style="text-align:center">before</div><img id="lookBefore" style="width:100%;border-radius:4px;background:#000"></div>
+      <div style="flex:1"><div class="msg" style="text-align:center">after</div><img id="lookAfter" style="width:100%;border-radius:4px;background:#000"></div>
+    </div>
+  </div>
+</div>
+
+<div id="planePanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #3a8f6a;border-radius:8px;padding:12px 14px;width:320px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.9">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <b>▤ Plane scan</b><span onclick="$('planePanel').style.display='none'" style="cursor:pointer;opacity:.7">✕</span>
+  </div>
+  <div class="msg" style="margin:2px 0 6px">Fixed camera; scan a plane start→stop.</div>
+  <label class="msg">Plane shows</label>
+  <select id="planeMode" onchange="planeModeChanged()" style="width:100%">
+    <option value="slice">layer cross-section (EM or seg)</option>
+    <option value="cull">cutaway — cut a layer</option>
+    <option value="both">both</option>
+  </select>
+  <div id="planeSliceWrap">
+    <label class="msg" title="Which layer to show on the slice plane — an EM/image volume (grayscale) or a segmentation layer (its labels in color). No longer assumes a layer called 'em'/'raw'.">Slice layer</label>
+    <select id="planeSliceLayer" style="width:100%"></select>
+  </div>
+  <label class="msg">Axis</label>
+  <select id="planeAxis" style="width:100%" onchange="updateSideLabels()">
+    <option value="z">z</option><option value="y">y</option><option value="x">x</option>
+  </select>
+  <div class="msg" id="planeAxisHint" style="margin-top:-2px">which way the plane faces. Ignored if you give a full x,y,z in both boxes below (oblique).</div>
+  <div id="planeCull" style="display:none">
+    <label class="msg">Cut layer</label>
+    <select id="planeLayer" style="width:100%"></select>
+    <label class="msg" title="Which side of the plane is sliced OFF (made hollow + capped). The other side stays solid. As the plane sweeps, more of the cut side is removed, revealing the interior.">What gets cut away</label>
+    <select id="planeSide" style="width:100%">
+      <option value="1">cut the +axis side (keep −)</option>
+      <option value="-1">cut the −axis side (keep +)</option>
+    </select>
+    <label class="chk" title="Fill the cut face as a solid cross-section. Uncheck for a faster open cut with no cap."><input id="planeCap" type="checkbox" checked> solid cap</label>
+  </div>
+  <label class="msg">From → To &nbsp;<span class="msg">(neuroglancer coords; blank = auto)</span></label>
+  <div style="display:flex;gap:6px">
+    <input id="planeFrom" placeholder="auto" oninput="updateSideLabels()" style="width:50%" title="paste exactly as neuroglancer shows it (its units + order). One value = depth along the axis; a full x,y,z = a point">
+    <input id="planeTo" placeholder="auto" oninput="updateSideLabels()" style="width:50%" title="paste exactly as neuroglancer shows it (its units + order). One value = depth along the axis; a full x,y,z = a point">
+  </div>
+  <label class="msg" title="How long the scan/cutaway takes on screen. Frames are filled in automatically from this and the fps — you set time, not frame count.">Duration (s)</label>
+  <input id="planeDur" type="number" min="0.1" step="0.1" value="4" style="width:100%">
+  <label class="msg" title="Global movie time where this plane clip starts. Defaults to the selected keyframe; drag clips in the sweep lane to snap them to keyframe moments.">Start (s)</label>
+  <input id="planeStart" type="number" min="0" step="0.1" value="0" style="width:100%">
+  <label class="chk" title="Ping-pong: sweep from start to end, then back — e.g. cut in to reveal, then close back up. Same duration."><input id="planeMirror" type="checkbox"> mirror (forward + back)</label>
+  <div style="margin-top:8px"><button class="primary" onclick="applyPlaneScan()"><span id="planeAddLbl">Add scan</span></button>
+    <button onclick="previewPlaneScan()" title="render preview stills of this cut/slice WITHOUT adding it yet">👁 Preview</button>
+    <span id="planeMsg" class="msg"></span></div>
+  <div id="planeSnaps" style="display:flex;gap:4px;margin-top:6px"></div>
+  <div class="msg" style="margin-top:2px">Tip: copy a position straight from neuroglancer. A single value scans along the axis; a full <b>x,y,z</b> in <i>both</i> boxes = an <b>oblique</b> scan along that line (axis ignored). Converted to nm via this view's grid.</div>
+</div>
+
+<div id="orbitPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #5a5fcf;border-radius:8px;padding:12px 14px;width:300px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.9">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <b>↻ Orbit</b><span onclick="$('orbitPanel').style.display='none'" style="cursor:pointer;opacity:.7">✕</span>
+  </div>
+  <div class="msg" style="margin:2px 0 6px">Circle the camera around the current target (fixed scene).</div>
+  <label class="msg" title="The orbit pole — the camera circles in the plane perpendicular to this axis.">Rotate around (axis)</label>
+  <select id="orbitAxis" style="width:100%">
+    <option value="z">z — circle in the XY plane (default)</option>
+    <option value="y">y — circle in the XZ plane</option>
+    <option value="x">x — circle in the YZ plane</option>
+  </select>
+  <label class="msg">Sweep (degrees)</label>
+  <input id="orbitDeg" type="number" min="1" step="5" value="360" style="width:100%">
+  <label class="msg" title="How long the whole orbit takes on screen.">Duration (s)</label>
+  <input id="orbitDur" type="number" min="0.1" step="0.5" value="8" style="width:100%">
+  <label class="msg" title="Camera tilt above/below the orbit plane.">Elevation (deg)</label>
+  <input id="orbitElev" type="number" step="1" value="22" style="width:100%">
+  <label class="msg" title="How many camera keyframes sample the arc — more = smoother for big sweeps (they share the duration).">Samples</label>
+  <input id="orbitN" type="number" min="2" step="1" value="12" style="width:100%">
+  <div style="margin-top:8px"><button class="primary" onclick="applyOrbit()">Add orbit</button>
+    <span id="orbitMsg" class="msg"></span></div>
+</div>
+
+<div id="sweepPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #5a5fcf;border-radius:8px;padding:12px 14px;width:300px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.9">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <b>▤ Edit cutaway sweep</b><span onclick="$('sweepPanel').style.display='none'" style="cursor:pointer;opacity:.7">✕</span>
+  </div>
+  <div class="msg" id="sweepWhich" style="margin:2px 0 6px"></div>
+  <label class="msg">Start (s)</label>
+  <input id="swStart" type="number" min="0" step="0.1" style="width:100%">
+  <label class="msg">Duration (s)</label>
+  <input id="swDur" type="number" min="0.1" step="0.1" style="width:100%">
+  <div id="swSideRow">
+    <label class="msg" title="which side of the plane is cut away (the other stays solid)">What gets cut away</label>
+    <select id="swSide" style="width:100%"><option value="1">+ side</option><option value="-1">− side</option></select>
+  </div>
+  <label class="msg">Easing</label>
+  <select id="swEase" style="width:100%">
+    <option value="linear">linear (constant speed)</option>
+    <option value="ease-in-out">ease in-out (smooth start/stop)</option>
+    <option value="ease-in">ease in</option><option value="ease-out">ease out</option>
+  </select>
+  <label class="chk" title="ping-pong: sweep forward then back, ending where it started"><input id="swMirror" type="checkbox"> mirror (forward + back)</label>
+  <label class="msg" id="swRangeLbl" title="Where the cutting plane starts and ends. For an oblique cut these are offsets measured ALONG the cut direction (not x/y/z corners), so they look different from what you typed in.">Cut range (start → end)</label>
+  <div style="display:flex;gap:6px;align-items:center">
+    <input id="swFrom" type="number" step="1" style="width:42%"><input id="swTo" type="number" step="1" style="width:42%">
+    <button onclick="const a=$('swFrom'),b=$('swTo');[a.value,b.value]=[b.value,a.value]" title="reverse the sweep direction (swap start and end)">⇄</button>
+  </div>
+  <label class="chk" title="Disabled sweeps stay on the timeline but are ignored by preview and full renders."><input id="swEnabled" type="checkbox"> enabled in render</label>
+  <label id="swCapRow" class="chk" title="Fill the cut face as a solid cross-section. Uncheck for a faster open cut with no cap."><input id="swCap" type="checkbox"> solid cap</label>
+  <div style="margin-top:8px"><button class="primary" onclick="saveSweepEdit()">Save</button>
+    <button onclick="delSweep(EDIT_SWEEP_ID); $('sweepPanel').style.display='none'">Delete</button>
+    <span id="swMsg" class="msg"></span></div>
+  <div style="margin-top:8px"><button onclick="renderSweepSnapshots()" title="render small start / middle / end stills so the clip shows a preview on the timeline">📷 Preview frames</button></div>
+  <div id="swSnaps" style="display:flex;gap:4px;margin-top:6px"></div>
+</div>
+
+<div id="swHover" style="display:none;position:fixed;z-index:90;background:#11151fee;border:1px solid #5a5fcf;border-radius:6px;padding:6px;box-shadow:0 6px 20px rgba(0,0,0,.6)"></div>
+
+<div id="lookZoom" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.82);align-items:center;justify-content:center;gap:18px;pointer-events:none">
+  <div style="text-align:center"><div style="color:#bbb;margin-bottom:6px;font-size:14px">before</div><img id="zoomBefore" style="max-width:45vw;max-height:82vh;border-radius:6px;background:#000"></div>
+  <div style="text-align:center"><div style="color:#bbb;margin-bottom:6px;font-size:14px">after</div><img id="zoomAfter" style="max-width:45vw;max-height:82vh;border-radius:6px;background:#000"></div>
+</div>
+
+<div id="ngPropPanel" style="display:none;position:fixed;right:16px;bottom:86px;z-index:60;background:#1a1d22;border:1px solid #3a8f5a;border-radius:8px;padding:12px 14px;width:360px;box-shadow:0 6px 24px rgba(0,0,0,.55);font-size:13px;line-height:1.7">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <b>You changed settings in neuroglancer</b>
+    <span onclick="$('ngPropPanel').style.display='none'" style="cursor:pointer;opacity:.7">✕</span>
+  </div>
+  <div class="msg" style="margin:2px 0">These are edits captured from the neuroglancer view. Propagate to other keyframes? (replaces only where they currently match the old value.) For material (metallic/roughness), use ✎ Propagate edit.</div>
+  <div id="ngChangeList" style="max-height:140px;overflow:auto;margin:6px 0;padding:6px;background:#0e1013;border-radius:6px"></div>
+  <label class="msg">Apply to</label>
+  <select id="ngPropDir" style="width:100%">
+    <option value="right">this + later →</option>
+    <option value="left">this + earlier ←</option>
+    <option value="all">all keyframes</option>
+  </select>
+  <label class="msg" title="checked: only change keyframes whose value currently matches the old one (preserves keyframes you set differently). unchecked: force the new value into every keyframe in range."><input type="checkbox" id="ngPropMatch" checked /> replace only where it matches (uncheck = overwrite all)</label>
+  <div style="margin-top:8px">
+    <button class="primary" onclick="applyNgPropagate()">Propagate</button>
+    <button onclick="$('ngPropPanel').style.display='none'">Skip</button>
+    <span id="ngPropMsg" class="msg"></span>
+  </div>
+</div>
 
 <script>
 let PID = null;
@@ -144,6 +450,10 @@ const api = async (m, url, body) => {
   return r.headers.get('content-type')?.includes('json') ? r.json() : r;
 };
 const setStatus = (s) => $('status').textContent = s;
+function clearFrameSelection() {
+  ACTIVE_KF = null;
+  KF_CLIPBOARD_ID = null;
+}
 
 async function refreshProjects() {
   const list = await api('GET','/api/projects');
@@ -158,7 +468,8 @@ async function createProject() {
   try {
     const p = await api('POST','/api/projects', { name: $('name').value || 'untitled', data_path: $('dataPath').value });
     PID = p.id; await refreshProjects(); $('projectSel').value = PID;
-    await loadNg(); renderKeyframes(p); setStatus('project ready: ' + p.manifest.title);
+    clearFrameSelection();
+    applyRenderPrefs(p); await loadNg(); renderKeyframes(p); setStatus('project ready: ' + p.manifest.title);
   } catch (e) { setStatus('error: ' + e.message); }
 }
 
@@ -175,8 +486,11 @@ async function importProject(e) {
     const data = JSON.parse(await file.text());
     const p = await api('POST', '/api/projects/import', data);
     PID = p.id; await refreshProjects(); $('projectSel').value = PID;
-    await loadNg(); renderKeyframes(p);
-    setStatus('imported: ' + (p.name || p.id));
+    clearFrameSelection();
+    applyRenderPrefs(p); await loadNg(); renderKeyframes(p);
+    // NOTE: don't auto-bake on import — it kicks off a long render the user didn't ask for
+    // (and is awkward to stop). They hit ⟳ Render all when ready.
+    setStatus('imported: ' + (p.name || p.id) + ' — hit ⟳ Render all to bake thumbnails/previews');
   } catch (err) { setStatus('import failed: ' + err.message); }
   e.target.value = '';
 }
@@ -192,14 +506,15 @@ async function importStates(e) {
       // no project open -> create one from the first state in the script
       r = await api('POST', '/api/projects/import_states', { text, name: file.name.replace(/\.[^.]+$/, '') });
       PID = r.project.id; await refreshProjects(); $('projectSel').value = PID;
-      await loadNg(); renderKeyframes(r.project);
+      clearFrameSelection();
+      applyRenderPrefs(r.project); await loadNg(); renderKeyframes(r.project);
     } else {
       r = await api('POST', `/api/projects/${PID}/keyframes/import_states`, { text });
       await reload();
     }
     let msg = `imported ${r.count} keyframe${r.count === 1 ? '' : 's'}`;
     if (r.errors && r.errors.length) { msg += ` (${r.errors.length} skipped)`; }
-    setStatus(msg);
+    setStatus(msg + ' — hit ⟳ Render all to bake thumbnails/previews');   // no auto-bake
   } catch (err) { setStatus('import states failed: ' + err.message); }
   e.target.value = '';
 }
@@ -208,7 +523,8 @@ async function openProject(pid) {
   PID = pid; setStatus('opening…');
   await api('POST', `/api/projects/${pid}/open`);
   const p = await api('GET', `/api/projects/${pid}`);
-  await loadNg(); renderKeyframes(p); setStatus('opened ' + p.name);
+  clearFrameSelection();
+  applyRenderPrefs(p); await loadNg(); renderKeyframes(p); setStatus('opened ' + p.name);
 }
 
 async function loadNg() {
@@ -216,33 +532,341 @@ async function loadNg() {
   $('ng').src = ng_url;
 }
 
-async function reload() { renderKeyframes(await api('GET', `/api/projects/${PID}`)); }
+async function reload() {
+  TVER = Date.now();   // fresh cache-buster so any blank/stale thumbnails refetch this reload
+  const p = await api('GET', `/api/projects/${PID}`);
+  try {
+    const d = await api('GET', `/api/projects/${PID}/keyframes/diffs`);
+    KF_DIFFS = {}; (d.diffs || []).forEach(x => KF_DIFFS[x.keyframe_id] = x.changes);
+  } catch (e) { KF_DIFFS = {}; }
+  renderKeyframes(p);
+}
+let KF_DIFFS = {};
+// a small "Δn" badge per keyframe showing how many layer settings changed vs the
+// previous frame; hover lists them, click opens the propagate panel to modify.
+function diffBadge(id) {
+  const ch = KF_DIFFS[id];
+  if (!ch || !ch.length) return '';
+  const title = ('changed vs previous:\n' + ch.map(changeLabel).join('\n'))
+    .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/\n/g, '&#10;');
+  return `<span class="diffbadge" title="${title}" onclick="event.stopPropagation(); openPropForKf('${id}')"
+    style="position:absolute;bottom:4px;right:4px;background:#2a6f43;color:#fff;border-radius:4px;padding:0 5px;font-size:11px;line-height:16px;cursor:pointer;z-index:3;box-shadow:0 1px 3px rgba(0,0,0,.6)">Δ${ch.length}</span>`;
+}
+function openPropForKf(id) { ACTIVE_KF = id; openPropPanel(); }
 
-let LAST_KF_ID = null, KF_ORDER = [], THUMB_VER = {};
+let LAST_KF_ID = null, KF_ORDER = [], THUMB_VER = {}, CUR = null, EXPANDED_GROUPS = new Set();
+let KF_CLIPBOARD_ID = null;
+let TVER = 0;   // shared thumbnail cache-buster, bumped every reload so cards never get
+                // stuck on a stale/404-cached '?v=0' image (e.g. fetched before the jpg landed)
+let KF_TIME = {};   // keyframe id -> its time on the timeline (seconds), set by renderKeyframes
+function thumbBg(k) {
+  return k.thumbnail_path
+    ? `background-image:url('/api/projects/${PID}/keyframes/${k.id}/thumbnail?v=${THUMB_VER[k.id]||TVER}');background-size:cover;background-position:center;`
+    : '';
+}
+async function setKfTiming(id, fields) {
+  if (!PID) return;
+  await api('PUT', `/api/projects/${PID}/keyframes/${id}/duration`, fields);
+  reload();
+}
+// ---- two-row timeline: keyframes are instants; holds + transitions take time ----
+const TL_PX = 64, MARKER = 92;                 // px per second; keyframe thumbnail width
+let TL_XOF = (t)=>t*TL_PX + MARKER/2, TL_WIDTH = 0;   // shared time->x (set by renderKeyframes)
+let TL_BAR_X = (t)=>t*TL_PX;                   // duration bars start at the actual time edge
+const fmtS = v => (+v).toFixed(2).replace(/\.?0+$/, '');
+const durS = k => Math.max(0, +(k && k.duration_in_s) || 0);
+const holdS = k => Math.max(0, +(k && k.hold_in_s) || 0);
+const transStyle = k => (k && ['glide','cut','fade'].includes(k.transition)) ? k.transition : 'glide';
+const layerTrans = k => (k && ['fade','cut'].includes(k.layer_transition)) ? k.layer_transition : 'fade';
+const layerAt = k => Math.max(0, Math.min(1, +(k && k.layer_transition_at != null ? k.layer_transition_at : 1)));
+const transIcon = s => s === 'cut' ? '⏭' : (s === 'fade' ? '◐' : '▶');
+function keyframeTimes(kfs) {
+  const tAt = [0];
+  for (let i = 1; i < kfs.length; i++) tAt.push(tAt[i - 1] + holdS(kfs[i - 1]) + durS(kfs[i]));
+  return tAt;
+}
+function populateBboxSources(p) {
+  const sel = $('bboxSource'); if (!sel) return;
+  const cur = sel.value, m = (p && p.manifest) || {};
+  let opts = '<option value="">bbox: auto</option>';
+  if (m.em && m.em.name) opts += `<option value="${m.em.name}">bbox: ${m.em.name} (EM)</option>`;
+  (m.meshes || []).forEach(ms => { opts += `<option value="${ms.name}">bbox: ${ms.name}</option>`; });
+  sel.innerHTML = opts;
+  sel.value = cur;   // keep the current pick if it still exists
+}
 function renderKeyframes(p) {
-  const tl = $('timeline');
-  LAST_KF_ID = p.keyframes.length ? p.keyframes[p.keyframes.length - 1].id : null;
-  KF_ORDER = p.keyframes.map(k => k.id);
-  $('kfCount').textContent = `${p.keyframes.length} frames`;
-  tl.innerHTML = p.keyframes.map((k,i) => {
-    // versioned URL: stable unless this thumbnail was just re-rendered, so the
-    // browser caches it instead of re-decoding every thumbnail on every reload
-    const bg = k.thumbnail_path
-      ? `background-image:url('/api/projects/${PID}/keyframes/${k.id}/thumbnail?v=${THUMB_VER[k.id]||0}');background-size:cover;background-position:center;`
-      : '';
-    return `
-    <div class="kf${k.thumbnail_path ? ' hasthumb' : ''}" draggable="true" data-id="${k.id}" style="${bg}"
-         title="click to view · drag to reorder"
-         onclick="gotoKf('${k.id}', this)"
-         ondragstart="kfDragStart(event,'${k.id}')"
-         ondragover="kfDragOver(event, this)"
-         ondragleave="this.classList.remove('drop')"
-         ondrop="kfDrop(event,'${k.id}')">
-      <span class="del" onclick="event.stopPropagation(); delKf('${k.id}')">✕</span>
-      <div class="lbl">⠿ KF${i} · ${k.label||''}</div>
-      <div class="meta">${k.slices.map(s=>s.axis+'='+Math.round(s.position_nm)).join(' ')}<br>
-        ${k.meshes.map(m=>m.mesh_name).join(',')||'—'}</div>
-    </div>`; }).join('') || '<span class="msg" style="padding:10px">no keyframes yet — Bake one from the scouting view</span>';
+  CUR = p; const tl = $('timeline'); const kfs = p.keyframes;
+  populateBboxSources(p);
+  LAST_KF_ID = kfs.length ? kfs[kfs.length-1].id : null;
+  KF_ORDER = kfs.map(k => k.id);
+  if (!kfs.length) {
+    tl.style.width=''; tl.innerHTML='<span class="msg" style="padding:10px">no keyframes yet — Bake one from the scouting view</span>';
+    $('kfCount').textContent='0 keyframes'; renderSweeps(p); return;
+  }
+  // cumulative arrival time of each keyframe: previous hold, then transition into this one.
+  const tAt = keyframeTimes(kfs);
+  KF_TIME = {}; kfs.forEach((k,i)=>{ KF_TIME[k.id]=tAt[i]; });   // id -> timeline time (s)
+  const T = tAt[kfs.length-1] + holdS(kfs[kfs.length-1]);
+  const swEnd = Math.max(0, ...(p.sweeps||[]).map(s=>s.start_s+s.duration_s));
+  const Tm = Math.max(T, swEnd, 0.1);
+  TL_XOF = (t)=>t*TL_PX + MARKER/2;             // shift right by half a marker so KF0 fits
+  TL_BAR_X = (t)=>t*TL_PX;
+  TL_WIDTH = TL_BAR_X(Tm) + MARKER;
+  let html='';
+  // hold blocks after keyframes
+  for (let i=0;i<kfs.length;i++){
+    const h = holdS(kfs[i]); if (h <= 0) continue;
+    const x0 = TL_BAR_X(tAt[i]), w = Math.max(2, h * TL_PX);
+    html += `<div class="tltrans hold" style="left:${x0}px;width:${w}px"
+        title="hold on KF${i} · ${fmtS(h)}s · click to edit" onclick="openTransEdit(event,'${kfs[i].id}')">
+      <span class="trlbl">⏸${fmtS(h)}s</span></div>`;
+  }
+  // transition blocks between consecutive keyframes
+  for (let i=1;i<kfs.length;i++){
+    const k=kfs[i], st=transStyle(k), lt=layerTrans(k), la=layerAt(k), x0=TL_BAR_X(tAt[i-1] + holdS(kfs[i-1])), w=Math.max(2,durS(k)*TL_PX);
+    const hold = JSON.stringify(kfs[i-1].camera)===JSON.stringify(k.camera);   // identical pose = a dwell
+    html += `<div class="tltrans ${hold?'hold ':''}${st}${lt==='cut'?' layercut':''}" style="left:${x0}px;width:${w}px"
+        title="camera: ${hold?'hold pose':st} · layers: ${lt}${lt==='cut'?' @ '+Math.round(la*100)+'%':''} · into KF${i} · ${fmtS(durS(k))}s · click to edit · drag the right edge to resize" onclick="openTransEdit(event,'${k.id}')">
+      <span class="trlbl">${hold?'⏸':transIcon(st)}${fmtS(durS(k))}s${lt==='cut'?' |cut@'+Math.round(la*100):''}</span>
+      <span class="trgrip" onmousedown="event.stopPropagation(); startTransDrag(event,'${k.id}',${durS(k)})"></span></div>`;
+  }
+  // keyframe markers (instants) — thumbnails centered on their time
+  for (let i=0;i<kfs.length;i++){
+    const k=kfs[i];
+    html += `<div class="kfmark${k.thumbnail_path?' hasthumb':''}${k.id===ACTIVE_KF?' active':''}" draggable="true" data-id="${k.id}"
+        style="${thumbBg(k)}left:${TL_XOF(tAt[i])-MARKER/2}px"
+        title="KF${i} · click to view · drag to reorder"
+        onclick="gotoKf('${k.id}',this)" ondragstart="kfDragStart(event,'${k.id}')" ondragover="kfDragOver(event,this)" ondragleave="this.classList.remove('drop')" ondrop="kfDrop(event,'${k.id}')">
+      <span class="kftools" onclick="event.stopPropagation()" onmousedown="event.stopPropagation()">
+        <button class="kfbtn${k.id===KF_CLIPBOARD_ID?' on':''}" draggable="false" onclick="copyKf('${k.id}',event)" title="Copy this keyframe">⧉</button>
+        <button class="kfbtn" draggable="false" onclick="pasteKf('${k.id}',event)" title="Paste copied keyframe after this one">✚</button>
+        <button class="kfbtn danger" draggable="false" onclick="delKf('${k.id}',event)" title="Delete this keyframe">✕</button>
+      </span>
+      ${diffBadge(k.id)}<div class="lbl">KF${i}</div></div>`;
+  }
+  tl.style.width=TL_WIDTH+'px'; tl.innerHTML=html;
+  $('kfCount').textContent=`${kfs.length} keyframe${kfs.length>1?'s':''} · ${T.toFixed(1)}s`;
+  renderSweeps(p);
+}
+// drag a transition's right edge to lengthen/shorten the MOVE into that keyframe (px->sec)
+function startTransDrag(e, id, v0) {
+  e.preventDefault();
+  const startX=e.clientX; let val=v0;
+  const move=(ev)=>{ val=Math.max(0, Math.round((v0+(ev.clientX-startX)/TL_PX)*10)/10); $('kfCount').textContent=`move: ${val}s`; };
+  const up=async()=>{ window.removeEventListener('mousemove',move); window.removeEventListener('mouseup',up);
+    await api('PUT', `/api/projects/${PID}/keyframes/${id}/duration`, {duration_in_s: val}); reload(); };
+  window.addEventListener('mousemove',move); window.addEventListener('mouseup',up);
+}
+// click a transition -> small popover to type its duration/style + pick easing
+function openTransEdit(e, id) {
+  e.stopPropagation();
+  const kfs=(CUR&&CUR.keyframes)||[], i=kfs.findIndex(k=>k.id===id), k=kfs[i];
+  if(!k) return;
+  const hold = i>0 && JSON.stringify(kfs[i-1].camera)===JSON.stringify(k.camera);
+  const st = transStyle(k);
+  const lt = layerTrans(k);
+  const la = layerAt(k);
+  let pop=$('transEdit');
+  if(!pop){ pop=document.createElement('div'); pop.id='transEdit'; document.body.appendChild(pop); }
+  pop.innerHTML=`
+    <div class="te-hd">${i===0?'KF0':(hold?'⏸ Hold':'Transition')} → KF${i}<span class="te-x" onclick="closeTransEdit()">✕</span></div>
+    ${i>0 ? `<label>camera <select id="teTrans">
+      ${[['glide','glide / move'],['cut','cut camera'],['fade','black fade']].map(([v,t])=>`<option value="${v}"${st===v?' selected':''}>${t}</option>`).join('')}
+    </select></label>
+    <label>layers <select id="teLayerTrans">
+      ${[['fade','fade layer changes'],['cut','cut layer changes']].map(([v,t])=>`<option value="${v}"${lt===v?' selected':''}>${t}</option>`).join('')}
+    </select></label>
+    <label>layer switch <input id="teLayerAt" type="number" min="0" max="100" step="5" value="${Math.round(la*100)}" />%</label>
+    <label>duration <input id="teDur" type="number" min="0" step="0.1" value="${fmtS(durS(k))}" />s</label>
+    <label>easing <select id="teEase">
+      ${['ease-in-out','linear','ease-in','ease-out'].map(o=>`<option value="${o}"${(k.easing||'ease-in-out')===o?' selected':''}>${o}</option>`).join('')}
+    </select></label>` : ''}
+    <label>hold after <input id="teHold" type="number" min="0" step="0.1" value="${fmtS(holdS(k))}" />s</label>
+    <div class="te-row"><button onclick="gotoKf('${id}',null); closeTransEdit()">view</button>
+      <button class="primary" onclick="applyTransEdit('${id}')">apply</button></div>
+    <div class="te-hint">Layer cut switches at the chosen percent of the camera move.</div>`;
+  pop.style.left=Math.min(e.clientX, window.innerWidth-252)+'px';
+  pop.style.top=Math.max(10, e.clientY-210)+'px';
+  pop.style.display='block';
+  const focusEl = $('teDur') || $('teHold');
+  if (focusEl) { focusEl.focus(); focusEl.select(); }
+  setTimeout(()=>document.addEventListener('mousedown', _teOutside), 0);
+}
+function _teOutside(ev){ const p=$('transEdit'); if(p && !p.contains(ev.target)){ closeTransEdit(); } }
+function closeTransEdit(){ const p=$('transEdit'); if(p) p.style.display='none'; document.removeEventListener('mousedown', _teOutside); }
+async function applyTransEdit(id){
+  const fields = { hold_in_s: Math.max(0, parseFloat($('teHold').value)||0) };
+  if ($('teDur')) fields.duration_in_s = Math.max(0, parseFloat($('teDur').value)||0);
+  if ($('teEase')) fields.easing = $('teEase').value;
+  if ($('teTrans')) fields.transition = $('teTrans').value;
+  if ($('teLayerTrans')) fields.layer_transition = $('teLayerTrans').value;
+  if ($('teLayerAt')) fields.layer_transition_at = Math.max(0, Math.min(100, parseFloat($('teLayerAt').value)||0)) / 100;
+  closeTransEdit();
+  await setKfTiming(id, fields);
+}
+// the time (s) on the timeline of the keyframe you're currently on — anchors new sweeps "here"
+function activeKfTime(){ const id=ACTIVE_KF||LAST_KF_ID; return (id!=null && KF_TIME[id]!=null) ? KF_TIME[id] : 0; }
+
+// Independent cutaway sweeps live in their OWN lane below the keyframes — each a bar
+// spanning the slice of the movie's timeline it animates over (like a clip/effect track
+// in a video editor). The camera keyframes drive the camera up top; sweeps run underneath.
+function renderSweeps(p) {
+  const lane = $('sweepLane'); if (!lane) return;
+  const sweeps = p.sweeps || [];
+  // snap targets = each keyframe's time (so dragging a sweep snaps to keyframe moments)
+  SWEEP_SNAPS = keyframeTimes(p.keyframes || []);
+  lane.style.width = TL_WIDTH + 'px';   // same width/scale as the keyframe lane above
+  if (!sweeps.length) { lane.innerHTML = ''; return; }
+  lane.innerHTML = sweeps.map(s => {
+    const left = TL_BAR_X(s.start_s), width = Math.max(8, s.duration_s * TL_PX);
+    const dir = s.normal ? 'oblique' : `${s.axis}`;
+    const isSlice = s.kind === 'slice';
+    const disabled = s.enabled === false;
+    const openCut = !isSlice && s.cap === false;
+    const name = isSlice ? (s.em_name || 'EM slice') : s.layer;
+    const icon = isSlice ? '▦' : '▤';
+    const grad = isSlice ? 'linear-gradient(90deg,#2f8f8f,#46c2c2)' : 'linear-gradient(90deg,#5a5fcf,#8a8fff)';
+    const v = SNAP_VER[s.id] ? `?v=${SNAP_VER[s.id]}` : '';
+    const bg = `background-image:url('/api/projects/${PID}/sweeps/${s.id}/snapshot/1${v}'),${grad};background-size:cover;background-position:center;`;
+    return `<div class="sweepbar${isSlice ? ' slicebar' : ''}${disabled ? ' disabled' : ''}" data-id="${s.id}" style="left:${left}px;width:${width}px;${bg}"
+                 onmousedown="startSweepDrag(event,'${s.id}','move')"
+                 onmouseenter="showSweepHover(event,'${s.id}',${s.mirror ? 5 : 3})" onmouseleave="hideSweepHover()"
+                 title="${disabled ? 'disabled ' : ''}${isSlice ? 'EM slice' : (openCut ? 'open cutaway' : 'capped cutaway')}: ${name} · ${dir} · ${Math.round(s.from_nm)}→${Math.round(s.to_nm)}nm · start ${fmtS(s.start_s)}s · ${fmtS(s.duration_s)}s">
+      <span class="del" onmousedown="event.stopPropagation()" onclick="event.stopPropagation(); delSweep('${s.id}')">✕</span>
+      <span class="swlbl">${icon} ${disabled ? 'off · ' : ''}${name} ${dir}${openCut ? ' open' : ''} · ${fmtS(s.duration_s)}s</span>
+      <span class="grip" onmousedown="event.stopPropagation(); startSweepDrag(event,'${s.id}','resize')"></span>
+    </div>`;
+  }).join('');
+}
+let SWEEP_SNAPS = [];
+// drag a sweep along the lane (move = change start; resize = change duration), snapping the
+// dragged edge to keyframe start times. A click that doesn't move opens the edit panel.
+function startSweepDrag(e, id, mode) {
+  e.preventDefault();
+  const s = (CUR.sweeps || []).find(x => x.id === id); if (!s) return;
+  const lane = $('sweepLane');
+  const bar = lane.querySelector(`.sweepbar[data-id="${id}"]`);
+  const startX = e.clientX, start0 = s.start_s, dur0 = s.duration_s;
+  const snapSec = 10 / TL_PX;                          // snap when within ~10px of a keyframe
+  let moved = false, newStart = start0, newDur = dur0, guide = null;
+  bar && bar.classList.add('dragging');
+  const move = (ev) => {
+    const dSec = (ev.clientX - startX) / TL_PX;        // px -> seconds (same scale as the lane)
+    if (Math.abs(ev.clientX - startX) > 3) moved = true;
+    // the edge we're snapping: move snaps the START, resize snaps the END
+    let edge = (mode === 'resize') ? start0 + Math.max(0.1, dur0 + dSec) : Math.max(0, start0 + dSec);
+    let snapTo = null, best = snapSec;
+    for (const t of SWEEP_SNAPS) { if (Math.abs(t - edge) < best) { best = Math.abs(t - edge); snapTo = t; } }
+    if (snapTo != null) edge = snapTo;
+    if (mode === 'resize') { newDur = Math.max(0.1, edge - start0); }
+    else { newStart = Math.max(0, edge); }
+    bar.style.left = TL_BAR_X(newStart) + 'px';
+    bar.style.width = (newDur * TL_PX) + 'px';
+    if (guide) guide.remove();
+    if (snapTo != null) { guide = document.createElement('div'); guide.className = 'swsnap';
+      guide.style.left = TL_BAR_X(snapTo) + 'px'; lane.appendChild(guide); }
+  };
+  const up = async () => {
+    window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up);
+    if (guide) guide.remove(); bar && bar.classList.remove('dragging');
+    if (!moved) { openSweepEdit(id); return; }          // a click -> edit panel
+    await api('PUT', `/api/projects/${PID}/sweeps/${id}`,
+              { start_s: +newStart.toFixed(2), duration_s: +newDur.toFixed(2) });
+    reload();
+  };
+  window.addEventListener('mousemove', move); window.addEventListener('mouseup', up);
+}
+async function delSweep(id) {
+  if (!PID) return;
+  await api('DELETE', `/api/projects/${PID}/sweeps/${id}`);
+  reload();
+}
+let EDIT_SWEEP_ID = null;
+function openSweepEdit(id) {
+  const s = (CUR.sweeps || []).find(x => x.id === id); if (!s) return;
+  EDIT_SWEEP_ID = id;
+  const isSlice = s.kind === 'slice';
+  document.querySelector('#sweepPanel b').textContent = isSlice ? '▦ Edit EM slice sweep' : '▤ Edit cutaway sweep';
+  $('sweepWhich').textContent = `${isSlice ? (s.em_name||'EM') : s.layer} · ${s.normal ? 'oblique' : s.axis} axis`;
+  $('swSideRow').style.display = isSlice ? 'none' : 'block';   // 'side' only meaningful for a cut
+  $('swCapRow').style.display = isSlice ? 'none' : 'block';
+  // label the side by the cut's actual orientation (oblique => direction, not "+z")
+  if (s.normal) { $('swSide').options[0].text = 'keep the “From” side (cut the “To”)'; $('swSide').options[1].text = 'keep the “To” side (cut the “From”)'; }
+  else { $('swSide').options[0].text = `cut the +${s.axis} side`; $('swSide').options[1].text = `cut the −${s.axis} side`; }
+  $('swStart').value = s.start_s; $('swDur').value = s.duration_s;
+  $('swSide').value = String(s.side); $('swEase').value = s.easing || 'linear';
+  $('swMirror').checked = !!s.mirror;
+  $('swEnabled').checked = s.enabled !== false;
+  $('swCap').checked = s.cap !== false;
+  $('swFrom').value = Math.round(s.from_nm); $('swTo').value = Math.round(s.to_nm);
+  $('swMsg').textContent = '';
+  $('lookPanel').style.display='none'; $('planePanel').style.display='none'; $('propPanel').style.display='none';
+  $('sweepPanel').style.display = 'block';
+}
+async function renderSweepSnapshots() {
+  if (!PID || !EDIT_SWEEP_ID) return;
+  const id = EDIT_SWEEP_ID;
+  $('swMsg').textContent = 'rendering preview frames… (runs in the background)';
+  try {
+    await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`);
+  } catch (e) { $('swMsg').textContent = 'failed to start: ' + (e.message||e); return; }
+  const poll = async () => {
+    let st; try { st = await api('GET', `/api/projects/${PID}/sweeps/${id}/snapshots/status`); }
+    catch { st = {status:'error'}; }
+    if (st.status === 'running') { $('swMsg').textContent = 'rendering preview frames…'; setTimeout(poll, 2000); return; }
+    if (st.status === 'error') { $('swMsg').textContent = 'snapshot failed: ' + (st.error||''); return; }
+    const v = Date.now(); SNAP_VER[id] = v; SNAP_COUNT[id] = st.count || 3;
+    showSnapStrip($('swSnaps'), id, st.count || 3, v);
+    $('swMsg').textContent = 'done';
+    if (CUR) renderSweeps(CUR);   // show the middle frame on the lane bar
+  };
+  setTimeout(poll, 1500);
+}
+let SNAP_VER = {}, SNAP_COUNT = {};
+function snapUrl(id, i, v) { return `/api/projects/${PID}/sweeps/${id}/snapshot/${i}` + (v?`?v=${v}`:''); }
+// hover a clip to peek its preview frames (rendered via the 📷 button). Frames that don't
+// exist yet just don't show; a caption nudges you to render them.
+function showSweepHover(e, id, n) {
+  const h = $('swHover'); if (!h) return;
+  const v = SNAP_VER[id] ? `?v=${SNAP_VER[id]}` : '';
+  h.innerHTML = `<div class="swhovcap">preview — open the clip → 📷 to (re)render</div>`
+    + `<div style="display:flex;gap:3px">` + Array.from({length:n}, (_,i) =>
+        `<img src="/api/projects/${PID}/sweeps/${id}/snapshot/${i}${v}" onerror="this.remove()" style="height:70px;border-radius:3px;background:#000">`).join('')
+    + `</div>`;
+  const r = e.currentTarget.getBoundingClientRect();
+  h.style.display = 'block';
+  h.style.left = Math.max(8, Math.min(r.left, window.innerWidth - h.offsetWidth - 8)) + 'px';
+  h.style.bottom = (window.innerHeight - r.top + 8) + 'px';
+}
+function hideSweepHover() { const h = $('swHover'); if (h) h.style.display = 'none'; }
+function showSnapStrip(el, id, n, v) {
+  el.innerHTML = Array.from({length:n}, (_,i) =>
+    `<img src="${snapUrl(id,i,v)}" onerror="this.style.display='none'" style="width:${Math.floor(100/n)-1}%;border-radius:3px;background:#000">`).join('');
+}
+async function saveSweepEdit() {
+  if (!PID || !EDIT_SWEEP_ID) return;
+  const body = { start_s:+$('swStart').value, duration_s:+$('swDur').value,
+                 side:parseInt($('swSide').value,10), easing:$('swEase').value,
+                 mirror:$('swMirror').checked,
+                 enabled:$('swEnabled').checked,
+                 cap:$('swCap').checked,
+                 from_nm:+$('swFrom').value, to_nm:+$('swTo').value };
+  await api('PUT', `/api/projects/${PID}/sweeps/${EDIT_SWEEP_ID}`, body);
+  $('sweepPanel').style.display='none';
+  reload();
+}
+function toggleGroup(g) {
+  if (EXPANDED_GROUPS.has(g)) EXPANDED_GROUPS.delete(g); else EXPANDED_GROUPS.add(g);
+  if (CUR) renderKeyframes(CUR);
+}
+async function delGroup(g) {
+  if (!CUR) return;
+  const ids = CUR.keyframes.filter(k => k.group === g).map(k => k.id);
+  if (!ids.length || !confirm(`Delete all ${ids.length} frames in this scan?`)) return;
+  const keep = KF_ORDER.filter(id => !ids.includes(id));  // reorder drops anything omitted
+  setStatus('deleting scan…');
+  await api('POST', `/api/projects/${PID}/keyframes/reorder`, { order: keep });
+  reload();
 }
 
 let DRAG_ID = null;
@@ -250,7 +874,7 @@ function kfDragStart(e, id) { DRAG_ID = id; e.dataTransfer.effectAllowed = 'move
 function kfDragOver(e, el) { e.preventDefault(); el.classList.add('drop'); }
 async function kfDrop(e, targetId) {
   e.preventDefault();
-  document.querySelectorAll('.kf').forEach(k => k.classList.remove('drop'));
+  document.querySelectorAll('.kfmark').forEach(k => k.classList.remove('drop'));
   if (!DRAG_ID || DRAG_ID === targetId) return;
   const ids = KF_ORDER.slice();
   ids.splice(ids.indexOf(DRAG_ID), 1);           // remove dragged
@@ -261,10 +885,58 @@ async function kfDrop(e, targetId) {
 }
 
 let ACTIVE_KF = null;
+function kfLabel(id) {
+  const i = KF_ORDER.indexOf(id);
+  return i >= 0 ? `KF${i}` : 'keyframe';
+}
+function copyKf(id, e) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  if (!PID || !id) return;
+  KF_CLIPBOARD_ID = id;
+  setStatus(`copied ${kfLabel(id)}`);
+  if (CUR) renderKeyframes(CUR);
+}
+async function pasteKf(afterId, e) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  if (!PID) { setStatus('open a project first'); return; }
+  if (!KF_CLIPBOARD_ID) { setStatus('copy a keyframe first'); return; }
+  const sourceId = KF_CLIPBOARD_ID;
+  const sourceLabel = kfLabel(sourceId);
+  const afterLabel = kfLabel(afterId);
+  try {
+    setStatus(`pasting ${sourceLabel}…`);
+    const kf = await api('POST', `/api/projects/${PID}/keyframes/${sourceId}/duplicate`, { after_id: afterId });
+    ACTIVE_KF = kf.id;
+    await reload();
+    showKeyframeThumb(kf.id);
+    setStatus(`pasted ${sourceLabel} after ${afterLabel}`);
+  } catch (err) { setStatus('paste failed: ' + err.message); }
+}
+async function duplicateCurrentKeyframe() {
+  const id = ACTIVE_KF || LAST_KF_ID;
+  if (!PID || !id) { setStatus('click a keyframe first'); return; }
+  try {
+    const label = kfLabel(id);
+    const kf = await api('POST', `/api/projects/${PID}/keyframes/${id}/duplicate`, { after_id: id });
+    ACTIVE_KF = kf.id;
+    await reload();
+    showKeyframeThumb(kf.id);
+    setStatus(`duplicated ${label}`);
+  } catch (err) { setStatus('duplicate failed: ' + err.message); }
+}
+function isTypingTarget(el) {
+  return el && (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName));
+}
+document.addEventListener('keydown', (e) => {
+  if (!PID || isTypingTarget(e.target) || !(e.ctrlKey || e.metaKey) || e.altKey) return;
+  const key = e.key.toLowerCase();
+  if (key === 'c' && ACTIVE_KF) { e.preventDefault(); copyKf(ACTIVE_KF); }
+  if (key === 'v' && KF_CLIPBOARD_ID) { e.preventDefault(); pasteKf(ACTIVE_KF || LAST_KF_ID); }
+});
 async function gotoKf(id, el) {
   if (!PID) return;
   ACTIVE_KF = id;
-  document.querySelectorAll('.kf').forEach(k => k.classList.remove('active'));
+  document.querySelectorAll('.kfmark').forEach(k => k.classList.remove('active'));
   if (el) el.classList.add('active');
   showKeyframeThumb(id);                 // load this frame's rendered image in the preview
   try { await api('POST', `/api/projects/${PID}/keyframes/${id}/goto`); }
@@ -276,13 +948,14 @@ function showKeyframeThumb(id) {
   if (JOB) return;                       // a live render is using the preview
   const img = new Image();
   img.onload = () => { $('preview').innerHTML = ''; $('preview').appendChild(img); };
-  img.onerror = () => { $('preview').innerHTML = '<span class="msg">no render yet — Bake or Update to render this frame</span>'; };
-  img.src = `/api/projects/${PID}/keyframes/${id}/thumbnail?v=${THUMB_VER[id] || 0}`;
+  img.onerror = () => { $('preview').innerHTML = '<span class="msg">this keyframe hasn’t been rendered yet — hit Preview, or “Render all” to fill the timeline</span>'; };
+  img.src = `/api/projects/${PID}/keyframes/${id}/thumbnail?v=${THUMB_VER[id] || TVER}`;
 }
 
 // render the single keyframe to a still; show it live and keep it as the frame thumbnail
 let THUMB_JOB = null;
 async function renderThumbnail(id) {
+  AUTO_THUMBS = false;   // a manual single-thumbnail render stops the auto sweep
   if (THUMB_JOB) { api('POST', `/api/renders/${THUMB_JOB}/cancel`).catch(() => {}); }  // don't pile up
   try {
     const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`);
@@ -293,6 +966,107 @@ async function renderThumbnail(id) {
       reload();
     }, true);
   } catch (e) { setStatus('thumbnail render failed: ' + e.message); }
+}
+
+// auto-render every keyframe's thumbnail in sequence (e.g. right after importing a
+// links file), so the timeline fills in at the bottom and you can watch progress.
+let AUTO_THUMBS = false;
+function renderThumbAwait(id) {
+  return new Promise(async (resolve) => {
+    try {
+      const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`);
+      THUMB_JOB = job_id;
+      attachRender(job_id, () => { if (THUMB_JOB === job_id) THUMB_JOB = null; THUMB_VER[id] = Date.now(); resolve(); }, true);
+    } catch (e) { resolve(); }   // one failure shouldn't stall the rest
+  });
+}
+// re-render thumbnails for a specific set of keyframes (e.g. after a propagate changed
+// their colors) so the timeline cards reflect the edit instead of showing stale images.
+async function refreshThumbs(ids) {
+  const uniq = [...new Set((ids || []).filter(Boolean))];
+  if (!PID || !uniq.length) return;
+  AUTO_THUMBS = false;
+  for (let i = 0; i < uniq.length; i++) {
+    setStatus(`refreshing thumbnail ${i + 1}/${uniq.length}…`);
+    await renderThumbAwait(uniq[i]);
+    reload();   // show each as it finishes
+  }
+  setStatus(`refreshed ${uniq.length} thumbnail(s)`);
+}
+// after a propagate: refresh the edited keyframe thumbnails AND re-bake the sweep
+// previews (a layer's color/visibility change also shows in cutaways and slice overlays).
+async function refreshPreviews(kfIds) {
+  await refreshThumbs(kfIds);
+  const sweepIds = orderedSweepIds();
+  for (let i = 0; i < sweepIds.length; i++) {
+    setStatus(`refreshing slice/cutaway preview ${i + 1}/${sweepIds.length}…`);
+    await bakeSweepSnapAwait(sweepIds[i]);
+    if (CUR) renderSweeps(CUR);
+  }
+  if (sweepIds.length) setStatus(`refreshed thumbnails + ${sweepIds.length} sweep preview(s)`);
+}
+function orderedSweepIds() {
+  return ((CUR && CUR.sweeps) || [])
+    .slice()
+    .sort((a, b) => {
+      // Slice/EM previews are usually the timeline-critical ones and much cheaper than
+      // capped cutaway previews, so don't let one slow cutaway block every fibsem strip.
+      const ka = (a.kind === 'slice' ? 0 : 1), kb = (b.kind === 'slice' ? 0 : 1);
+      return ka - kb || (a.start_s || 0) - (b.start_s || 0);
+    })
+    .map(s => s.id);
+}
+// bake one sweep's preview stills (slice / cutaway / EM-plane clip) and wait for it
+let SNAP_JOB = null;   // id of the in-flight sweep-snapshot render, so Stop can cancel it
+function bakeSweepSnapAwait(id) {
+  return new Promise(async (resolve) => {
+    try { const r = await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`); SNAP_JOB = r.job_id || `snap_${id}`; }
+    catch { return resolve(); }
+    const poll = async () => {
+      if (!AUTO_THUMBS) { SNAP_JOB = null; return resolve(); }   // stopped
+      let st; try { st = await api('GET', `/api/projects/${PID}/sweeps/${id}/snapshots/status`); }
+      catch { SNAP_JOB = null; return resolve(); }
+      if (st.status === 'running') { setTimeout(poll, 1500); return; }
+      SNAP_VER[id] = Date.now(); SNAP_COUNT[id] = st.count || 3;   // bust the lane-thumb cache
+      SNAP_JOB = null;
+      resolve();
+    };
+    setTimeout(poll, 1200);
+  });
+}
+// "Render all" / post-load bake: keyframe thumbnails AND every sweep's preview frames
+// (slice / cutaway / EM-plane clips), so the whole timeline — both lanes — fills in.
+async function autoRenderThumbs() {
+  if (!PID) { setStatus('open a project first'); return; }
+  const ids = KF_ORDER.slice();
+  const sweepIds = orderedSweepIds();
+  if (!ids.length && !sweepIds.length) return;
+  AUTO_THUMBS = true;
+  $('autoThumbBtn').textContent = '■ Stop';
+  const total = ids.length + sweepIds.length;
+  let done = 0;
+  for (let i = 0; i < ids.length && AUTO_THUMBS; i++) {
+    setStatus(`baking keyframe ${i + 1}/${ids.length}…`);
+    await renderThumbAwait(ids[i]); done++;
+    await reload();
+  }
+  for (let j = 0; j < sweepIds.length && AUTO_THUMBS; j++) {
+    setStatus(`baking sweep ${j + 1}/${sweepIds.length}…`);
+    await bakeSweepSnapAwait(sweepIds[j]); done++;
+    if (CUR) renderSweeps(CUR);   // show each clip's preview on the lane as it finishes
+  }
+  setStatus(AUTO_THUMBS ? `done — baked ${ids.length} keyframe(s) + ${sweepIds.length} sweep(s)`
+                        : `stopped (${done}/${total} baked)`);
+  AUTO_THUMBS = false;
+  $('autoThumbBtn').textContent = '⟳ Render all';
+}
+function toggleAutoThumbs() {
+  if (AUTO_THUMBS) {
+    AUTO_THUMBS = false;                 // stop the sweep
+    if (THUMB_JOB) api('POST', `/api/renders/${THUMB_JOB}/cancel`).catch(() => {});  // and the in-flight bake
+    if (SNAP_JOB) api('POST', `/api/renders/${SNAP_JOB}/cancel`).catch(() => {});    // ...incl a sweep snapshot
+    setStatus('stopping…');
+  } else autoRenderThumbs();
 }
 
 async function setMeshOpacity() {
@@ -313,6 +1087,7 @@ async function updateFrame() {
     setStatus(`updated frame from Neuroglancer (camera + ${n} segment(s)) — rendering…`);
     reload();
     renderThumbnail(id);
+    if (kf.changes && kf.changes.length) showNgPropPrompt(id, kf.changes);
   } catch (e) { setStatus('update failed: ' + e.message); }
 }
 
@@ -330,10 +1105,207 @@ function toggleClaude() {
   $('chatcol').style.display = open ? 'flex' : 'none';
   $('claudeToggle').textContent = open ? '✦ Bye! Claude' : '✦ Help me! Claude';
 }
-async function addKeyframe() { if(!PID)return; await api('POST', `/api/projects/${PID}/keyframes`); reload(); }
-async function delKf(id)     { await api('DELETE', `/api/projects/${PID}/keyframes/${id}`); reload(); }
-async function orbit()       { if(!PID)return; setStatus('adding orbit…'); await api('POST', `/api/projects/${PID}/orbit`, {degrees:360,n:12}); reload(); setStatus('orbit added'); }
-async function sweep()       { if(!PID)return; await api('POST', `/api/projects/${PID}/sweep_slice`, {axis:'z',n:12}); reload(); }
+async function addKeyframe() { if(!PID)return; const kf = await api('POST', `/api/projects/${PID}/keyframes`); ACTIVE_KF = kf.id; reload(); }
+async function delKf(id, e) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  await api('DELETE', `/api/projects/${PID}/keyframes/${id}`);
+  if (ACTIVE_KF === id) ACTIVE_KF = null;
+  if (KF_CLIPBOARD_ID === id) KF_CLIPBOARD_ID = null;
+  reload();
+}
+function openOrbitPanel() {
+  if (!PID) { setStatus('open a project first'); return; }
+  ['lookPanel','propPanel','planePanel'].forEach(id => { const e=$(id); if(e) e.style.display='none'; });
+  $('orbitMsg').textContent = ''; $('orbitPanel').style.display = 'block';
+}
+async function applyOrbit() {
+  if (!PID) return;
+  const body = { degrees: parseFloat($('orbitDeg').value) || 360,
+    n: parseInt($('orbitN').value, 10) || 12,
+    elevation_deg: parseFloat($('orbitElev').value) || 0,
+    total_duration_s: parseFloat($('orbitDur').value) || 8,
+    axis: $('orbitAxis').value };
+  $('orbitMsg').textContent = 'adding…';
+  try {
+    const r = await api('POST', `/api/projects/${PID}/orbit`, body);
+    await reload();
+    if (r.thumb_id) renderThumbnail(r.thumb_id);
+    $('orbitMsg').textContent = `added (${body.degrees}° around ${body.axis}, ${body.total_duration_s}s)`;
+    setStatus('orbit added');
+  } catch (e) { $('orbitMsg').textContent = 'error: ' + e.message; }
+}
+async function openPlanePanel() {
+  if(!PID) return;
+  $('lookPanel').style.display='none'; $('propPanel').style.display='none';
+  // pull in any volume layers added live in neuroglancer (e.g. an EM image) so they're sliceable
+  let proj;
+  try { proj = await api('POST', `/api/projects/${PID}/sync_layers`); }
+  catch (e) { proj = await api('GET', `/api/projects/${PID}`); }
+  const kfs = (proj && proj.keyframes) || [];
+  // layers from the keyframe you're ON (falls back to the last), so the cut matches your view
+  const base = kfs.find(k=>k.id===(ACTIVE_KF||LAST_KF_ID)) || kfs[kfs.length-1];
+  const layers = base ? [...new Set(base.meshes.filter(m=>m.render_3d!==false && (m.segment_ids||[]).length).map(m=>m.mesh_name))] : [];
+  $('planeLayer').innerHTML = `<option value="">all layers</option>` + layers.map(l=>`<option value="${l}">${l}</option>`).join('');
+  if (LAST_CUT_LAYER && layers.includes(LAST_CUT_LAYER)) $('planeLayer').value = LAST_CUT_LAYER;  // remember selection
+  // sliceable layers = the EM/image volume + any segmentation layer that has a label volume
+  const man = proj.manifest || {}, sl = [];
+  if (man.em && man.em.name) sl.push([man.em.name, man.em.name + ' — EM']);
+  (man.meshes || []).forEach(ms => { if (ms.label_zarr) sl.push([ms.name, ms.name + ' — seg']); });
+  $('planeSliceLayer').innerHTML = sl.length
+    ? sl.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')
+    : '<option value="">(default EM)</option>';
+  if ($('planeStart')) $('planeStart').value = fmtS(activeKfTime());
+  planeModeChanged(); updateSideLabels();
+  PREVIEW_READY = false; if ($('planeSnaps')) $('planeSnaps').innerHTML = '';
+  $('planeMsg').textContent = ''; $('planePanel').style.display='block';
+}
+let LAST_CUT_LAYER = '';
+// drag the divider between the scouting (NG) and preview panes to expand either one.
+// Adjusts only the left/right flex (the Claude column is untouched); the iframe gets
+// pointer-events:none mid-drag so the mouse can cross it.
+function startResize(e) {
+  e.preventDefault();
+  const left = document.querySelector('.col.left'), right = document.querySelector('.col.right');
+  if (!left || !right) return;
+  document.body.classList.add('resizing');
+  const move = (ev) => {
+    const lr = left.getBoundingClientRect(), rr = right.getBoundingClientRect();
+    const total = lr.width + rr.width;
+    const f = Math.max(0.15, Math.min(0.85, (ev.clientX - lr.left) / total));
+    left.style.flex = f.toFixed(3);
+    right.style.flex = (1 - f).toFixed(3);
+  };
+  const up = () => { document.body.classList.remove('resizing');
+    window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+  window.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', up);
+}
+function planeModeChanged() {
+  const cut = $('planeMode').value === 'cull';
+  $('planeCull').style.display = $('planeMode').value === 'slice' ? 'none' : 'block';
+  $('planeSliceWrap').style.display = cut ? 'none' : 'block';   // slice-layer picker: slice/both only
+  if ($('planeAddLbl')) $('planeAddLbl').textContent = cut ? 'Add cutaway' : 'Add scan';
+  PREVIEW_READY = false; if ($('planeSnaps')) $('planeSnaps').innerHTML = '';   // mode changed -> preview stale
+}
+// spell out the cut side. For an OBLIQUE cut (full x,y,z in both boxes) the axis is
+// meaningless, so describe it relative to the From→To direction instead of "+z".
+function updateSideLabels() {
+  const sel = $('planeSide'); if (!sel) return;
+  const fn = planeNums($('planeFrom').value), tn = planeNums($('planeTo').value);
+  if (fn.length >= 3 && tn.length >= 3) {
+    sel.options[0].text = 'keep the “From” side (cut the “To”)';
+    sel.options[1].text = 'keep the “To” side (cut the “From”)';
+  } else {
+    const ax = $('planeAxis').value;
+    sel.options[0].text = `cut the +${ax} side (keep −${ax})`;
+    sel.options[1].text = `cut the −${ax} side (keep +${ax})`;
+  }
+}
+// parse a box: full "x, y, z" -> [x,y,z] (oblique), single number -> scalar depth nm
+function planeNums(str) {
+  return (str||'').trim().split(/[\s,]+/).map(parseFloat).filter(isFinite);
+}
+function planeStartTime() {
+  const v = parseFloat($('planeStart')?.value);
+  return Number.isFinite(v) ? Math.max(0, v) : activeKfTime();
+}
+// preview the cut/slice from the create form WITHOUT committing it (renders into the
+// shared '_preview' snapshot slot, shown in the panel).
+async function previewPlaneScan() {
+  if (!PID) return;
+  const axis = $('planeAxis').value, mode = $('planeMode').value, side = parseInt($('planeSide').value,10);
+  const fn = planeNums($('planeFrom').value), tn = planeNums($('planeTo').value);
+  const dur = parseFloat($('planeDur').value) || 4, layer = $('planeLayer').value;
+  const start = planeStartTime();
+  const kind = (mode === 'slice') ? 'slice' : 'cutaway';
+  if (kind === 'cutaway' && !layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
+  // Use the selected global start time so preview and saved clips agree on placement.
+  const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: start, mirror: $('planeMirror').checked };
+  if (kind === 'cutaway') { body.layer = layer; body.cap = $('planeCap').checked; }
+  else body.em_name = $('planeSliceLayer').value;   // which layer the slice shows (EM or seg)
+  if (fn.length) body.from_ng = fn;
+  if (tn.length) body.to_ng = tn;
+  $('planeMsg').textContent = 'rendering preview…';
+  try { await api('POST', `/api/projects/${PID}/sweeps/preview`, body); }
+  catch (e) { $('planeMsg').textContent = 'preview failed: ' + (e.message||e); return; }
+  const poll = async () => {
+    let st; try { st = await api('GET', `/api/projects/${PID}/sweeps/_preview/snapshots/status`); }
+    catch { st = {status:'error'}; }
+    if (st.status === 'running') { setTimeout(poll, 2000); return; }
+    if (st.status === 'error') { $('planeMsg').textContent = 'preview failed: ' + (st.error||''); return; }
+    showSnapStrip($('planeSnaps'), '_preview', st.count || 3, Date.now());
+    $('planeMsg').textContent = 'preview ready (not added yet)';
+    PREVIEW_READY = true;   // Add will adopt these frames onto the new clip
+  };
+  setTimeout(poll, 1500);
+}
+let PREVIEW_READY = false;
+async function adoptPreview(sw) {
+  if (!PREVIEW_READY || !sw || !sw.id) return false;
+  try {
+    const r = await api('POST', `/api/projects/${PID}/sweeps/${sw.id}/adopt_preview`);
+    SNAP_VER[sw.id] = Date.now();
+    return !!(r && r.ok);
+  } catch { return false; }
+  finally { PREVIEW_READY = false; }
+}
+async function renderSweepSnapshotsQuiet(id) {
+  if (!PID || !id) return;
+  try { await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`); }
+  catch { return; }
+  const poll = async () => {
+    let st; try { st = await api('GET', `/api/projects/${PID}/sweeps/${id}/snapshots/status`); }
+    catch { return; }
+    if (st.status === 'running') { setTimeout(poll, 2000); return; }
+    if (st.status === 'done') {
+      SNAP_VER[id] = Date.now();
+      if (CUR) renderSweeps(CUR);
+    }
+  };
+  setTimeout(poll, 1500);
+}
+async function applyPlaneScan() {
+  if(!PID) return;
+  // Both EM slice and cutaway are now independent plane-CLIPS (own timeline, in the lane),
+  // defined by start→stop + duration — no keyframes, no per-keyframe frame count.
+  const axis = $('planeAxis').value, mode = $('planeMode').value;
+  const side = parseInt($('planeSide').value,10);
+  const fn = planeNums($('planeFrom').value), tn = planeNums($('planeTo').value);
+  const oblique = fn.length >= 3 && tn.length >= 3;
+  const dur = parseFloat($('planeDur')?.value) || 4;
+  const start = planeStartTime();
+  const layer = $('planeLayer').value;
+  const mk = async (kind) => {
+    const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: start, mirror: $('planeMirror').checked };
+    if (kind === 'cutaway') { body.layer = layer; body.cap = $('planeCap').checked; LAST_CUT_LAYER = layer; }
+    else body.em_name = $('planeSliceLayer').value;   // which layer the slice shows (EM or seg)
+    if (fn.length) body.from_ng = fn;
+    if (tn.length) body.to_ng = tn;
+    return await api('POST', `/api/projects/${PID}/sweeps`, body);   // returns the new sweep
+  };
+  $('planeMsg').textContent = 'adding…';
+  if (mode === 'cull' && !layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
+  const needsSnap = [];
+  // single-kind modes adopt the just-rendered preview frames onto the new clip
+  if (mode === 'slice') {
+    const sw = await mk('slice');
+    if (!(await adoptPreview(sw))) needsSnap.push(sw.id);
+  } else if (mode === 'cull') {
+    const sw = await mk('cutaway');
+    if (!(await adoptPreview(sw))) needsSnap.push(sw.id);
+  } else {
+    const sliceSw = await mk('slice');
+    needsSnap.push(sliceSw.id);                 // the shared preview is for the cutaway
+    if (layer) {
+      const cutSw = await mk('cutaway');
+      if (!(await adoptPreview(cutSw))) needsSnap.push(cutSw.id);
+    }
+  }
+  $('planeMsg').textContent = `added (${dur}s)` + (oblique ? ' (oblique)' : '');
+  $('planeSnaps').innerHTML = '';
+  await reload();
+  needsSnap.forEach(renderSweepSnapshotsQuiet);
+}
 
 let JOB = null;
 function renderingUI(on, mode) {
@@ -371,8 +1343,43 @@ function heartbeat(onStall) {
   };
 }
 
+// "#rrggbb" -> [r,g,b] in 0–1 for the render API
+function hexToRgb01(hex) {
+  const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex || '');
+  return m ? [1, 2, 3].map(i => parseInt(m[i], 16) / 255) : [0.62, 0.66, 0.74];
+}
+function rgb01ToHex(rgb) {
+  const h = v => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
+  return Array.isArray(rgb) && rgb.length >= 3 ? `#${h(rgb[0])}${h(rgb[1])}${h(rgb[2])}` : '#9ea8bd';
+}
+// persist the render controls on the project so they survive reload + travel with export
+function saveRenderPrefs() {
+  if (!PID) return;
+  const prefs = { width: +$('w').value, height: +$('h').value, fps: +$('fps').value,
+    samples: +$('samples').value, mesh_detail: +$('detail').value || 1,
+    auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
+    show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
+    bbox_source: $('bboxSource').value, preview_ratio: +$('ratio').value || 10,
+    fast_sample: $('fastSample').checked };
+  api('PUT', `/api/projects/${PID}/render_prefs`, prefs).catch(() => {});
+}
+// apply a project's saved render controls back onto the UI (only if it has any)
+function applyRenderPrefs(p) {
+  const rp = p && p.render_prefs;
+  if (!rp) return;
+  const set = (id, v) => { const el = $(id); if (el != null && v != null) el.value = v; };
+  set('w', rp.width); set('h', rp.height); set('fps', rp.fps); set('samples', rp.samples);
+  set('detail', rp.mesh_detail); set('lodMode', rp.lod_mode); set('ratio', rp.preview_ratio);
+  if (rp.auto_direct != null) $('autoDirect').checked = !!rp.auto_direct;
+  if (rp.show_bbox != null) $('showBbox').checked = !!rp.show_bbox;
+  if (rp.bbox_color) $('bboxColor').value = rgb01ToHex(rp.bbox_color);
+  if (rp.bbox_source != null) $('bboxSource').value = rp.bbox_source;
+  if (rp.fast_sample != null) $('fastSample').checked = !!rp.fast_sample;
+}
 async function startRender(mode) {
+  AUTO_THUMBS = false;   // stop any thumbnail auto-sweep before a full render
   if (!PID) { setStatus('create/open a project first'); return; }
+  saveRenderPrefs();     // remember these controls on the project (survives reload + export)
   let fps = +$('fps').value;
   if (mode === 'preview') {
     const r = Math.max(1, +$('ratio').value || 1);
@@ -380,8 +1387,17 @@ async function startRender(mode) {
   }
   // Preview is a fast, low-res look (coarse EM + low-voxel meshes); Export/blend
   // use full resolution for the final output.
-  const body = { width:+$('w').value, height:+$('h').value, fps, samples:+$('samples').value,
-                 draft: mode === 'preview', mesh_detail: +$('detail').value || 1 };
+  // ⚡ fast: cap samples low + let adaptive sampling bail early (high noise threshold) and
+  // the denoiser finish the job — ~2x faster frames at near-identical quality.
+  const fast = $('fastSample').checked;
+  const body = { width:+$('w').value, height:+$('h').value, fps,
+                 samples: fast ? 32 : (+$('samples').value || 48),
+                 noise_threshold: fast ? 0.06 : 0.01,
+                 engine: $('engine').value,
+                 draft: mode === 'preview', mesh_detail: +$('detail').value || 1,
+                 auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
+                 show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
+                 bbox_source: $('bboxSource').value };
   if (mode === 'blend') body.export_blend = true;   // bake an animated .blend, no video
   let job_id;
   try { ({ job_id } = await api('POST', `/api/projects/${PID}/render`, body)); }
@@ -568,6 +1584,221 @@ function attachRender(job_id, afterDone, light) {
   ws.onerror = () => finish('error');
   ws.onclose = () => finish('error');   // never leave the UI stuck if the socket drops
   hb.kick();   // arm the watchdog even if the socket never opens
+}
+
+// ---- propagate layer edits across keyframes ----
+let PROP_LAYERS = [];
+async function openPropPanel() {
+  const id = ACTIVE_KF || LAST_KF_ID;
+  if (!PID || !id) { setStatus('click a keyframe to select it first'); return; }
+  try {
+    const r = await api('GET', `/api/projects/${PID}/keyframes/${id}/layers`);
+    PROP_LAYERS = r.layers || [];
+  } catch (e) { setStatus('could not load layers: ' + e.message); return; }
+  if (!PROP_LAYERS.length) { setStatus('this keyframe has no mesh layers'); return; }
+  $('propKf').textContent = 'editing keyframe ' + id;
+  $('propLayer').innerHTML = PROP_LAYERS.map((l, i) => `<option value="${i}">${l.mesh_name}</option>`).join('');
+  $('propMsg').textContent = '';
+  propLayerChanged();
+  $('propPanel').style.display = 'block';
+}
+const curPropLayer = () => PROP_LAYERS[+$('propLayer').value];
+function propLayerChanged() {
+  const l = curPropLayer(); if (!l) return;
+  $('propSeg').innerHTML = (l.segment_ids || []).map(s => `<option value="${s}">${s}</option>`).join('');
+  propFieldChanged();
+}
+function rgbToHex(c) {
+  if (!c) return '#3333ff';
+  const h = c.map(v => Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0'));
+  return '#' + h.join('');
+}
+const hexToRgb = (h) => { h = h.replace('#', ''); return [0, 2, 4].map(i => parseInt(h.substr(i, 2), 16) / 255); };
+function propFieldChanged() {
+  const f = $('propField').value, l = curPropLayer();
+  $('propSegWrap').style.display = f === 'segment_color' ? 'block' : 'none';
+  let html;
+  if (f === 'segment_color' || f === 'default_color') {
+    html = `<input type="color" id="propVal" value="${rgbToHex(f === 'default_color' ? l.default_color : null)}">`;
+  } else if (f === 'visible') {
+    html = `<select id="propVal"><option value="true">true</option><option value="false">false</option></select>`;
+  } else if (f === 'color_seed') {
+    html = `<input type="number" id="propVal" step="1" value="${l ? l.color_seed : 0}" style="width:90px">`;
+  } else {  // object_alpha, silhouette, saturation
+    const v = l && l[f] != null ? l[f] : 1;
+    html = `<input type="number" id="propVal" step="0.05" min="0" value="${v}" style="width:90px">`;
+  }
+  $('propValInput').innerHTML = html;
+}
+async function applyPropagate() {
+  const id = ACTIVE_KF || LAST_KF_ID, l = curPropLayer(); if (!l) return;
+  const f = $('propField').value, raw = $('propVal').value;
+  let value, segment_id = null;
+  if (f === 'segment_color') { value = hexToRgb(raw); segment_id = +$('propSeg').value; }
+  else if (f === 'default_color') value = hexToRgb(raw);
+  else if (f === 'visible') value = raw === 'true';
+  else if (f === 'color_seed') value = parseInt(raw, 10);
+  else value = parseFloat(raw);
+  try {
+    const r = await api('POST', `/api/projects/${PID}/keyframes/${id}/propagate`,
+      { mesh_name: l.mesh_name, field: f, value, segment_id,
+        direction: $('propDir').value, match_old: $('propMatch').checked });
+    $('propMsg').textContent = `changed ${r.count} keyframe(s) — refreshing thumbnails…`;
+    setStatus(`propagated ${f} → ${r.count} keyframe(s)`);
+    reload();
+    refreshPreviews(r.changed);   // re-render edited keyframes + sweep previews so nothing's stale
+  } catch (e) { $('propMsg').textContent = 'error: ' + e.message; }
+}
+
+// ---- after updating a keyframe from NG, offer to propagate the changed settings ----
+let NG_CHANGES = [], NG_PROP_KID = null;
+const FIELD_LABELS = { segment_color: 'segment color', default_color: 'default color',
+  object_alpha: 'opacity (3d)', silhouette: 'silhouette (3d)', saturation: 'saturation',
+  color_seed: 'color seed', visible: 'visible', color: 'color',
+  metallic: 'metallic', roughness: 'roughness' };
+function changeLabel(c) {
+  let s = `${c.mesh_name} • ${FIELD_LABELS[c.field] || c.field}`;
+  if (c.field === 'segment_color') s += ` (seg ${c.segment_id})`;
+  if (['object_alpha', 'silhouette', 'saturation', 'color_seed', 'visible', 'metallic', 'roughness'].includes(c.field))
+    s += `: ${c.old} → ${c.new}`;
+  return s;
+}
+function showNgPropPrompt(kid, changes) {
+  NG_CHANGES = changes; NG_PROP_KID = kid;
+  $('ngChangeList').innerHTML = changes.map(c => `<div>• ${changeLabel(c)}</div>`).join('');
+  $('ngPropMsg').textContent = '';
+  $('ngPropPanel').style.display = 'block';
+}
+async function applyNgPropagate() {
+  const dir = $('ngPropDir').value, matchOnly = $('ngPropMatch').checked;
+  let total = 0;
+  const changedIds = new Set();
+  try {
+    for (const c of NG_CHANGES) {
+      const r = await api('POST', `/api/projects/${PID}/keyframes/${NG_PROP_KID}/propagate`,
+        { mesh_name: c.mesh_name, field: c.field, value: c.new, segment_id: c.segment_id ?? null,
+          direction: dir, match_old: matchOnly, match_value: c.old, match_value_set: true });
+      total += (r.count || 1) - 1;   // exclude the source keyframe itself
+      (r.changed || []).forEach(id => changedIds.add(id));
+    }
+    $('ngPropMsg').textContent = `propagated to ${total} other keyframe(s) — refreshing thumbnails…`;
+    setStatus(`propagated ${NG_CHANGES.length} change(s) to ${total} keyframe(s)`);
+    reload();
+    refreshPreviews([...changedIds]);   // re-render edited keyframes + sweep previews so nothing's stale
+    setTimeout(() => $('ngPropPanel').style.display = 'none', 1500);
+  } catch (e) { $('ngPropMsg').textContent = 'error: ' + e.message; }
+}
+
+// ---- look / glow experiment panel ----
+let PREV_LOOK = null, PREV_IMG = null;
+// material "type" presets — set the Principled knobs (the look panel exposes glow/
+// roughness/specular sliders; metallic/transmission/sheen come from the type).
+const MAT_STYLES = {
+  glossy:     { roughness: 0.25, specular: 0.5, glow: 0.02 },
+  matte:      { roughness: 0.9,  specular: 0.1, glow: 0.02 },
+  plastic:    { roughness: 0.4,  specular: 0.6, glow: 0.02 },
+  metallic:   { roughness: 0.3,  specular: 0.5, metallic: 1.0, glow: 0.02 },
+  chrome:     { roughness: 0.05, specular: 0.5, metallic: 1.0, glow: 0.02 },
+  ceramic:    { roughness: 0.25, specular: 0.5, coat: 1.0, glow: 0.02 },
+  waxy:       { roughness: 0.5,  specular: 0.3, sheen: 1.0, glow: 0.02 },
+  subsurface: { roughness: 0.45, specular: 0.4, subsurface: 1.0, glow: 0.02 },
+  glassy:     { roughness: 0.0,  specular: 0.5, transmission: 1.0, glow: 0.02 },
+  frosted:    { roughness: 0.4,  specular: 0.5, transmission: 0.7, glow: 0.02 },
+  glow:       { roughness: 0.4,  specular: 0.4, glow: 0.4 },
+};
+function syncLookVals() {
+  ['glowVal', 'roughVal', 'specVal'].forEach((v, i) => $(v).textContent = (+$(['lookGlow', 'lookRough', 'lookSpec'][i]).value).toFixed(2));
+}
+function lookMatChanged() {
+  const s = MAT_STYLES[$('lookMat').value]; if (!s) return;
+  $('lookGlow').value = s.glow; $('lookRough').value = s.roughness; $('lookSpec').value = s.specular;
+  syncLookVals();
+}
+function setLookControls(L) {
+  L = L || {};
+  $('lookPreset').value = L.preset || 'neuvid';
+  $('lookMat').value = L.material || 'glossy';
+  $('lookGlow').value = L.glow != null ? L.glow : 0.02;
+  $('lookRough').value = L.roughness != null ? L.roughness : 0.25;
+  $('lookSpec').value = L.specular != null ? L.specular : 0.5;
+  syncLookVals();
+  lookPresetChanged();
+}
+async function openLookPanel() {
+  if (!PID) { setStatus('open a project first'); return; }
+  try { setLookControls((await api('GET', `/api/projects/${PID}/look`)).look || {}); } catch (e) {}
+  $('lookMsg').textContent = '';
+  $('lookCompare').style.display = 'none'; $('lookUndoBtn').style.display = 'none';
+  $('lookPanel').style.display = 'block';
+}
+function lookPresetChanged() {
+  const ng = $('lookPreset').value === 'ng';   // ng uses the flat emission shader (no material knobs)
+  ['lookMat', 'lookGlow', 'lookRough', 'lookSpec'].forEach(id => $(id).disabled = ng);
+}
+// snapshot the selected keyframe's current thumbnail to a data URL (so the 'before'
+// survives the file being overwritten by the new-look render)
+function captureThumb(id) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const c = document.createElement('canvas');
+        c.width = img.naturalWidth || 320; c.height = img.naturalHeight || 180;
+        c.getContext('2d').drawImage(img, 0, 0); resolve(c.toDataURL('image/png'));
+      } catch (e) { resolve(null); }
+    };
+    img.onerror = () => resolve(null);
+    img.src = `/api/projects/${PID}/keyframes/${id}/thumbnail?v=${THUMB_VER[id] || 0}`;
+  });
+}
+function lookFromControls() {
+  const preset = $('lookPreset').value, look = { preset };
+  if (preset !== 'ng') {
+    const s = MAT_STYLES[$('lookMat').value] || {};
+    look.material = $('lookMat').value;
+    look.glow = +$('lookGlow').value; look.roughness = +$('lookRough').value; look.specular = +$('lookSpec').value;
+    look.metallic = s.metallic || 0; look.transmission = s.transmission || 0;
+    look.subsurface = s.subsurface || 0; look.sheen = s.sheen || 0; look.coat = s.coat || 0;
+  }
+  return look;
+}
+async function applyLook() {
+  if (!PID) return;
+  const id = ACTIVE_KF || LAST_KF_ID;
+  // capture BEFORE (look + current thumbnail) so we can compare + undo
+  try { PREV_LOOK = (await api('GET', `/api/projects/${PID}/look`)).look || {}; } catch (e) { PREV_LOOK = {}; }
+  PREV_IMG = id ? await captureThumb(id) : null;
+  const look = lookFromControls();
+  try {
+    await api('POST', `/api/projects/${PID}/look`, { look });
+    if (!id) { $('lookMsg').textContent = 'applied (select a frame to preview)'; setStatus(`look set (${look.preset})`); return; }
+    $('lookMsg').textContent = 'rendering preview…'; setStatus(`look set (${look.preset}) — rendering preview`);
+    await renderThumbAwait(id); await reload();
+    $('lookBefore').src = PREV_IMG || '';
+    $('lookBefore').style.visibility = PREV_IMG ? 'visible' : 'hidden';
+    $('lookAfter').src = `/api/projects/${PID}/keyframes/${id}/thumbnail?v=${THUMB_VER[id] || Date.now()}`;
+    $('lookCompare').style.display = 'block';
+    $('lookUndoBtn').style.display = '';
+    $('lookMsg').textContent = 'done — before vs after below';
+  } catch (e) { $('lookMsg').textContent = 'error: ' + e.message; }
+}
+function showLookZoom() {
+  if (!$('lookAfter').src) return;
+  $('zoomBefore').src = $('lookBefore').src || ''; $('zoomAfter').src = $('lookAfter').src;
+  $('lookZoom').style.display = 'flex';
+}
+function hideLookZoom() { $('lookZoom').style.display = 'none'; }
+async function undoLook() {
+  if (!PID || PREV_LOOK == null) return;
+  try {
+    await api('POST', `/api/projects/${PID}/look`, { look: PREV_LOOK });
+    setLookControls(PREV_LOOK);
+    const id = ACTIVE_KF || LAST_KF_ID;
+    $('lookMsg').textContent = 'reverted — rendering…'; setStatus('look reverted');
+    if (id) { await renderThumbAwait(id); await reload(); }
+    $('lookUndoBtn').style.display = 'none'; $('lookCompare').style.display = 'none';
+    $('lookMsg').textContent = 'reverted';
+  } catch (e) { $('lookMsg').textContent = 'error: ' + e.message; }
 }
 
 refreshProjects();

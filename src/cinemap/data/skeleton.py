@@ -12,11 +12,16 @@ for a whole layer's selected segments) to stay fast across thousands of segments
 """
 from __future__ import annotations
 
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import trimesh
 from cloudvolume import CloudVolume
+
+# concurrent per-segment fetches; logical CPU count (incl. hyperthreading) by default
+_FETCH_WORKERS = int(os.environ.get("CINEMAP_FETCH_WORKERS") or (os.cpu_count() or 8))
 
 # Default tube radius (nm). Skeletons are 1D, so this is a render choice, not data;
 # tuned to read as a visible strand at EM/organelle scale. Override per call.
@@ -192,21 +197,26 @@ class SkeletonLoader:
         if not seg_ids:
             raise ValueError("no segment ids")
         radius = self.radius_nm if radius_nm is None else radius_nm
-        parts: list[trimesh.Trimesh] = []
-        for s in seg_ids:
+
+        def _fetch(s):  # network + tube build per segment, run concurrently
             try:
                 skel = self.cv.skeleton.get(int(s))
             except Exception as e:  # noqa: BLE001
                 print(f"[skeleton] {s} failed: {e}")
-                continue
+                return None
             verts = np.asarray(skel.vertices, dtype=np.float64)
             edges = np.asarray(skel.edges, dtype=np.int64)
             if len(verts) == 0 or len(edges) == 0:
-                continue
+                return None
             rgba = self._edge_colors(skel, edges, s, colorize)
-            tube = edges_to_tubes(verts, edges, radius, rgba=rgba)
-            if tube is not None:
-                parts.append(tube)
+            return edges_to_tubes(verts, edges, radius, rgba=rgba)
+
+        if len(seg_ids) > 1:
+            with ThreadPoolExecutor(max_workers=min(_FETCH_WORKERS, len(seg_ids))) as ex:
+                parts = list(ex.map(_fetch, seg_ids))
+        else:
+            parts = [_fetch(seg_ids[0])]
+        parts = [p for p in parts if p is not None]
         if not parts:
             raise ValueError("no skeleton geometry for the selected segments")
         return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]

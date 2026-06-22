@@ -24,7 +24,8 @@ def get_viewer() -> neuroglancer.Viewer:
         # is opened from another machine (the URL host is rewritten per-request to
         # whatever host the browser used — see server._ng_url_for).
         neuroglancer.set_server_bind_address(
-            os.environ.get("CINEMAP_NG_BIND", "0.0.0.0")
+            os.environ.get("CINEMAP_NG_BIND", "0.0.0.0"),
+            int(os.environ.get("CINEMAP_NG_PORT", "0") or "0"),
         )
         _viewer = neuroglancer.Viewer()
     return _viewer
@@ -130,6 +131,10 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
         if (link and name in by_name and ldict.get("visible", True) is not False
                 and not vis.get(name) and vis.get(link)):
             vis[name] = list(vis[link])
+    # CineMap-only material (metallic/roughness) isn't in the neuroglancer state, so a
+    # freshly-baked keyframe would lose it. Inherit it per-layer from the previous keyframe
+    # so "set reflective, then add a keyframe" carries the look forward (incl. after import).
+    prev_by_name = {m.mesh_name: m for m in (prev or [])}
     meshes: list[MeshInstance] = []
     for name, ids in vis.items():
         lc = lcolors.get(name)
@@ -140,6 +145,12 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
                           saturation=lc.saturation)
         if name in layers:
             fields.update(_colors.render3d_from_layer(layers[name]))  # Opacity/Silhouette (3d)
+        pm = prev_by_name.get(name)
+        if pm is not None:
+            if getattr(pm, "metallic", None) is not None:
+                fields["metallic"] = pm.metallic
+            if getattr(pm, "roughness", None) is not None:
+                fields["roughness"] = pm.roughness
         meshes.append(MeshInstance(mesh_name=name, **fields))
     return meshes
 
@@ -160,9 +171,29 @@ def _scene_from_view(project: Project, st: dict | None = None):
     show_slice = layer_vis.get(em_name, True) and st.get("layout") != "3d"
     slices = ([SlicePlane(em_name=em_name, axis="z", position_nm=cam.look_at_nm[2])]
               if show_slice else [])
-    meshes = _meshes_from_visible(project, st=st)
+    prev = project.keyframes[-1].meshes if project.keyframes else None
+    meshes = _meshes_from_visible(project, prev=prev, st=st)   # inherit material from last kf
     annotations = _annotations_from_view(project, st)
     return cam, slices, meshes, annotations, st
+
+
+def _state_declares_render_layers(project: Project, st: dict) -> bool:
+    """Whether this NG state explicitly says something about renderable layers.
+
+    If a state has known mesh/segmentation or EM layers but they are hidden or empty, that
+    is an intentional blank/slice-only state. Do not treat it as a failed capture and copy
+    previous meshes forward.
+    """
+    mesh_names = {m.name for m in project.manifest.meshes}
+    em_name = project.manifest.em.name if project.manifest.em else None
+    for layer in st.get("layers", []):
+        name = layer.get("name")
+        typ = layer.get("type")
+        if typ == "segmentation" and name in mesh_names:
+            return True
+        if typ == "image" and name == em_name:
+            return True
+    return False
 
 
 def _hex_to_rgb(h: str) -> list[float]:
@@ -177,13 +208,15 @@ def _annotations_from_view(project: Project, st: dict) -> list[AnnotationInstanc
     the serialized state. Layers backed only by a precomputed source (no inline
     `annotations`) are skipped for now."""
     from .data import annotations as _ann
+    from .data.ng_camera import _voxel_nm_from_state, _xyz_perm
 
-    vox = project.manifest.voxel_size_nm
+    vox = _voxel_nm_from_state(st, project.manifest.voxel_size_nm)  # NG grid, dim order
+    perm = _xyz_perm(st)
     out: list[AnnotationInstance] = []
     for layer in st.get("layers", []):
         if layer.get("type") != "annotation":
             continue
-        prims = _ann.parse_inline(layer, vox)
+        prims = _ann.parse_inline(layer, vox, perm)
         if not _ann.has_geometry(prims):
             continue
         out.append(AnnotationInstance(
@@ -198,7 +231,9 @@ def _annotations_from_view(project: Project, st: dict) -> list[AnnotationInstanc
 def bake_keyframe(project: Project, label: str = "scouted", st: dict | None = None) -> Keyframe:
     """Build a NEW keyframe from a neuroglancer state (the live view by default)."""
     cam, slices, meshes, annotations, st = _scene_from_view(project, st)
-    if not meshes and not slices and project.keyframes:  # nothing on -> keep previous meshes
+    _merge_manifest(project, st)   # learn layers new to this view (e.g. an EM image just added)
+    if (not meshes and not slices and project.keyframes
+            and not _state_declares_render_layers(project, st)):
         meshes = [m.model_copy() for m in project.keyframes[-1].meshes]
     kf = Keyframe(id=ops._uid("kf"), label=label, camera=cam, slices=slices,
                   meshes=meshes, annotations=annotations, ng_state=st)
@@ -233,6 +268,23 @@ def _merge_manifest(project: Project, state: dict) -> None:
         project.manifest.em = m.em
 
 
+def _bg_from_state(state: dict) -> list[float] | None:
+    """The neuroglancer 3D (perspective) view background = `projectionBackgroundColor`
+    (a CSS hex). Default is black. Returned LINEAR so it round-trips through Blender's
+    Standard (sRGB) view transform back to exactly the color NG shows."""
+    from .data.colors import hex_to_rgb
+
+    bg = state.get("projectionBackgroundColor")
+    if not isinstance(bg, str) or not bg:
+        return [0.0, 0.0, 0.0]
+    try:
+        srgb = hex_to_rgb(bg)
+    except Exception:  # noqa: BLE001
+        return [0.0, 0.0, 0.0]
+    # sRGB -> linear (Blender background colors are linear)
+    return [(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4) for c in srgb]
+
+
 def import_states(project: Project, links: list[tuple]) -> tuple[list[Keyframe], list[str]]:
     """Bake one keyframe per (label, state-link[, duration]). A per-entry duration
     (from a neuroglancer video_tool script) sets the transition INTO that keyframe.
@@ -247,6 +299,8 @@ def import_states(project: Project, links: list[tuple]) -> tuple[list[Keyframe],
         duration = entry[2] if len(entry) > 2 else None
         try:
             state = fetch_state(link)
+            if not created:                  # first state sets the NG view background
+                project.lighting.background = _bg_from_state(state)
             _merge_manifest(project, state)  # register layers new to this state
             kf = bake_keyframe_from_state(project, state, label=label)
             # match neuroglancer's video_tool: linear interpolation between states,
@@ -269,11 +323,22 @@ def update_keyframe_from_view(project: Project, keyframe_id: str) -> Keyframe | 
     if kf is None:
         return None
     cam, slices, meshes, annotations, st = _scene_from_view(project)
+    _merge_manifest(project, st)   # learn layers new to this view (e.g. an EM image just added)
     updated = kf.model_copy(update={"camera": cam, "slices": slices, "meshes": meshes,
                                     "annotations": annotations, "ng_state": st})
     project.keyframes = [updated if k.id == keyframe_id else k for k in project.keyframes]
     ops.store.save(project)
     return updated
+
+
+def sync_manifest_from_view(project: Project) -> Project:
+    """Union the live neuroglancer view's layers into the project manifest WITHOUT
+    baking a keyframe — so a volume just added in the viewer (e.g. an EM image, or a
+    segmentation with a label volume) becomes sliceable right away. Returns the project."""
+    st = get_viewer().state.to_json()
+    _merge_manifest(project, st)
+    ops.store.save(project)
+    return project
 
 
 def sync_segments(project: Project, keyframe_id: str) -> Keyframe | None:

@@ -1,0 +1,29 @@
+{
+  // CineMap's projects/ tree is runtime data: ~56k files / 23 GB (projects/.mesh_cache
+  // alone has ~43k .ply, plus render-frame PNGs, assets, snapshots). VS Code's file
+  // watcher ignores .gitignore, so it tries to watch ALL of it — and over NFS that melts
+  // the watcher and makes the editor slow / crash. Exclude the whole tree from watching
+  // and search. (Reload the window after changing this: Cmd/Ctrl-Shift-P -> Reload Window.)
+  "files.watcherExclude": {
+    "**/.git/**": true,
+    "**/projects/**": true,
+    "**/*.ply": true,
+    "**/*.blend": true,
+    "**/__pycache__/**": true,
+    "**/.mesh_cache/**": true
+  },
+  "search.exclude": {
+    "**/projects/**": true,
+    "**/*.ply": true,
+    "**/*.blend": true,
+    "**/*.cinemap.json": true,
+    "**/__pycache__/**": true
+  },
+  // explorer: hide the bulky generated sub-trees, but still show project.json etc.
+  "files.exclude": {
+    "**/projects/.mesh_cache": true,
+    "**/projects/*/renders": true,
+    "**/projects/*/assets": true,
+    "**/__pycache__": true
+  }
+}
