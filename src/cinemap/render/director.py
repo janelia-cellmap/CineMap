@@ -173,6 +173,8 @@ def _frame_starts(keyframes, fps: int) -> tuple[list[int], int]:
     f = 0
     for i, kf in enumerate(keyframes):
         starts.append(f)
+        hold = getattr(kf, "hold_in_s", 0.0) or 0.0
+        f += 0 if hold <= 0 else int(round(hold * fps))
         if i < len(keyframes) - 1:
             d = keyframes[i + 1].duration_in_s
             f += 0 if d <= 0 else max(1, int(round(d * fps)))

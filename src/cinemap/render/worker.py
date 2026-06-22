@@ -20,7 +20,7 @@ from ..config import NM_PER_BU, PROJECTS_DIR
 from ..models import Manifest, Project, RenderJob
 from ..data.mesh_loader import MeshLoader
 from ..data.slice_loader import EMVolume, get_volume
-from .interpolate import FrameAnnotation, FrameState, build_frames
+from .interpolate import FrameAnnotation, FrameState, build_frames, state_at_time
 
 Progress = Callable[[float, str], None]
 
@@ -926,6 +926,7 @@ class RenderWorker:
                 },
                 "slices": slices,
                 "mesh_overrides": overrides,
+                "fade_alpha": max(0.0, min(1.0, float(getattr(fr, "fade_alpha", 0.0) or 0.0))),
                 "index": index_offset + fi,   # global frame index (split cluster jobs)
             })
             self._progress(0.45 + 0.15 * (fi + 1) / len(frames),
@@ -1062,19 +1063,10 @@ class RenderWorker:
     def _state_at_time(self, t: float):
         """The interpolated FrameState (camera/slices/meshes) at a GLOBAL time t (seconds),
         for one-off snapshot frames. Holds the last keyframe past the end."""
-        from .interpolate import _ease, _state_at
         kfs = self.project.keyframes
-        if not kfs:
-            return None
-        # only transitions take time (keyframes are instants); walk cumulative transitions.
-        cum = 0.0
-        for i in range(len(kfs) - 1):
-            d = kfs[i + 1].duration_in_s or 0.0
-            if t <= cum + d or i == len(kfs) - 2:
-                local = 0.0 if d <= 0 else min(1.0, max(0.0, (t - cum) / d))
-                return _state_at(kfs[i], kfs[i + 1], _ease(local, kfs[i + 1].easing))
-            cum += d
-        return _state_at(kfs[-1], kfs[-1], 0.0)
+        from . import director as _director
+        smooth = self._auto_direct and _director.DirectorSettings().smooth_camera
+        return state_at_time(kfs, t, smooth_ends=smooth)
 
     def render_snapshots(self, times: list[float], out_dir) -> list[str]:
         """Render single still frames at the given GLOBAL times (seconds) into out_dir —

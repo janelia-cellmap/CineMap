@@ -120,6 +120,7 @@ class FrameState:
     slices: list[FrameSlice] = field(default_factory=list)
     meshes: list[FrameMesh] = field(default_factory=list)
     annotations: list[FrameAnnotation] = field(default_factory=list)
+    fade_alpha: float = 0.0
 
 
 def _clip_dict(c) -> dict | None:
@@ -216,14 +217,64 @@ def _state_at(a: Keyframe, b: Keyframe, t: float) -> FrameState:
     return fs
 
 
+def _with_fade(fs: FrameState, alpha: float) -> FrameState:
+    fs.fade_alpha = max(0.0, min(1.0, float(alpha)))
+    return fs
+
+
+def _transition_state(a: Keyframe, b: Keyframe, t: float, style: str,
+                      easing: str) -> FrameState:
+    """Frame for one transition, before any global sweep overlays are evaluated."""
+    if style == "cut":
+        # The move has duration, but the scene itself does not interpolate: hold the
+        # source pose until the next keyframe's arrival time, then the following frame
+        # starts from the destination pose.
+        return _state_at(a, a, 0.0)
+    if style == "fade":
+        # Fade through black. This avoids mixing two full 3D renders in post while still
+        # giving an editorial fade between poses/states.
+        if t < 0.5:
+            return _with_fade(_state_at(a, a, 0.0), t * 2.0)
+        return _with_fade(_state_at(b, b, 0.0), (1.0 - t) * 2.0)
+    return _state_at(a, b, _ease(t, easing))
+
+
+def state_at_time(keyframes: list[Keyframe], t: float,
+                  smooth_ends: bool = False) -> FrameState | None:
+    """Evaluate the timeline at global time `t` seconds, including holds and transition
+    styles. Used by sweep/snapshot previews so their timing matches full renders."""
+    if not keyframes:
+        return None
+    t = max(0.0, float(t))
+    n_trans = len(keyframes) - 1
+    cum = 0.0
+    for i in range(n_trans):
+        a, b = keyframes[i], keyframes[i + 1]
+        hold = max(0.0, float(getattr(a, "hold_in_s", 0.0) or 0.0))
+        if t < cum + hold:
+            return _state_at(a, a, 0.0)
+        cum += hold
+        dur = max(0.0, float(getattr(b, "duration_in_s", 0.0) or 0.0))
+        if dur > 0.0 and t < cum + dur:
+            if smooth_ends:
+                ease = ("ease-in-out" if n_trans == 1 else
+                        "ease-in" if i == 0 else "ease-out" if i == n_trans - 1 else "linear")
+            else:
+                ease = b.easing
+            local = (t - cum) / dur
+            return _transition_state(a, b, local, getattr(b, "transition", "glide"), ease)
+        cum += dur
+    return _state_at(keyframes[-1], keyframes[-1], 0.0)
+
+
 def build_frames(keyframes: list[Keyframe], fps: int,
                  smooth_ends: bool = False) -> list[FrameState]:
     """Flatten keyframes to per-frame states, matching neuroglancer's video_tool
-    exactly: for each transition i->i+1 emit round(duration*fps) frames at t = k/n
-    for k in [0, n) (so keyframe i is shown at the START of its outgoing transition),
-    then one final frame holding the last keyframe. `duration_in_s` is stored on the
-    DESTINATION keyframe (the transition into it). A duration of 0 emits no transition
-    frames (an instant cut).
+    for normal glide transitions: for each transition i->i+1 emit round(duration*fps)
+    frames at t = k/n for k in [0, n). `duration_in_s` is stored on the DESTINATION
+    keyframe (the transition into it). A duration of 0 emits no transition frames.
+    `transition` controls whether those frames glide, hold-then-cut, or fade through
+    black; `hold_in_s` on a keyframe adds dwell time before its outgoing transition.
 
     `smooth_ends` (the director's cinematic motion) eases into the FIRST transition
     and out of the LAST, but keeps the middle LINEAR — so the camera glides to a
@@ -232,20 +283,24 @@ def build_frames(keyframes: list[Keyframe], fps: int,
     total duration as video_tool either way."""
     if not keyframes:
         return []
-    # Keyframes are instants; only the TRANSITIONS between them take time. A dwell/"hold"
-    # is just a transition between two identical keyframes (the camera doesn't move), so
-    # timing falls out of the transition durations alone — and the sweep lane lines up.
     frames: list[FrameState] = []
     n_trans = len(keyframes) - 1
     for i in range(n_trans):
         a, b = keyframes[i], keyframes[i + 1]
+        hold_n = int(round(max(0.0, float(getattr(a, "hold_in_s", 0.0) or 0.0)) * fps))
+        for _ in range(hold_n):
+            frames.append(_state_at(a, a, 0.0))
         n = 0 if b.duration_in_s <= 0 else max(1, int(round(b.duration_in_s * fps)))
         if smooth_ends:
             ease = ("ease-in-out" if n_trans == 1 else
                     "ease-in" if i == 0 else "ease-out" if i == n_trans - 1 else "linear")
         else:
             ease = b.easing
+        style = getattr(b, "transition", "glide")
         for k in range(n):
-            frames.append(_state_at(a, b, _ease(k / n, ease)))
+            frames.append(_transition_state(a, b, k / n, style, ease))
     frames.append(_state_at(keyframes[-1], keyframes[-1], 0.0))  # final keyframe, 1 frame
+    final_hold_n = int(round(max(0.0, float(getattr(keyframes[-1], "hold_in_s", 0.0) or 0.0)) * fps))
+    for _ in range(final_hold_n):
+        frames.append(_state_at(keyframes[-1], keyframes[-1], 0.0))
     return frames

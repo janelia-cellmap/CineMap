@@ -60,7 +60,10 @@ TOOLS = [
     {"name": "set_keyframe", "description": "Edit a keyframe's transition timing.",
      "input_schema": {"type": "object", "properties": {
          "index": {"type": "integer"}, "duration_in_s": {"type": "number"},
-         "easing": {"type": "string", "enum": ["linear", "ease-in-out"]}}, "required": ["index"]}},
+         "hold_in_s": {"type": "number"},
+         "easing": {"type": "string", "enum": ["linear", "ease-in-out"]},
+         "transition": {"type": "string", "enum": ["glide", "cut", "fade"]}},
+         "required": ["index"]}},
     {"name": "set_keyframe_segments", "description": "Set which segment ids of a mesh layer are shown in a keyframe.",
      "input_schema": {"type": "object", "properties": {
          "index": {"type": "integer"}, "mesh_name": {"type": "string"},
@@ -86,6 +89,7 @@ def _kf_summary(p: Project) -> list[dict]:
     for i, k in enumerate(p.keyframes):
         out.append({
             "index": i, "label": k.label, "duration_in_s": k.duration_in_s,
+            "hold_in_s": k.hold_in_s, "transition": getattr(k, "transition", "glide"),
             "look_at_nm": [round(x) for x in k.camera.look_at_nm],
             "slices": [{"axis": s.axis, "position_nm": round(s.position_nm), "visible": s.visible} for s in k.slices],
             "meshes": [{"layer": m.mesh_name, "n_segments": len(m.segment_ids), "visible": m.visible} for m in k.meshes],
@@ -134,7 +138,8 @@ def _dispatch(name: str, args: dict, p: Project, render_fn: Callable | None) -> 
         ops.reorder_keyframes(p, ids)
         return {"ok": True}
     if name == "set_keyframe":
-        fields = {k: args[k] for k in ("duration_in_s", "easing") if k in args}
+        fields = {k: args[k] for k in ("duration_in_s", "hold_in_s", "easing", "transition")
+                  if k in args}
         ops.update_keyframe(p, _kid(p, args["index"]), **fields)
         return {"ok": True}
     if name == "set_keyframe_segments":

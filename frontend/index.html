@@ -75,6 +75,8 @@
   .kfmark .del:hover { opacity:1; }
   .tltrans { position:absolute; top:64px; height:18px; background:linear-gradient(90deg,#3a4358,#566184); border-radius:4px; display:flex; align-items:center; padding:0 5px; cursor:pointer; overflow:hidden; z-index:1; }
   .tltrans.hold { background:repeating-linear-gradient(45deg,#262b36,#262b36 5px,#323847 5px,#323847 10px); }
+  .tltrans.cut { background:#4c5667; }
+  .tltrans.fade { background:linear-gradient(90deg,#566184,#090b10 50%,#566184); }
   .tltrans .trlbl { font-size:10px; color:#cdd3ff; white-space:nowrap; text-shadow:0 1px 2px #000; }
   .tltrans .trgrip { position:absolute; right:0; top:0; width:7px; height:100%; cursor:ew-resize; background:rgba(255,255,255,.28); }
   .tltrans .trgrip:hover { background:#8a8fff; }
@@ -93,7 +95,7 @@
   .swsnap { position:absolute; top:4px; height:22px; width:2px; background:#8a8fff; pointer-events:none; box-shadow:0 0 4px #8a8fff; }
   #swHover .swhovcap { font-size:10px; color:#aab0ff; margin-bottom:4px; }
   /* click-to-edit popover for a transition (duration + easing) */
-  #transEdit { position:fixed; z-index:80; display:none; width:208px; background:#1a1d22;
+  #transEdit { position:fixed; z-index:80; display:none; width:228px; background:#1a1d22;
                border:1px solid #3a3f47; border-radius:8px; padding:10px 12px; font-size:12px;
                box-shadow:0 6px 24px rgba(0,0,0,.55); }
   #transEdit .te-hd { display:flex; justify-content:space-between; align-items:center; font-weight:600; margin-bottom:8px; }
@@ -545,12 +547,19 @@ async function setKfTiming(id, fields) {
   await api('PUT', `/api/projects/${PID}/keyframes/${id}/duration`, fields);
   reload();
 }
-// ---- two-row timeline: keyframes are INSTANTS; only TRANSITIONS take time ----
-// A "hold" is just a transition between two identical keyframes (camera doesn't move). So
-// time = sum of transition durations, and the sweep lane below lines up exactly (pure t*px).
+// ---- two-row timeline: keyframes are instants; holds + transitions take time ----
 const TL_PX = 64, MARKER = 92;                 // px per second; keyframe thumbnail width
 let TL_XOF = (t)=>t*TL_PX + MARKER/2, TL_WIDTH = 0;   // shared time->x (set by renderKeyframes)
 const fmtS = v => (+v).toFixed(2).replace(/\.?0+$/, '');
+const durS = k => Math.max(0, +(k && k.duration_in_s) || 0);
+const holdS = k => Math.max(0, +(k && k.hold_in_s) || 0);
+const transStyle = k => (k && ['glide','cut','fade'].includes(k.transition)) ? k.transition : 'glide';
+const transIcon = s => s === 'cut' ? '⏭' : (s === 'fade' ? '◐' : '▶');
+function keyframeTimes(kfs) {
+  const tAt = [0];
+  for (let i = 1; i < kfs.length; i++) tAt.push(tAt[i - 1] + holdS(kfs[i - 1]) + durS(kfs[i]));
+  return tAt;
+}
 function populateBboxSources(p) {
   const sel = $('bboxSource'); if (!sel) return;
   const cur = sel.value, m = (p && p.manifest) || {};
@@ -569,23 +578,31 @@ function renderKeyframes(p) {
     tl.style.width=''; tl.innerHTML='<span class="msg" style="padding:10px">no keyframes yet — Bake one from the scouting view</span>';
     $('kfCount').textContent='0 keyframes'; renderSweeps(p); return;
   }
-  // cumulative time of each keyframe — only transitions (the moves) take time
-  const tAt=[0]; for (let i=1;i<kfs.length;i++) tAt.push(tAt[i-1] + (+kfs[i].duration_in_s||0));
+  // cumulative arrival time of each keyframe: previous hold, then transition into this one.
+  const tAt = keyframeTimes(kfs);
   KF_TIME = {}; kfs.forEach((k,i)=>{ KF_TIME[k.id]=tAt[i]; });   // id -> timeline time (s)
-  const T = tAt[kfs.length-1];
+  const T = tAt[kfs.length-1] + holdS(kfs[kfs.length-1]);
   const swEnd = Math.max(0, ...(p.sweeps||[]).map(s=>s.start_s+s.duration_s));
   const Tm = Math.max(T, swEnd, 0.1);
   TL_XOF = (t)=>t*TL_PX + MARKER/2;             // shift right by half a marker so KF0 fits
   TL_WIDTH = TL_XOF(Tm) + MARKER/2;
   let html='';
-  // transition blocks (the moves) between consecutive keyframes
+  // hold blocks after keyframes
+  for (let i=0;i<kfs.length;i++){
+    const h = holdS(kfs[i]); if (h <= 0) continue;
+    const x0 = TL_XOF(tAt[i]), w = Math.max(2, h * TL_PX);
+    html += `<div class="tltrans hold" style="left:${x0}px;width:${w}px"
+        title="hold on KF${i} · ${fmtS(h)}s · click to edit" onclick="openTransEdit(event,'${kfs[i].id}')">
+      <span class="trlbl">⏸${fmtS(h)}s</span></div>`;
+  }
+  // transition blocks between consecutive keyframes
   for (let i=1;i<kfs.length;i++){
-    const k=kfs[i], x0=TL_XOF(tAt[i-1]), w=Math.max(2,(tAt[i]-tAt[i-1])*TL_PX);
+    const k=kfs[i], st=transStyle(k), x0=TL_XOF(tAt[i-1] + holdS(kfs[i-1])), w=Math.max(2,durS(k)*TL_PX);
     const hold = JSON.stringify(kfs[i-1].camera)===JSON.stringify(k.camera);   // identical pose = a dwell
-    html += `<div class="tltrans${hold?' hold':''}" style="left:${x0}px;width:${w}px"
-        title="${hold?'hold (no move)':'move'} into KF${i} · ${fmtS(k.duration_in_s)}s · click to edit · drag the right edge to resize" onclick="openTransEdit(event,'${k.id}')">
-      <span class="trlbl">${hold?'⏸':'▶'}${fmtS(k.duration_in_s)}s</span>
-      <span class="trgrip" onmousedown="event.stopPropagation(); startTransDrag(event,'${k.id}',${+k.duration_in_s||0})"></span></div>`;
+    html += `<div class="tltrans ${hold?'hold ':''}${st}" style="left:${x0}px;width:${w}px"
+        title="${hold?'hold pose':st} into KF${i} · ${fmtS(durS(k))}s · click to edit · drag the right edge to resize" onclick="openTransEdit(event,'${k.id}')">
+      <span class="trlbl">${hold?'⏸':transIcon(st)}${fmtS(durS(k))}s</span>
+      <span class="trgrip" onmousedown="event.stopPropagation(); startTransDrag(event,'${k.id}',${durS(k)})"></span></div>`;
   }
   // keyframe markers (instants) — thumbnails centered on their time
   for (let i=0;i<kfs.length;i++){
@@ -610,35 +627,44 @@ function startTransDrag(e, id, v0) {
     await api('PUT', `/api/projects/${PID}/keyframes/${id}/duration`, {duration_in_s: val}); reload(); };
   window.addEventListener('mousemove',move); window.addEventListener('mouseup',up);
 }
-// click a transition -> small popover to type its duration + pick easing (drag still resizes)
+// click a transition -> small popover to type its duration/style + pick easing
 function openTransEdit(e, id) {
   e.stopPropagation();
   const kfs=(CUR&&CUR.keyframes)||[], i=kfs.findIndex(k=>k.id===id), k=kfs[i];
   if(!k) return;
   const hold = i>0 && JSON.stringify(kfs[i-1].camera)===JSON.stringify(k.camera);
+  const st = transStyle(k);
   let pop=$('transEdit');
   if(!pop){ pop=document.createElement('div'); pop.id='transEdit'; document.body.appendChild(pop); }
   pop.innerHTML=`
-    <div class="te-hd">${hold?'⏸ Hold':'▶ Move'} → KF${i}<span class="te-x" onclick="closeTransEdit()">✕</span></div>
-    <label>duration <input id="teDur" type="number" min="0" step="0.1" value="${fmtS(k.duration_in_s)}" />s</label>
+    <div class="te-hd">${i===0?'KF0':(hold?'⏸ Hold':'Move')} → KF${i}<span class="te-x" onclick="closeTransEdit()">✕</span></div>
+    ${i>0 ? `<label>style <select id="teTrans">
+      ${[['glide','glide / interpolate'],['cut','cut'],['fade','fade through black']].map(([v,t])=>`<option value="${v}"${st===v?' selected':''}>${t}</option>`).join('')}
+    </select></label>
+    <label>duration <input id="teDur" type="number" min="0" step="0.1" value="${fmtS(durS(k))}" />s</label>
     <label>easing <select id="teEase">
       ${['ease-in-out','linear','ease-in','ease-out'].map(o=>`<option value="${o}"${(k.easing||'ease-in-out')===o?' selected':''}>${o}</option>`).join('')}
-    </select></label>
+    </select></label>` : ''}
+    <label>hold after <input id="teHold" type="number" min="0" step="0.1" value="${fmtS(holdS(k))}" />s</label>
     <div class="te-row"><button onclick="gotoKf('${id}',null); closeTransEdit()">view</button>
       <button class="primary" onclick="applyTransEdit('${id}')">apply</button></div>
-    <div class="te-hint">0s = instant cut. Easing applies when Director is off.</div>`;
-  pop.style.left=Math.min(e.clientX, window.innerWidth-224)+'px';
-  pop.style.top=Math.max(10, e.clientY-170)+'px';
+    <div class="te-hint">Cut holds the previous pose, then jumps. Fade goes through black.</div>`;
+  pop.style.left=Math.min(e.clientX, window.innerWidth-252)+'px';
+  pop.style.top=Math.max(10, e.clientY-210)+'px';
   pop.style.display='block';
-  $('teDur').focus(); $('teDur').select();
+  const focusEl = $('teDur') || $('teHold');
+  if (focusEl) { focusEl.focus(); focusEl.select(); }
   setTimeout(()=>document.addEventListener('mousedown', _teOutside), 0);
 }
 function _teOutside(ev){ const p=$('transEdit'); if(p && !p.contains(ev.target)){ closeTransEdit(); } }
 function closeTransEdit(){ const p=$('transEdit'); if(p) p.style.display='none'; document.removeEventListener('mousedown', _teOutside); }
 async function applyTransEdit(id){
-  const dur=Math.max(0, parseFloat($('teDur').value)||0), ease=$('teEase').value;
+  const fields = { hold_in_s: Math.max(0, parseFloat($('teHold').value)||0) };
+  if ($('teDur')) fields.duration_in_s = Math.max(0, parseFloat($('teDur').value)||0);
+  if ($('teEase')) fields.easing = $('teEase').value;
+  if ($('teTrans')) fields.transition = $('teTrans').value;
   closeTransEdit();
-  await setKfTiming(id, {duration_in_s: dur, easing: ease});
+  await setKfTiming(id, fields);
 }
 // the time (s) on the timeline of the keyframe you're currently on — anchors new sweeps "here"
 function activeKfTime(){ const id=ACTIVE_KF||LAST_KF_ID; return (id!=null && KF_TIME[id]!=null) ? KF_TIME[id] : 0; }
@@ -650,8 +676,7 @@ function renderSweeps(p) {
   const lane = $('sweepLane'); if (!lane) return;
   const sweeps = p.sweeps || [];
   // snap targets = each keyframe's time (so dragging a sweep snaps to keyframe moments)
-  let t = 0; SWEEP_SNAPS = [0];
-  for (let i = 1; i < (p.keyframes||[]).length; i++) { t += (p.keyframes[i].duration_in_s || 0); SWEEP_SNAPS.push(t); }
+  SWEEP_SNAPS = keyframeTimes(p.keyframes || []);
   lane.style.width = TL_WIDTH + 'px';   // same width/scale as the keyframe lane above
   if (!sweeps.length) { lane.innerHTML = ''; return; }
   lane.innerHTML = sweeps.map(s => {

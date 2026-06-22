@@ -13,6 +13,7 @@ Invoke:  python -m cinemap.render.blender_script <scene.json>
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -888,6 +889,72 @@ def _set_camera(frame: dict) -> None:
         cam.data.dof.use_dof = False
 
 
+_fade_overlay = None
+
+
+def _ensure_fade_overlay():
+    global _fade_overlay
+    try:
+        if _fade_overlay and _fade_overlay.name in bpy.data.objects:
+            return _fade_overlay
+    except ReferenceError:
+        _fade_overlay = None
+    mesh = bpy.data.meshes.new("cm_fade_overlay_mesh")
+    mesh.from_pydata([[-1, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0]], [], [[0, 1, 2, 3]])
+    mesh.update()
+    obj = bpy.data.objects.new("cm_fade_overlay", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    obj.visible_shadow = False
+
+    mat = bpy.data.materials.new("cm_fade_overlay_mat")
+    mat.use_nodes = True
+    mat.blend_method = "BLEND"
+    mat.show_transparent_back = False
+    nt = mat.node_tree
+    nt.nodes.clear()
+    alpha = nt.nodes.new("ShaderNodeValue")
+    alpha.name = "cm_fade_alpha"
+    alpha.outputs[0].default_value = 0.0
+    transp = nt.nodes.new("ShaderNodeBsdfTransparent")
+    black = nt.nodes.new("ShaderNodeBsdfDiffuse")
+    black.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+    mix = nt.nodes.new("ShaderNodeMixShader")
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    nt.links.new(alpha.outputs[0], mix.inputs[0])
+    nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
+    nt.links.new(black.outputs["BSDF"], mix.inputs[2])
+    nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+    obj.data.materials.append(mat)
+    _fade_overlay = obj
+    return obj
+
+
+def _set_fade_overlay(frame: dict, f: int | None = None) -> None:
+    alpha = max(0.0, min(1.0, float(frame.get("fade_alpha", 0.0) or 0.0)))
+    obj = _ensure_fade_overlay()
+    cam = bpy.context.scene.camera
+    obj.parent = cam
+    obj.matrix_parent_inverse = Matrix.Identity(4)
+    obj.location = (0.0, 0.0, -1.0)
+    obj.rotation_euler = (0.0, 0.0, 0.0)
+    aspect = max(1e-6, bpy.context.scene.render.resolution_x / max(1, bpy.context.scene.render.resolution_y))
+    if cam and cam.data.type == "ORTHO":
+        h = float(cam.data.ortho_scale)
+    else:
+        h = 2.0 * math.tan(float(frame["camera"]["fov_rad"]) / 2.0)
+    obj.scale = (h * aspect * 0.5, h * 0.5, 1.0)
+    obj.hide_render = obj.hide_viewport = alpha <= 0.001
+    av = obj.active_material.node_tree.nodes.get("cm_fade_alpha")
+    if av is not None:
+        av.outputs[0].default_value = alpha
+        if f is not None:
+            av.outputs[0].keyframe_insert("default_value", frame=f)
+    if f is not None:
+        obj.keyframe_insert("hide_render", frame=f)
+        obj.keyframe_insert("hide_viewport", frame=f)
+        obj.keyframe_insert("scale", frame=f)
+
+
 def _recover_meshes(spec: dict):
     """Rebuild the {id: (obj, mat)} map (and the _orig_mesh / _mat_base globals) from a
     warm-cached .blend that was just opened — so we skip the expensive re-import + weld.
@@ -967,6 +1034,7 @@ def main(scene_path: str) -> None:
             _update_lights(frame, rig)
         _build_slices(frame)
         _set_mesh_state(meshes, frame.get("mesh_overrides", {}), base_emit)
+        _set_fade_overlay(frame)
         idx = frame.get("index", fi)  # global frame index (for split cluster jobs)
         scene.render.filepath = f"{out_dir}/frame_{idx:05d}.png"
         print(f"[blender] frame {fi + 1}/{len(spec['frames'])}", flush=True)
@@ -1060,6 +1128,7 @@ def export_blend(spec: dict) -> None:
         scene.frame_set(f)
         _keyframe_camera(frame, f)
         _keyframe_meshes(meshes, frame.get("mesh_overrides", {}), f)
+        _set_fade_overlay(frame, f)
         print(f"[blender] frame {fi + 1}/{n}", flush=True)
 
     scene.frame_set(1)

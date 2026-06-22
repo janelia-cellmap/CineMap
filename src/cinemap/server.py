@@ -561,12 +561,13 @@ class DurationReq(BaseModel):
     duration_in_s: float | None = None
     hold_in_s: float | None = None
     easing: str | None = None
+    transition: str | None = None
 
 
 @app.put("/api/projects/{pid}/keyframes/{kid}/duration")
 def set_keyframe_duration(pid: str, kid: str, req: DurationReq):
     """Set a keyframe's transition TIMING — duration (seconds the camera/slice glides INTO
-    this keyframe; 0 = instant cut) and/or easing (how it accelerates)."""
+    this keyframe), hold time after it, easing, and transition style."""
     p = store.load(pid)
     kf = next((k for k in p.keyframes if k.id == kid), None)
     if kf is None:
@@ -578,6 +579,10 @@ def set_keyframe_duration(pid: str, kid: str, req: DurationReq):
         fields["hold_in_s"] = max(0.0, float(req.hold_in_s))
     if req.easing:
         fields["easing"] = req.easing
+    if req.transition:
+        if req.transition not in ("glide", "cut", "fade"):
+            raise HTTPException(400, "transition must be glide, cut, or fade")
+        fields["transition"] = req.transition
     ops.update_keyframe(p, kid, **fields)
     return {"ok": True, **fields}
 
