@@ -218,6 +218,25 @@ class EMVolume:
             scale_level=level,
         )
 
+    def pick_level_for_nm_per_px(self, axis: str, nm_per_px: float) -> int:
+        """Neuroglancer-style multiscale choice from physical screen scale.
+
+        Pick the coarsest level whose in-plane voxel spacing is no larger than one
+        rendered pixel. This keeps the loaded EM resolution tied to the view's physical
+        scale instead of to an arbitrary output image size.
+        """
+        if nm_per_px <= 0:
+            return 0
+        ua, va = self._INPLANE[axis]
+        best = 0
+        for lvl, scale in enumerate(self.level_scale_nm):
+            in_plane_nm = max(scale[_AXIS_TO_ZYX[ua]], scale[_AXIS_TO_ZYX[va]])
+            if in_plane_nm <= nm_per_px:
+                best = lvl
+            else:
+                break
+        return best
+
     def pick_level(self, extent_nm: float, target_px: int = 1600) -> int:
         """Coarsest level that still gives >= target_px across `extent_nm`."""
         best = 0
@@ -237,11 +256,13 @@ class EMVolume:
     def read_slice(
         self, axis: str, position_nm: float, level: int | None = None, target_px: int = 1600,
         region: tuple[tuple[float, float, float], float] | None = None,
+        target_nm_per_px: float | None = None,
         raw: bool = False,
     ) -> SliceResult:
         """Read one cross-section. If `region`=((cx,cy,cz)_nm, half_nm) is given,
-        read only that square crop around the camera target at a level chosen for
-        the crop extent (sharp when zoomed); otherwise read the whole plane.
+        read only that square crop around the camera target. When `target_nm_per_px`
+        is supplied, choose the multiscale level by physical screen scale; otherwise
+        fall back to the older target-pixel-count heuristic.
 
         `raw=True` keeps the array's native dtype — required for LABEL volumes whose
         segment ids exceed 255 (the default uint8 cast, fine for 8-bit EM, would
@@ -257,7 +278,9 @@ class EMVolume:
                 shp0[_AXIS_TO_ZYX[ua]] * s0[_AXIS_TO_ZYX[ua]],
                 shp0[_AXIS_TO_ZYX[va]] * s0[_AXIS_TO_ZYX[va]],
             )
-        if level is None:
+        if level is None and target_nm_per_px is not None:
+            level = self.pick_level_for_nm_per_px(axis, target_nm_per_px)
+        elif level is None:
             level = self.pick_level(extent_nm, target_px)
 
         arr = self._open_level(level)

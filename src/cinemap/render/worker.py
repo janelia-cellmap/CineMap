@@ -114,16 +114,13 @@ class RenderWorker:
         self._slice_cache: dict[tuple, dict] = {}
         self._slice_cache_lock = threading.Lock()
         # Resolution budgets. Draft (bake/update/preview thumbnails) trades detail
-        # for speed: a coarse EM level and low-voxel meshes. The final video uses
-        # full resolution. EM level is chosen by target px across the on-screen
-        # crop; meshes by marching-cubes voxel budget (per-segment / union).
+        # for speed: a coarse EM level and low-voxel meshes. EM scale is selected
+        # per frame from physical nm/pixel, matching Neuroglancer's multiscale choice;
+        # meshes use marching-cubes voxel budgets (per-segment / union).
         draft = bool(getattr(job.settings, "draft", False))
         self._draft = draft
-        # EM slice resolution: how many voxels to pull across the on-screen region. The
-        # region already scales with the camera (zoom), and slice_loader.pick_level then
-        # picks the finest pyramid level giving ~this many voxels — so zoomed-in views get
-        # finer EM automatically, exactly like neuroglancer. Tie it to the OUTPUT width
-        # (~1.25 voxels/pixel) so higher-res exports pull sharper EM (no change at 1280).
+        # Fallback/cap for paths that still request an explicit resampled image size
+        # (notably oblique slices). Axis-aligned slices use per-frame nm/pixel instead.
         self._em_target_px = 768 if draft else min(2560, max(1280, int(job.settings.width * 1.25)))
         self._mesh_voxels_single = 1_500_000 if draft else 8_000_000
         self._mesh_voxels_union = 3_000_000 if draft else 20_000_000
@@ -202,7 +199,8 @@ class RenderWorker:
             return axis, pos / n[ai], None
         return axis, pos, n
 
-    def _slice_cache_key(self, sl, region, seg_overlays, slice_seg=None) -> tuple:
+    def _slice_cache_key(self, sl, region, seg_overlays, slice_seg=None,
+                         target_nm_per_px: float | None = None) -> tuple:
         center, half = region
         axis, position_nm, normal = self._slice_read_plane(sl)
         zurl, is_label = self._vol_for(sl.em_name)
@@ -221,6 +219,7 @@ class RenderWorker:
             tuple(round(float(c)) for c in center),
             round(float(half)),
             self._em_target_px,
+            None if target_nm_per_px is None else round(float(target_nm_per_px), 3),
             tuple((u, tuple(sorted(int(i) for i in ids)), lc.cache_key())
                   for u, ids, lc in seg_overlays),
         )
@@ -260,7 +259,8 @@ class RenderWorker:
         with self._slice_cache_lock:
             self._slice_cache[key] = out
 
-    def _slice_png(self, sl, region, seg_overlays, slice_seg=None) -> dict:
+    def _slice_png(self, sl, region, seg_overlays, slice_seg=None,
+                   target_nm_per_px: float | None = None) -> dict:
         """Render a cross-section of the slice's chosen layer. For an EM/image layer:
         the grayscale EM with `seg_overlays` [(label_zarr, ids, lc), …] colored on top
         (like neuroglancer). For a SEGMENTATION layer (resolved via _vol_for): the
@@ -272,7 +272,8 @@ class RenderWorker:
         center, half = region
         axis, position_nm, normal = self._slice_read_plane(sl)
         zurl, is_label = self._vol_for(sl.em_name)
-        key = self._slice_cache_key(sl, region, seg_overlays, slice_seg=slice_seg)
+        key = self._slice_cache_key(sl, region, seg_overlays, slice_seg=slice_seg,
+                                    target_nm_per_px=target_nm_per_px)
         path, meta_path = self._slice_cache_paths(key, axis)
         cached = self._slice_cache_get(key, path, meta_path)
         if cached is not None:
@@ -283,10 +284,14 @@ class RenderWorker:
             n = np.asarray(normal, float); n = n / (np.linalg.norm(n) or 1.0)
             c = np.asarray(center, float)
             cproj = c + (position_nm - float(np.dot(c, n))) * n
-            res = vol.read_oblique_slice(normal, cproj, half, target_px=self._em_target_px)
+            target_px = self._em_target_px
+            if target_nm_per_px:
+                target_px = min(target_px, max(8, int(round(2 * half / target_nm_per_px))))
+            res = vol.read_oblique_slice(normal, cproj, half, target_px=target_px)
         else:
             res = vol.read_slice(axis, position_nm, level=sl.scale_level,
-                                 target_px=self._em_target_px, region=region, raw=is_label)
+                                 target_px=self._em_target_px, region=region,
+                                 target_nm_per_px=target_nm_per_px, raw=is_label)
 
         if is_label:   # segmentation layer: color the labels directly (no EM grayscale)
             lab = np.asarray(res.image)
@@ -313,7 +318,9 @@ class RenderWorker:
                 continue
             lres = self._label_vol(label_zarr).read_slice(axis, position_nm,
                                                           target_px=self._em_target_px,
-                                                          region=region, raw=True)
+                                                          region=region,
+                                                          target_nm_per_px=target_nm_per_px,
+                                                          raw=True)
             lab = np.asarray(lres.image)
             yi = (np.arange(H) * lab.shape[0] / H).astype(int).clip(0, lab.shape[0] - 1)
             xi = (np.arange(W) * lab.shape[1] / W).astype(int).clip(0, lab.shape[1] - 1)
@@ -436,6 +443,12 @@ class RenderWorker:
         dist = math.dist(fr.position_nm, fr.look_at_nm)
         half = max(500.0, dist * math.tan(math.radians(fr.fov_deg) / 2) * 1.25)
         return (tuple(fr.look_at_nm), half)
+
+    def _frame_nm_per_px(self, fr) -> float:
+        """Physical size of one rendered screen pixel at the camera target."""
+        height = max(1, self.job.settings.height)
+        dist = math.dist(fr.position_nm, fr.look_at_nm)
+        return 2.0 * dist * math.tan(math.radians(fr.fov_deg) / 2) / height
 
     def _frame_seg_overlays(self, fr):
         """Segmentation layers in this frame to overlay on the EM slice."""
@@ -740,13 +753,7 @@ class RenderWorker:
         # On-screen scale (nm per pixel) per frame, for picking precomputed-mesh LOD
         # like neuroglancer. With dynamic LOD this varies per frame (coarser when the
         # layer is far/small on screen); otherwise every frame uses the finest.
-        height = max(1, self.job.settings.height)
-
-        def _nmpp(fr):
-            d = math.dist(fr.position_nm, fr.look_at_nm)
-            return 2.0 * d * math.tan(math.radians(fr.fov_deg) / 2) / height
-
-        frame_nmpp = [_nmpp(fr) for fr in frames]
+        frame_nmpp = [self._frame_nm_per_px(fr) for fr in frames]
         self._nm_per_px = min(frame_nmpp, default=None)
         frame_lod_nmpp = self._lod_bucket_nmpp(frame_nmpp)  # nm/px to build each frame at
 
@@ -827,18 +834,21 @@ class RenderWorker:
         warm_seen: set[tuple] = set()
         for fi, fr in enumerate(frames):
             region = self._frame_region(fr)
+            target_nm_per_px = self._frame_nm_per_px(fr)
             seg_overlays = self._frame_seg_overlays(fr)
             for sl, slice_seg in self._frame_slice_reads(fr, self._t_global(fi, frame_times, index_offset)):
-                key = self._slice_cache_key(sl, region, seg_overlays, slice_seg=slice_seg)
+                key = self._slice_cache_key(sl, region, seg_overlays, slice_seg=slice_seg,
+                                            target_nm_per_px=target_nm_per_px)
                 if key in warm_seen:
                     continue
                 warm_seen.add(key)
-                warm_jobs.append((sl, region, seg_overlays, slice_seg))
+                warm_jobs.append((sl, region, seg_overlays, slice_seg, target_nm_per_px))
 
         def _warm(job):
-            sl, region, seg_overlays, slice_seg = job
+            sl, region, seg_overlays, slice_seg, target_nm_per_px = job
             try:
-                self._slice_png(sl, region, seg_overlays, slice_seg=slice_seg)
+                self._slice_png(sl, region, seg_overlays, slice_seg=slice_seg,
+                                target_nm_per_px=target_nm_per_px)
             except Exception:  # noqa: BLE001 (failures re-surface in the build loop below)
                 pass
 
@@ -859,6 +869,7 @@ class RenderWorker:
             emph_hero, emph_glow, emph_spot = (
                 emph_track[fi] if emph_track and fi < len(emph_track) else (None, 0.0, 1.0))
             region = self._frame_region(fr)
+            target_nm_per_px = self._frame_nm_per_px(fr)
             # segmentation layers in this frame -> overlaid on the EM slice. Decoupled from
             # the 3D mesh opacity: the slice shows the cross-section even when the 3D meshes
             # are faded/hidden (so they don't occlude it).
@@ -873,7 +884,8 @@ class RenderWorker:
                 # non-OME-Zarr EM source) is skipped, not fatal to the whole render.
                 # _slice_png is already cached from the parallel warm pass above.
                 try:
-                    png = self._slice_png(sl, region, seg_overlays, slice_seg=slice_seg)
+                    png = self._slice_png(sl, region, seg_overlays, slice_seg=slice_seg,
+                                          target_nm_per_px=target_nm_per_px)
                 except Exception as e:  # noqa: BLE001
                     print(f"[worker] slice {sl.em_name}:{sl.axis} failed: {e}")
                     continue
