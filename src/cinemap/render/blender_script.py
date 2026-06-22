@@ -50,13 +50,32 @@ def _setup_render(scene_spec: dict) -> None:
             prefs = bpy.context.preferences.addons["cycles"].preferences
             prefs.compute_device_type = "OPTIX"
             prefs.get_devices()
+            # CINEMAP_GPU picks which OPTIX GPU(s) to render on when several exist:
+            # an index or comma-separated indices into the OPTIX device list below
+            # (e.g. "1" or "0,2"). Unset/blank -> use all GPUs.
+            sel = os.environ.get("CINEMAP_GPU", "").strip()
+            want = None
+            if sel:
+                try:
+                    want = {int(x) for x in sel.replace(" ", "").split(",") if x}
+                except ValueError:
+                    print(f"[blender] bad CINEMAP_GPU={sel!r}; using all GPUs", flush=True)
+            optix = [d for d in prefs.devices if d.type == "OPTIX"]
+            for i, d in enumerate(optix):
+                d.use = want is None or i in want
             for d in prefs.devices:
-                d.use = d.type in ("OPTIX", "CPU")
+                if d.type == "CPU":
+                    d.use = True            # CPU helps alongside the GPU(s)
+                elif d.type != "OPTIX":
+                    d.use = False
             scene.cycles.device = "GPU"
-            # make it obvious in the log whether we're actually on the GPU (OPTIX) or
-            # silently fell back to CPU — a CPU fallback is a ~10-50x slowdown.
-            gpus = [d.name for d in prefs.devices if d.use and d.type == "OPTIX"]
-            print(f"[blender] cycles device=GPU compute=OPTIX gpus={gpus or 'NONE -> CPU fallback!'}",
+            # make it obvious in the log which GPUs are available (with the index to
+            # pass via CINEMAP_GPU) and which we're actually on — a silent CPU
+            # fallback is a ~10-50x slowdown.
+            print(f"[blender] OPTIX GPUs available: {[f'{i}:{d.name}' for i, d in enumerate(optix)]}",
+                  flush=True)
+            gpus = [d.name for d in optix if d.use]
+            print(f"[blender] cycles device=GPU compute=OPTIX using={gpus or 'NONE -> CPU fallback!'}",
                   flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[blender] GPU unavailable, CPU: {e}", flush=True)

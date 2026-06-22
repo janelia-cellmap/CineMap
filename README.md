@@ -85,6 +85,15 @@ conda run -n mv_env pip install -e .     # installs all deps incl. bpy (Blender/
 Requires an NVIDIA GPU (OPTIX / Cycles) and network access to the data host (data
 is read over https; `/nrs` need not be mounted).
 
+**Choosing a GPU.** By default the renderer uses every available NVIDIA GPU. On a
+multi-GPU machine, set `CINEMAP_GPU` to pick one (or several) by index — the
+render log prints `OPTIX GPUs available: [0:…, 1:…]` so you know the indices:
+
+```bash
+CINEMAP_GPU=1   ./run.sh      # render only on GPU 1
+CINEMAP_GPU=0,2 ./run.sh      # render on GPUs 0 and 2
+```
+
 ## Let Claude help
 
 Click `✦ Help me! Claude` to open the director panel and just ask in plain
