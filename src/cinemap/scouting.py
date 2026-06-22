@@ -24,7 +24,8 @@ def get_viewer() -> neuroglancer.Viewer:
         # is opened from another machine (the URL host is rewritten per-request to
         # whatever host the browser used — see server._ng_url_for).
         neuroglancer.set_server_bind_address(
-            os.environ.get("CINEMAP_NG_BIND", "0.0.0.0")
+            os.environ.get("CINEMAP_NG_BIND", "0.0.0.0"),
+            int(os.environ.get("CINEMAP_NG_PORT", "0") or "0"),
         )
         _viewer = neuroglancer.Viewer()
     return _viewer

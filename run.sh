@@ -20,7 +20,8 @@ export CINEMAP_PROJECTS_DIR="${CINEMAP_PROJECTS_DIR:-$(pwd)/projects}"
 # Bind the neuroglancer viewer to all interfaces (incl. loopback) by default; the app
 # rewrites the iframe URL to whatever host the browser used (see server._ng_url_for), so
 # this works for both local (localhost) and remote access. Override with CINEMAP_NG_BIND
-# (e.g. a specific hostname) if needed.
+# (e.g. a specific hostname) if needed. Set CINEMAP_NG_PORT to a fixed port when
+# serving over SSH tunnels from a cluster job.
 export CINEMAP_NG_BIND="${CINEMAP_NG_BIND:-0.0.0.0}"
 
 echo "CineMap  →  http://$(hostname -f):${PORT}  (or http://localhost:${PORT}; server bound on ${HOST})"
