@@ -167,6 +167,7 @@
           <option value="2">high (~10M/layer)</option>
           <option value="3">max (~15M/layer)</option>
         </select></label>
+      <label class="chk" title="Generate render meshes from label voxels with zmesh instead of using precomputed Neuroglancer meshes."><input id="labelMeshes" type="checkbox" /> label meshes</label>
       <label class="chk" title="Director: a non-destructive presentation pass that enhances the look WITHOUT changing your neuroglancer data — camera-relative key/fill/rim lighting, publication-quality materials, and subtle depth-of-field on the framed subject. Uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
       <label class="chk" title="Draw a thin wireframe box around each data source's extent (the EM volume and/or each rendered layer's label volume), like neuroglancer's bounding box. Falls back to a tight box around the rendered meshes when a layer has no volume source."><input id="showBbox" type="checkbox" /> bbox</label>
       <input id="bboxColor" type="color" value="#9ea8bd" title="bounding-box wireframe color" style="width:24px;height:20px;padding:0;border:1px solid var(--line);background:none;cursor:pointer" />
@@ -1395,6 +1396,7 @@ async function startRender(mode) {
                  noise_threshold: fast ? 0.06 : 0.01,
                  engine: $('engine').value,
                  draft: mode === 'preview', mesh_detail: +$('detail').value || 1,
+                 mesh_from_labels: $('labelMeshes').checked,
                  auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
                  show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
                  bbox_source: $('bboxSource').value };

@@ -174,7 +174,7 @@ class RenderReq(BaseModel):
     export_blend: bool = False  # produce a self-contained .blend instead of a video
     draft: bool = False         # fast low-res preview (coarse EM + low-voxel meshes)
     mesh_detail: float = 1.0    # per-layer vertex-budget multiplier (hard-capped)
-    mesh_from_labels: bool = False  # regenerate watertight meshes from labels vs precomputed
+    mesh_from_labels: bool = False  # regenerate render meshes from labels with zmesh
     auto_direct: bool = True    # non-destructive presentation pass (lighting/material/DOF)
     lod_mode: str = "frame"     # mesh LOD: "single" | "frame" (per-frame adaptive) | "chunk"
     show_bbox: bool = False     # draw a wireframe box around each data source's extent

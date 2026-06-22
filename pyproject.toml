@@ -32,6 +32,7 @@ dependencies = [
   "zarr<3",         # cloud-volume / ome compatibility
   "trimesh",        # mesh load/convert for Blender import
   "scikit-image",   # marching-cubes mesh generation from label volumes
+  "zmesh",          # fast per-label meshing from segmentation volumes
   # --- blender (render worker) ---
   "bpy",            # Blender as a Python module (Cycles); run in a subprocess script for isolation
   # --- core ---

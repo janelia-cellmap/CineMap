@@ -116,7 +116,7 @@ class RenderWorker:
         # Resolution budgets. Draft (bake/update/preview thumbnails) trades detail
         # for speed: a coarse EM level and low-voxel meshes. EM scale is selected
         # per frame from physical nm/pixel, matching Neuroglancer's multiscale choice;
-        # meshes use marching-cubes voxel budgets (per-segment / union).
+        # meshes use zmesh voxel/vertex budgets for label-derived geometry.
         draft = bool(getattr(job.settings, "draft", False))
         self._draft = draft
         # Fallback/cap for paths that still request an explicit resampled image size
@@ -124,8 +124,8 @@ class RenderWorker:
         self._em_target_px = 768 if draft else min(2560, max(1280, int(job.settings.width * 1.25)))
         self._mesh_voxels_single = 1_500_000 if draft else 8_000_000
         self._mesh_voxels_union = 3_000_000 if draft else 20_000_000
-        # mesh sourcing: precomputed (LOD-adaptive) by default; opt in to watertight
-        # marching-cubes-from-labels via the render setting.
+        # mesh sourcing: precomputed (LOD-adaptive) by default; opt in to zmesh
+        # meshing from labels via the render setting.
         self._prefer_labels = bool(getattr(job.settings, "mesh_from_labels", False))
         # Per-layer vertex budget = base * mesh_detail, hard-capped so a too-high
         # setting can't recreate the multi-GB mesh that stalled asset prep / OOM'd the

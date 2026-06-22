@@ -1,18 +1,25 @@
-"""Generate a clean mesh for a segment directly from its OME-Zarr label volume.
+"""Generate clean meshes for segments directly from OME-Zarr label volumes.
 
 This bypasses the precomputed multilod-draco meshes (which cloud-volume decodes
-with per-chunk gaps, producing a 'stippled' look). Marching cubes on the label
-mask yields a single watertight surface.
+with per-chunk gaps, producing a 'stippled' look). The preferred path uses zmesh
+to generate separate meshes per selected label ID, preserving instance colors and
+boundaries while choosing the finest label scale that fits the render budget.
 """
 from __future__ import annotations
 
 import colorsys
+from dataclasses import dataclass
 
 import numpy as np
 import trimesh
 from skimage import measure
+import zmesh
 
 from .slice_loader import get_volume
+
+
+_ZMESH_VERTEX_PER_VOXEL_ESTIMATE = 0.15
+_ROI_SCAN_VOXELS = 24_000_000
 
 
 def _layer_offset(layer: str) -> float:
@@ -32,6 +39,177 @@ def seg_color(seg_id: int, layer: str = "") -> tuple[float, float, float]:
     per-layer offset so segments of different layers are distinguishable."""
     h = (_layer_offset(layer) + int(seg_id) * 0.6180339887498949) % 1.0
     return colorsys.hsv_to_rgb(h, 0.62, 0.95)
+
+
+@dataclass(frozen=True)
+class _ReadPlan:
+    level: int
+    stride: int
+    bbox_xyz_nm: tuple[tuple[float, float, float], tuple[float, float, float]] | None
+
+
+def _shape_voxels(shape) -> int:
+    return int(shape[0]) * int(shape[1]) * int(shape[2])
+
+
+def _bbox_voxels_for_level(vol, bbox_xyz_nm, level: int, pad: int = 2) -> int:
+    if bbox_xyz_nm is None:
+        return _shape_voxels(vol.level_shape_zyx(level))
+    sc = vol.level_scale_nm[level]
+    tr = vol.level_translation_nm[level]
+    shape = vol.level_shape_zyx(level)
+    (x0n, y0n, z0n), (x1n, y1n, z1n) = bbox_xyz_nm
+    z0 = max(0, int((z0n - tr[0]) / sc[0]) - pad)
+    z1 = min(shape[0], int((z1n - tr[0]) / sc[0]) + pad)
+    y0 = max(0, int((y0n - tr[1]) / sc[1]) - pad)
+    y1 = min(shape[1], int((y1n - tr[1]) / sc[1]) + pad)
+    x0 = max(0, int((x0n - tr[2]) / sc[2]) - pad)
+    x1 = min(shape[2], int((x1n - tr[2]) / sc[2]) + pad)
+    return max(1, z1 - z0) * max(1, y1 - y0) * max(1, x1 - x0)
+
+
+def _choose_plan(
+    vol,
+    bbox_xyz_nm,
+    *,
+    target_voxels: int,
+    target_vertices: int | None,
+) -> _ReadPlan:
+    """Finest level/stride whose estimated memory and mesh size fit the budget."""
+    vertex_voxel_budget = None
+    if target_vertices:
+        vertex_voxel_budget = max(1, int(target_vertices / _ZMESH_VERTEX_PER_VOXEL_ESTIMATE))
+    budget = max(1, int(target_voxels))
+    if vertex_voxel_budget is not None:
+        budget = min(budget, vertex_voxel_budget)
+
+    chosen_level = len(vol.level_scale_nm) - 1
+    chosen_voxels = _bbox_voxels_for_level(vol, bbox_xyz_nm, chosen_level)
+    for level in range(len(vol.level_scale_nm)):
+        voxels = _bbox_voxels_for_level(vol, bbox_xyz_nm, level)
+        if voxels <= budget:
+            chosen_level = level
+            chosen_voxels = voxels
+            break
+
+    stride = max(1, int(np.ceil((chosen_voxels / budget) ** (1 / 3))))
+    return _ReadPlan(level=chosen_level, stride=stride, bbox_xyz_nm=bbox_xyz_nm)
+
+
+def _read_plan_array(vol, plan: _ReadPlan, pad: int = 2):
+    """Read the plan region and return (arr, origin_voxel_zyx, scale_zyx_nm, translation)."""
+    level = plan.level
+    stride = plan.stride
+    if plan.bbox_xyz_nm is not None:
+        arr, origin, sc, tr = vol.read_box(plan.bbox_xyz_nm, level, pad=pad)
+        if stride > 1:
+            arr = arr[::stride, ::stride, ::stride]
+            sc = tuple(s * stride for s in sc)
+        return arr, origin, tuple(sc), tuple(tr)
+
+    arr = np.asarray(vol._open_level(level)[::stride, ::stride, ::stride].read().result())
+    sc = tuple(s * stride for s in vol.level_scale_nm[level])
+    tr = tuple(vol.level_translation_nm[level])
+    return arr, (0, 0, 0), sc, tr
+
+
+def _bbox_for_ids(label_zarr_url: str, seg_ids, target_voxels: int = _ROI_SCAN_VOXELS):
+    """Find a conservative xyz-nm bounding box from labels when no mesh bbox exists."""
+    ids = set(int(s) for s in seg_ids)
+    if not ids:
+        return None
+    vol = get_volume(label_zarr_url)
+    level = len(vol.level_scale_nm) - 1
+    for lvl in range(len(vol.level_scale_nm)):
+        if _shape_voxels(vol.level_shape_zyx(lvl)) <= target_voxels:
+            level = lvl
+            break
+    arr = np.asarray(vol._open_level(level)[:, :, :].read().result())
+    zz, yy, xx = np.where(np.isin(arr, list(ids)))
+    if len(zz) == 0:
+        return None
+    sc = vol.level_scale_nm[level]
+    tr = vol.level_translation_nm[level]
+    margin = 4
+    z0, z1 = max(0, zz.min() - margin), min(arr.shape[0], zz.max() + margin + 1)
+    y0, y1 = max(0, yy.min() - margin), min(arr.shape[1], yy.max() + margin + 1)
+    x0, x1 = max(0, xx.min() - margin), min(arr.shape[2], xx.max() + margin + 1)
+    lo = (x0 * sc[2] + tr[2], y0 * sc[1] + tr[1], z0 * sc[0] + tr[0])
+    hi = (x1 * sc[2] + tr[2], y1 * sc[1] + tr[1], z1 * sc[0] + tr[0])
+    return (lo, hi)
+
+
+def _mesh_to_trimesh(mesh, seg_id: int, origin_zyx_nm, colorize=None) -> trimesh.Trimesh | None:
+    if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        return None
+    verts_zyx = np.asarray(mesh.vertices, dtype=np.float64) + np.asarray(origin_zyx_nm)
+    verts_xyz = verts_zyx[:, ::-1]
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    vcolors = None
+    if colorize is not None:
+        r, g, b = colorize(int(seg_id))
+        vcolors = np.tile(np.array([r, g, b, 1.0]) * 255, (len(verts_xyz), 1)).astype(np.uint8)
+    return trimesh.Trimesh(vertices=verts_xyz, faces=faces, vertex_colors=vcolors, process=False)
+
+
+def generate_zmesh_auto(
+    label_zarr_url: str,
+    seg_ids,
+    *,
+    bbox_xyz_nm=None,
+    target_voxels: int = 20_000_000,
+    target_vertices: int | None = None,
+    smooth_iters: int = 0,
+    colorize=None,
+) -> trimesh.Trimesh:
+    """Generate selected IDs with zmesh at the finest scale that fits the budget.
+
+    `bbox_xyz_nm` lets callers pass a selected-object ROI from existing meshes. When
+    absent, we scan a coarse label level to find a conservative ROI before selecting
+    the final meshing scale. zmesh emits one mesh per label ID, so colors and object
+    boundaries survive even when many IDs are meshed in one array read.
+    """
+    seg_ids = [int(s) for s in seg_ids]
+    if not seg_ids:
+        raise ValueError("no segment ids")
+    vol = get_volume(label_zarr_url)
+    if bbox_xyz_nm is None and len(seg_ids) <= 128:
+        bbox_xyz_nm = _bbox_for_ids(label_zarr_url, seg_ids)
+
+    plan = _choose_plan(
+        vol,
+        bbox_xyz_nm,
+        target_voxels=target_voxels,
+        target_vertices=target_vertices,
+    )
+    arr, (z0, y0, x0), sc, tr = _read_plan_array(vol, plan, pad=3)
+    keep = np.isin(arr, seg_ids)
+    if not keep.any():
+        raise ValueError("none of the selected segments present in labels")
+    labels = np.where(keep, arr, 0).astype(np.uint32, copy=False)
+    labels = np.pad(labels, 1)
+
+    mesher = zmesh.Mesher(tuple(float(s) for s in sc))
+    mesher.mesh(labels)
+    origin_zyx_nm = (
+        (z0 - 1) * sc[0] + tr[0],
+        (y0 - 1) * sc[1] + tr[1],
+        (x0 - 1) * sc[2] + tr[2],
+    )
+    parts = []
+    available = set(int(s) for s in mesher.ids())
+    for seg_id in seg_ids:
+        if seg_id not in available:
+            continue
+        part = _mesh_to_trimesh(mesher.get(seg_id), seg_id, origin_zyx_nm, colorize=colorize)
+        if part is not None:
+            parts.append(part)
+    if not parts:
+        raise ValueError("zmesh produced no geometry for the selected segments")
+    mesh = trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+    if smooth_iters:
+        trimesh.smoothing.filter_taubin(mesh, iterations=smooth_iters)
+    return mesh
 
 
 def _vertex_colors(verts_world_zyx, normals, sc, tr, arr, colorize=None) -> np.ndarray:
