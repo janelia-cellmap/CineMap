@@ -338,6 +338,8 @@
   </div>
   <label class="msg" title="How long the scan/cutaway takes on screen. Frames are filled in automatically from this and the fps — you set time, not frame count.">Duration (s)</label>
   <input id="planeDur" type="number" min="0.1" step="0.1" value="4" style="width:100%">
+  <label class="msg" title="Global movie time where this plane clip starts. Use 0 to show the slice on the first rendered frame.">Start (s)</label>
+  <input id="planeStart" type="number" min="0" step="0.1" value="0" style="width:100%">
   <label class="chk" title="Ping-pong: sweep from start to end, then back — e.g. cut in to reveal, then close back up. Same duration."><input id="planeMirror" type="checkbox"> mirror (forward + back)</label>
   <div style="margin-top:8px"><button class="primary" onclick="applyPlaneScan()"><span id="planeAddLbl">Add scan</span></button>
     <button onclick="previewPlaneScan()" title="render preview stills of this cut/slice WITHOUT adding it yet">👁 Preview</button>
@@ -551,6 +553,7 @@ async function setKfTiming(id, fields) {
 // ---- two-row timeline: keyframes are instants; holds + transitions take time ----
 const TL_PX = 64, MARKER = 92;                 // px per second; keyframe thumbnail width
 let TL_XOF = (t)=>t*TL_PX + MARKER/2, TL_WIDTH = 0;   // shared time->x (set by renderKeyframes)
+let TL_BAR_X = (t)=>t*TL_PX;                   // duration bars start at the actual time edge
 const fmtS = v => (+v).toFixed(2).replace(/\.?0+$/, '');
 const durS = k => Math.max(0, +(k && k.duration_in_s) || 0);
 const holdS = k => Math.max(0, +(k && k.hold_in_s) || 0);
@@ -588,19 +591,20 @@ function renderKeyframes(p) {
   const swEnd = Math.max(0, ...(p.sweeps||[]).map(s=>s.start_s+s.duration_s));
   const Tm = Math.max(T, swEnd, 0.1);
   TL_XOF = (t)=>t*TL_PX + MARKER/2;             // shift right by half a marker so KF0 fits
-  TL_WIDTH = TL_XOF(Tm) + MARKER/2;
+  TL_BAR_X = (t)=>t*TL_PX;
+  TL_WIDTH = TL_BAR_X(Tm) + MARKER;
   let html='';
   // hold blocks after keyframes
   for (let i=0;i<kfs.length;i++){
     const h = holdS(kfs[i]); if (h <= 0) continue;
-    const x0 = TL_XOF(tAt[i]), w = Math.max(2, h * TL_PX);
+    const x0 = TL_BAR_X(tAt[i]), w = Math.max(2, h * TL_PX);
     html += `<div class="tltrans hold" style="left:${x0}px;width:${w}px"
         title="hold on KF${i} · ${fmtS(h)}s · click to edit" onclick="openTransEdit(event,'${kfs[i].id}')">
       <span class="trlbl">⏸${fmtS(h)}s</span></div>`;
   }
   // transition blocks between consecutive keyframes
   for (let i=1;i<kfs.length;i++){
-    const k=kfs[i], st=transStyle(k), lt=layerTrans(k), la=layerAt(k), x0=TL_XOF(tAt[i-1] + holdS(kfs[i-1])), w=Math.max(2,durS(k)*TL_PX);
+    const k=kfs[i], st=transStyle(k), lt=layerTrans(k), la=layerAt(k), x0=TL_BAR_X(tAt[i-1] + holdS(kfs[i-1])), w=Math.max(2,durS(k)*TL_PX);
     const hold = JSON.stringify(kfs[i-1].camera)===JSON.stringify(k.camera);   // identical pose = a dwell
     html += `<div class="tltrans ${hold?'hold ':''}${st}${lt==='cut'?' layercut':''}" style="left:${x0}px;width:${w}px"
         title="camera: ${hold?'hold pose':st} · layers: ${lt}${lt==='cut'?' @ '+Math.round(la*100)+'%':''} · into KF${i} · ${fmtS(durS(k))}s · click to edit · drag the right edge to resize" onclick="openTransEdit(event,'${k.id}')">
@@ -691,7 +695,7 @@ function renderSweeps(p) {
   lane.style.width = TL_WIDTH + 'px';   // same width/scale as the keyframe lane above
   if (!sweeps.length) { lane.innerHTML = ''; return; }
   lane.innerHTML = sweeps.map(s => {
-    const left = TL_XOF(s.start_s), width = Math.max(8, s.duration_s * TL_PX);
+    const left = TL_BAR_X(s.start_s), width = Math.max(8, s.duration_s * TL_PX);
     const dir = s.normal ? 'oblique' : `${s.axis}`;
     const isSlice = s.kind === 'slice';
     const name = isSlice ? (s.em_name || 'EM slice') : s.layer;
@@ -731,11 +735,11 @@ function startSweepDrag(e, id, mode) {
     if (snapTo != null) edge = snapTo;
     if (mode === 'resize') { newDur = Math.max(0.1, edge - start0); }
     else { newStart = Math.max(0, edge); }
-    bar.style.left = TL_XOF(newStart) + 'px';
+    bar.style.left = TL_BAR_X(newStart) + 'px';
     bar.style.width = (newDur * TL_PX) + 'px';
     if (guide) guide.remove();
     if (snapTo != null) { guide = document.createElement('div'); guide.className = 'swsnap';
-      guide.style.left = TL_XOF(snapTo) + 'px'; lane.appendChild(guide); }
+      guide.style.left = TL_BAR_X(snapTo) + 'px'; lane.appendChild(guide); }
   };
   const up = async () => {
     window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up);
@@ -1055,6 +1059,7 @@ async function openPlanePanel() {
   $('planeSliceLayer').innerHTML = sl.length
     ? sl.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')
     : '<option value="">(default EM)</option>';
+  if ($('planeStart')) $('planeStart').value = fmtS(activeKfTime());
   planeModeChanged(); updateSideLabels();
   PREVIEW_READY = false; if ($('planeSnaps')) $('planeSnaps').innerHTML = '';
   $('planeMsg').textContent = ''; $('planePanel').style.display='block';
@@ -1105,6 +1110,10 @@ function updateSideLabels() {
 function planeNums(str) {
   return (str||'').trim().split(/[\s,]+/).map(parseFloat).filter(isFinite);
 }
+function planeStartTime() {
+  const v = parseFloat($('planeStart')?.value);
+  return Number.isFinite(v) ? Math.max(0, v) : activeKfTime();
+}
 // preview the cut/slice from the create form WITHOUT committing it (renders into the
 // shared '_preview' snapshot slot, shown in the panel).
 async function previewPlaneScan() {
@@ -1112,10 +1121,11 @@ async function previewPlaneScan() {
   const axis = $('planeAxis').value, mode = $('planeMode').value, side = parseInt($('planeSide').value,10);
   const fn = planeNums($('planeFrom').value), tn = planeNums($('planeTo').value);
   const dur = parseFloat($('planeDur').value) || 4, layer = $('planeLayer').value;
+  const start = planeStartTime();
   const kind = (mode === 'slice') ? 'slice' : 'cutaway';
   if (kind === 'cutaway' && !layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
-  // anchor the sweep at the keyframe you're on, so the preview frames from THAT camera
-  const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: activeKfTime(), mirror: $('planeMirror').checked };
+  // Use the selected global start time so preview and saved clips agree on placement.
+  const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: start, mirror: $('planeMirror').checked };
   if (kind === 'cutaway') body.layer = layer;
   else body.em_name = $('planeSliceLayer').value;   // which layer the slice shows (EM or seg)
   if (fn.length) body.from_ng = fn;
@@ -1168,9 +1178,10 @@ async function applyPlaneScan() {
   const fn = planeNums($('planeFrom').value), tn = planeNums($('planeTo').value);
   const oblique = fn.length >= 3 && tn.length >= 3;
   const dur = parseFloat($('planeDur')?.value) || 4;
+  const start = planeStartTime();
   const layer = $('planeLayer').value;
   const mk = async (kind) => {
-    const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: activeKfTime(), mirror: $('planeMirror').checked };
+    const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: start, mirror: $('planeMirror').checked };
     if (kind === 'cutaway') { body.layer = layer; LAST_CUT_LAYER = layer; }
     else body.em_name = $('planeSliceLayer').value;   // which layer the slice shows (EM or seg)
     if (fn.length) body.from_ng = fn;
