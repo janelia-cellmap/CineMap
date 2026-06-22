@@ -337,6 +337,7 @@
       <option value="1">cut the +axis side (keep −)</option>
       <option value="-1">cut the −axis side (keep +)</option>
     </select>
+    <label class="chk" title="Fill the cut face as a solid cross-section. Uncheck for a faster open cut with no cap."><input id="planeCap" type="checkbox" checked> solid cap</label>
   </div>
   <label class="msg">From → To &nbsp;<span class="msg">(neuroglancer coords; blank = auto)</span></label>
   <div style="display:flex;gap:6px">
@@ -404,6 +405,7 @@
     <button onclick="const a=$('swFrom'),b=$('swTo');[a.value,b.value]=[b.value,a.value]" title="reverse the sweep direction (swap start and end)">⇄</button>
   </div>
   <label class="chk" title="Disabled sweeps stay on the timeline but are ignored by preview and full renders."><input id="swEnabled" type="checkbox"> enabled in render</label>
+  <label id="swCapRow" class="chk" title="Fill the cut face as a solid cross-section. Uncheck for a faster open cut with no cap."><input id="swCap" type="checkbox"> solid cap</label>
   <div style="margin-top:8px"><button class="primary" onclick="saveSweepEdit()">Save</button>
     <button onclick="delSweep(EDIT_SWEEP_ID); $('sweepPanel').style.display='none'">Delete</button>
     <span id="swMsg" class="msg"></span></div>
@@ -720,6 +722,7 @@ function renderSweeps(p) {
     const dir = s.normal ? 'oblique' : `${s.axis}`;
     const isSlice = s.kind === 'slice';
     const disabled = s.enabled === false;
+    const openCut = !isSlice && s.cap === false;
     const name = isSlice ? (s.em_name || 'EM slice') : s.layer;
     const icon = isSlice ? '▦' : '▤';
     const grad = isSlice ? 'linear-gradient(90deg,#2f8f8f,#46c2c2)' : 'linear-gradient(90deg,#5a5fcf,#8a8fff)';
@@ -728,9 +731,9 @@ function renderSweeps(p) {
     return `<div class="sweepbar${isSlice ? ' slicebar' : ''}${disabled ? ' disabled' : ''}" data-id="${s.id}" style="left:${left}px;width:${width}px;${bg}"
                  onmousedown="startSweepDrag(event,'${s.id}','move')"
                  onmouseenter="showSweepHover(event,'${s.id}',${s.mirror ? 5 : 3})" onmouseleave="hideSweepHover()"
-                 title="${disabled ? 'disabled ' : ''}${isSlice ? 'EM slice' : 'cutaway'}: ${name} · ${dir} · ${Math.round(s.from_nm)}→${Math.round(s.to_nm)}nm · start ${fmtS(s.start_s)}s · ${fmtS(s.duration_s)}s">
+                 title="${disabled ? 'disabled ' : ''}${isSlice ? 'EM slice' : (openCut ? 'open cutaway' : 'capped cutaway')}: ${name} · ${dir} · ${Math.round(s.from_nm)}→${Math.round(s.to_nm)}nm · start ${fmtS(s.start_s)}s · ${fmtS(s.duration_s)}s">
       <span class="del" onmousedown="event.stopPropagation()" onclick="event.stopPropagation(); delSweep('${s.id}')">✕</span>
-      <span class="swlbl">${icon} ${disabled ? 'off · ' : ''}${name} ${dir} · ${fmtS(s.duration_s)}s</span>
+      <span class="swlbl">${icon} ${disabled ? 'off · ' : ''}${name} ${dir}${openCut ? ' open' : ''} · ${fmtS(s.duration_s)}s</span>
       <span class="grip" onmousedown="event.stopPropagation(); startSweepDrag(event,'${s.id}','resize')"></span>
     </div>`;
   }).join('');
@@ -786,6 +789,7 @@ function openSweepEdit(id) {
   document.querySelector('#sweepPanel b').textContent = isSlice ? '▦ Edit EM slice sweep' : '▤ Edit cutaway sweep';
   $('sweepWhich').textContent = `${isSlice ? (s.em_name||'EM') : s.layer} · ${s.normal ? 'oblique' : s.axis} axis`;
   $('swSideRow').style.display = isSlice ? 'none' : 'block';   // 'side' only meaningful for a cut
+  $('swCapRow').style.display = isSlice ? 'none' : 'block';
   // label the side by the cut's actual orientation (oblique => direction, not "+z")
   if (s.normal) { $('swSide').options[0].text = 'keep the “From” side (cut the “To”)'; $('swSide').options[1].text = 'keep the “To” side (cut the “From”)'; }
   else { $('swSide').options[0].text = `cut the +${s.axis} side`; $('swSide').options[1].text = `cut the −${s.axis} side`; }
@@ -793,6 +797,7 @@ function openSweepEdit(id) {
   $('swSide').value = String(s.side); $('swEase').value = s.easing || 'linear';
   $('swMirror').checked = !!s.mirror;
   $('swEnabled').checked = s.enabled !== false;
+  $('swCap').checked = s.cap !== false;
   $('swFrom').value = Math.round(s.from_nm); $('swTo').value = Math.round(s.to_nm);
   $('swMsg').textContent = '';
   $('lookPanel').style.display='none'; $('planePanel').style.display='none'; $('propPanel').style.display='none';
@@ -844,6 +849,7 @@ async function saveSweepEdit() {
                  side:parseInt($('swSide').value,10), easing:$('swEase').value,
                  mirror:$('swMirror').checked,
                  enabled:$('swEnabled').checked,
+                 cap:$('swCap').checked,
                  from_nm:+$('swFrom').value, to_nm:+$('swTo').value };
   await api('PUT', `/api/projects/${PID}/sweeps/${EDIT_SWEEP_ID}`, body);
   $('sweepPanel').style.display='none';
@@ -1204,7 +1210,7 @@ async function previewPlaneScan() {
   if (kind === 'cutaway' && !layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
   // Use the selected global start time so preview and saved clips agree on placement.
   const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: start, mirror: $('planeMirror').checked };
-  if (kind === 'cutaway') body.layer = layer;
+  if (kind === 'cutaway') { body.layer = layer; body.cap = $('planeCap').checked; }
   else body.em_name = $('planeSliceLayer').value;   // which layer the slice shows (EM or seg)
   if (fn.length) body.from_ng = fn;
   if (tn.length) body.to_ng = tn;
@@ -1260,7 +1266,7 @@ async function applyPlaneScan() {
   const layer = $('planeLayer').value;
   const mk = async (kind) => {
     const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: start, mirror: $('planeMirror').checked };
-    if (kind === 'cutaway') { body.layer = layer; LAST_CUT_LAYER = layer; }
+    if (kind === 'cutaway') { body.layer = layer; body.cap = $('planeCap').checked; LAST_CUT_LAYER = layer; }
     else body.em_name = $('planeSliceLayer').value;   // which layer the slice shows (EM or seg)
     if (fn.length) body.from_ng = fn;
     if (tn.length) body.to_ng = tn;

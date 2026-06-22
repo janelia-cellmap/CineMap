@@ -399,7 +399,7 @@ class RenderWorker:
             # holds open after the end (progress clamps to 1); mirror ping-pongs back.
             pos = sw.from_nm + (sw.to_nm - sw.from_nm) * _sweep_progress(sw, t)
             return {"axis": sw.axis, "side": sw.side, "normal": sw.normal,
-                    "position_nm": float(pos)}
+                    "position_nm": float(pos), "cap": bool(getattr(sw, "cap", True))}
         return None
 
     def _slices_from_sweeps(self, t: float) -> list:
@@ -793,7 +793,8 @@ class RenderWorker:
             for m in fr.meshes:
                 if self._mesh_render_alpha(m) <= 0.001:
                     continue
-                if self._clip_from_sweeps(m.mesh_name, t) or _clip_params(getattr(m, "clip", None)):
+                cl = self._clip_from_sweeps(m.mesh_name, t) or _clip_params(getattr(m, "clip", None))
+                if cl and cl.get("cap", True):
                     clip_frames.setdefault(m.mesh_name, set()).add(fi)
         clip_nmpp = {layer: min(frame_lod_nmpp[i] for i in fis) for layer, fis in clip_frames.items()}
 
@@ -936,7 +937,12 @@ class RenderWorker:
                         getattr(m, "clip", None))
                     if cl:
                         ov["clip"] = {**cl, "position_bu": cl["position_nm"] / self.nm_per_bu}
-                        mesh_specs[uid]["clip"] = True   # geometric cutaway (slice + cap)
+                        # clip=True means the material needs animated clip nodes. cap=True
+                        # additionally requests the expensive geometric cut + filled face.
+                        mesh_specs[uid]["clip"] = True
+                        mesh_specs[uid]["clip_cap"] = bool(mesh_specs[uid].get("clip_cap")) or bool(
+                            cl.get("cap", True)
+                        )
                     overrides[uid] = ov
             for an in fr.annotations:
                 uid = self._ann_uid(an)
@@ -997,7 +1003,9 @@ class RenderWorker:
             # ao/cavity/edge/ng_shader/flat_shading/backface_cull/…), engine, nm_per_bu scale,
             # and auto_direct. Per-frame state (camera/opacity/metallic OVERRIDES/clip position/
             # slices/lights) is re-driven on the cached geometry, so it correctly does NOT key.
-            geom = sorted((mm["id"], bool(mm.get("clip")), tuple(mm.get("color") or ()))
+            geom = sorted((mm["id"], bool(mm.get("clip")),
+                           bool(mm.get("clip_cap", mm.get("clip"))),
+                           tuple(mm.get("color") or ()))
                           for mm in mesh_specs.values())
             sig_src = json.dumps([geom, spec.get("direction", {}).get("material", {}),
                                   self.job.settings.engine, round(self.nm_per_bu, 6),

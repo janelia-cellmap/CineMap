@@ -671,6 +671,7 @@ class SweepReqNew(BaseModel):
     duration_s: float | None = None
     easing: str = "linear"
     mirror: bool = False
+    cap: bool = True
 
 
 @app.post("/api/projects/{pid}/sweeps")
@@ -683,7 +684,7 @@ def add_sweep(pid: str, req: SweepReqNew):
                        from_ng=req.from_ng, to_ng=req.to_ng,
                        from_nm=req.from_nm, to_nm=req.to_nm,
                        start_s=req.start_s, duration_s=req.duration_s, easing=req.easing,
-                       mirror=req.mirror)
+                       mirror=req.mirror, cap=req.cap)
     return sw.model_dump()
 
 
@@ -696,6 +697,7 @@ class SweepPatch(BaseModel):
     to_nm: float | None = None
     axis: str | None = None
     mirror: bool | None = None
+    cap: bool | None = None
     enabled: bool | None = None
 
 
@@ -799,7 +801,7 @@ def preview_sweep(pid: str, req: SweepReqNew):
                        side=req.side, from_ng=req.from_ng, to_ng=req.to_ng,
                        from_nm=req.from_nm, to_nm=req.to_nm, start_s=req.start_s,
                        duration_s=req.duration_s, easing=req.easing, mirror=req.mirror,
-                       commit=False)
+                       cap=req.cap, commit=False)
     times = _snapshot_times(sw)
     n = len(times)
     out = config.PROJECTS_DIR / pid / "assets" / "snapshots" / "_preview"

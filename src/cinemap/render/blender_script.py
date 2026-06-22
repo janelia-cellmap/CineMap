@@ -393,7 +393,8 @@ def _import_meshes(scene_spec: dict) -> dict:
         t_mesh = time.perf_counter()
         path = m["obj_path"]
         if path.lower().endswith(".npz"):
-            obj = _load_npz_mesh(path, m["id"], calc_edges=bool(m.get("clip")))
+            obj = _load_npz_mesh(path, m["id"],
+                                 calc_edges=bool(m.get("clip_cap", m.get("clip"))))
         else:
             # legacy fallback for any pre-existing .ply / .obj cached assets
             before = set(bpy.data.objects)
@@ -610,6 +611,8 @@ def _import_meshes(scene_spec: dict) -> dict:
         # side of an axis-aligned plane by mixing in a Transparent BSDF, revealing what's
         # inside/behind. Plane params are driven per frame by the cm_clip_* value nodes.
         if m.get("clip"):
+            surf = _build_clip_nodes(nt, surf)
+        if m.get("clip_cap", m.get("clip")):
             # geometric cutaway: keep a pristine copy of the geometry; each frame we
             # rebuild the object as this mesh sliced at the clip plane and capped (filled
             # cross-section) — a true solid cut, not a shader transparency trick.
@@ -647,7 +650,8 @@ def _import_meshes(scene_spec: dict) -> dict:
         obj.data.materials.append(mat)
         out[m["id"]] = (obj, mat)
         print(f"[blender] imported {m['id']} faces={len(obj.data.polygons)} "
-              f"clip={bool(m.get('clip'))} in {time.perf_counter() - t_mesh:.1f}s",
+              f"clip={bool(m.get('clip'))} cap={bool(m.get('clip_cap', m.get('clip')))} "
+              f"in {time.perf_counter() - t_mesh:.1f}s",
               flush=True)
     print(f"[blender] imported {len(out)}/{len(scene_spec['meshes'])} meshes "
           f"in {time.perf_counter() - t_all:.1f}s", flush=True)

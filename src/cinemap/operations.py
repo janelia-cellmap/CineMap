@@ -442,6 +442,7 @@ def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, s
               from_nm=None, to_nm=None, start_s=None, duration_s=None,
               from_ng=None, to_ng=None, easing: str = "linear",
               kind: str = "cutaway", em_name: str = "", mirror: bool = False,
+              cap: bool = True,
               commit: bool = True) -> Sweep:
     """Add an independent plane sweep on its OWN timeline (decoupled from the camera).
     kind='cutaway' slides a mesh layer's clip plane; kind='slice' sweeps an EM cross-section.
@@ -493,7 +494,7 @@ def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, s
                side=int(side), from_nm=float(from_nm), to_nm=float(to_nm),
                start_s=float(start_s if start_s is not None else 0.0),
                duration_s=float(duration_s if duration_s is not None else total),
-               easing=easing, mirror=bool(mirror))
+               easing=easing, mirror=bool(mirror), cap=bool(cap))
     project.sweeps.append(sw)
     if commit:                 # commit=False -> build the sweep for a preview without saving
         store.save(project)
@@ -507,7 +508,7 @@ def remove_sweep(project: Project, sweep_id: str) -> None:
 
 def update_sweep(project: Project, sweep_id: str, **fields) -> Sweep | None:
     """Patch an existing sweep's fields (start_s, duration_s, side, easing, from_nm,
-    to_nm, axis, layer, enabled). Unknown/None fields are ignored."""
+    to_nm, axis, layer, cap, enabled). Unknown/None fields are ignored."""
     sw = next((s for s in project.sweeps if s.id == sweep_id), None)
     if sw is None:
         return None
