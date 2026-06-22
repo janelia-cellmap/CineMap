@@ -26,6 +26,13 @@ How a video works here:
 camera, EM cross-section SLICE planes, and segmentation MESHES (chosen segment \
 ids per layer). The video interpolates between consecutive keyframes; a keyframe's \
 `duration_in_s` is the transition time INTO it.
+- Independent SWEEPS live on their own timeline below the keyframes. Use them for \
+EM slice scans and mesh cutaways that should run while the camera does something \
+else. Disabled sweeps stay on the timeline but do not render. Capped cutaways show \
+a filled cross-section; open cutaways are faster and do not fill the cut face.
+- Camera transitions (`transition`) are separate from layer visibility/style changes \
+(`layer_transition`). Use `layer_transition="cut"` and `layer_transition_at` when \
+layers should switch at a specific point in a camera move instead of cross-fading.
 - The user scouts the data in an embedded Neuroglancer viewer. "Bake" captures \
 the current 3D view (camera + visible layers/segments) as a keyframe.
 - Meshes are generated from the label volume; many segments render as one colored \
@@ -33,13 +40,14 @@ field. The EM slice gives spatial context.
 
 Your job: translate plain requests ("orbit the nuclei", "sweep a slice through, \
 then zoom to a few cells") into tool calls that build/edit the keyframe timeline. \
-Call `get_state` first when you need to know the current scene. Prefer the preset \
-shot tools (make_orbit, sweep_slice) for motion. After editing, briefly tell the \
-user what you changed and that they can Preview/Export (or use the render tool). \
+Call `get_state` first when you need to know the current scene. Prefer keyframes \
+for camera motion and independent sweeps for plane scans/cutaways. After editing, \
+briefly tell the user what you changed and that they can Preview/Export (or use \
+the render tool). \
 Keep replies short. Keyframes are referenced by their integer index from get_state."""
 
 TOOLS = [
-    {"name": "get_state", "description": "Return the dataset manifest (EM + mesh layers, available segments) and the current keyframes (index, label, camera, slices, meshes). Call this first to understand the scene.",
+    {"name": "get_state", "description": "Return the dataset manifest, current keyframes, and independent timeline sweeps. Call this first to understand the scene.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "make_orbit", "description": "Append keyframes orbiting the current camera target (preserves framing). Use for 'rotate/spin around'.",
      "input_schema": {"type": "object", "properties": {
@@ -49,6 +57,34 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "axis": {"type": "string", "enum": ["x", "y", "z"], "default": "z"},
          "n": {"type": "integer", "default": 12}}}},
+    {"name": "add_sweep", "description": "Create an independent timeline sweep. kind='slice' sweeps an EM plane; kind='cutaway' sweeps a mesh cutaway. Use this when the plane effect should be decoupled from camera keyframes.",
+     "input_schema": {"type": "object", "properties": {
+         "kind": {"type": "string", "enum": ["cutaway", "slice"], "default": "cutaway"},
+         "layer": {"type": "string", "description": "mesh layer for cutaway sweeps"},
+         "em_name": {"type": "string", "description": "EM layer for slice sweeps"},
+         "axis": {"type": "string", "enum": ["x", "y", "z"], "default": "z"},
+         "side": {"type": "integer", "default": 1},
+         "from_nm": {"type": "number"}, "to_nm": {"type": "number"},
+         "from_ng": {"type": "array", "items": {"type": "number"}},
+         "to_ng": {"type": "array", "items": {"type": "number"}},
+         "start_s": {"type": "number"}, "duration_s": {"type": "number"},
+         "easing": {"type": "string", "enum": ["linear", "ease-in-out", "ease-in", "ease-out"], "default": "linear"},
+         "mirror": {"type": "boolean", "default": False},
+         "cap": {"type": "boolean", "default": True, "description": "cutaway only; false is an open, faster cut"},
+         "enabled": {"type": "boolean", "default": True}}}},
+    {"name": "update_sweep", "description": "Edit an existing independent sweep by index from get_state.",
+     "input_schema": {"type": "object", "properties": {
+         "index": {"type": "integer"},
+         "start_s": {"type": "number"}, "duration_s": {"type": "number"},
+         "from_nm": {"type": "number"}, "to_nm": {"type": "number"},
+         "axis": {"type": "string", "enum": ["x", "y", "z"]},
+         "side": {"type": "integer"},
+         "easing": {"type": "string", "enum": ["linear", "ease-in-out", "ease-in", "ease-out"]},
+         "mirror": {"type": "boolean"}, "cap": {"type": "boolean"},
+         "enabled": {"type": "boolean"}},
+         "required": ["index"]}},
+    {"name": "delete_sweep", "description": "Delete an independent sweep by index from get_state.",
+     "input_schema": {"type": "object", "properties": {"index": {"type": "integer"}}, "required": ["index"]}},
     {"name": "bake_keyframe", "description": "Capture the current Neuroglancer 3D view (camera + visible layers/segments) as a new keyframe.",
      "input_schema": {"type": "object", "properties": {"label": {"type": "string"}}}},
     {"name": "duplicate_last_keyframe", "description": "Append a copy of the last keyframe (to then tweak).",
@@ -61,7 +97,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "index": {"type": "integer"}, "duration_in_s": {"type": "number"},
          "hold_in_s": {"type": "number"},
-         "easing": {"type": "string", "enum": ["linear", "ease-in-out"]},
+         "easing": {"type": "string", "enum": ["linear", "ease-in-out", "ease-in", "ease-out"]},
          "transition": {"type": "string", "enum": ["glide", "cut", "fade"]},
          "layer_transition": {"type": "string", "enum": ["fade", "cut"]},
          "layer_transition_at": {"type": "number"}},
@@ -109,6 +145,17 @@ def _state(p: Project) -> dict:
         "mesh_layers": [{"name": m.name, "n_selected": len(m.segment_ids)} for m in man.meshes],
         "voxel_size_nm": man.voxel_size_nm,
         "keyframes": _kf_summary(p),
+        "sweeps": [
+            {
+                "index": i, "id": s.id, "kind": s.kind, "layer": s.layer,
+                "em_name": s.em_name, "axis": s.axis,
+                "from_nm": round(s.from_nm), "to_nm": round(s.to_nm),
+                "start_s": s.start_s, "duration_s": s.duration_s,
+                "easing": s.easing, "mirror": s.mirror, "cap": s.cap,
+                "enabled": s.enabled,
+            }
+            for i, s in enumerate(getattr(p, "sweeps", []))
+        ],
     }
 
 
@@ -116,6 +163,12 @@ def _kid(p: Project, index: int) -> str:
     if not (0 <= index < len(p.keyframes)):
         raise ValueError(f"keyframe index {index} out of range (0..{len(p.keyframes) - 1})")
     return p.keyframes[index].id
+
+
+def _sid(p: Project, index: int) -> str:
+    if not (0 <= index < len(p.sweeps)):
+        raise ValueError(f"sweep index {index} out of range (0..{len(p.sweeps) - 1})")
+    return p.sweeps[index].id
 
 
 def _dispatch(name: str, args: dict, p: Project, render_fn: Callable | None) -> dict:
@@ -128,6 +181,37 @@ def _dispatch(name: str, args: dict, p: Project, render_fn: Callable | None) -> 
     if name == "sweep_slice":
         kfs = ops.sweep_slice(p, axis=args.get("axis", "z"), n=args.get("n", 12))
         return {"added": len(kfs)}
+    if name == "add_sweep":
+        sw = ops.add_sweep(
+            p,
+            kind=args.get("kind", "cutaway"),
+            layer=args.get("layer", ""),
+            em_name=args.get("em_name", ""),
+            axis=args.get("axis", "z"),
+            side=args.get("side", 1),
+            from_nm=args.get("from_nm"),
+            to_nm=args.get("to_nm"),
+            from_ng=args.get("from_ng"),
+            to_ng=args.get("to_ng"),
+            start_s=args.get("start_s"),
+            duration_s=args.get("duration_s"),
+            easing=args.get("easing", "linear"),
+            mirror=args.get("mirror", False),
+            cap=args.get("cap", True),
+        )
+        if "enabled" in args:
+            sw = ops.update_sweep(p, sw.id, enabled=bool(args["enabled"])) or sw
+        return {"added": 1, "index": len(p.sweeps) - 1, "sweep": sw.model_dump()}
+    if name == "update_sweep":
+        fields = {k: args[k] for k in (
+            "start_s", "duration_s", "from_nm", "to_nm", "axis", "side", "easing",
+            "mirror", "cap", "enabled")
+            if k in args}
+        sw = ops.update_sweep(p, _sid(p, args["index"]), **fields)
+        return {"ok": sw is not None, "sweep": sw.model_dump() if sw else None}
+    if name == "delete_sweep":
+        ops.remove_sweep(p, _sid(p, args["index"]))
+        return {"deleted": args["index"]}
     if name == "bake_keyframe":
         kf = scouting.bake_keyframe(p, label=args.get("label", "scouted"))
         return {"added": 1, "index": len(p.keyframes) - 1, "meshes": [m.mesh_name for m in kf.meshes]}

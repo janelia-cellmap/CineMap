@@ -55,7 +55,12 @@ there — that camera is what gets baked.
   between your keyframes.
 - **Update a frame** — select a keyframe and `⟳ Update current frame` to replace it
   with your latest view.
+- **Copy / paste frames** — select a keyframe, then use the copy/paste buttons or
+  `Ctrl-C` / `Ctrl-V` to duplicate its camera and layer state.
 - **Reorder frames** — drag keyframes along the timeline to change their order.
+- **Add plane sweeps** — EM slice sweeps and mesh cutaways live in the lower sweep
+  lane, independent of camera keyframes; disable a sweep to keep it on the timeline
+  but out of preview/export renders.
 - **Import / Export project** — save and reload a whole project with `⭱ Import` /
   `⭳ Export`.
 
@@ -64,6 +69,8 @@ there — that camera is what gets baked.
 - `⬇ Export video` — render the full shot to an mp4.
 - `⬇ Export .blend` — a self-contained Blender file (camera, meshes, EM slices,
   packed textures) for manual finishing.
+- `⟳ Render all` fills keyframe thumbnails and sweep preview strips; full exports
+  still render enabled slices and cutaways from the timeline.
 
 ![Export buttons](imgs/export_buttons.png)
 
