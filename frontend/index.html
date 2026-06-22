@@ -1136,10 +1136,28 @@ async function previewPlaneScan() {
 }
 let PREVIEW_READY = false;
 async function adoptPreview(sw) {
-  if (!PREVIEW_READY || !sw || !sw.id) return;
-  try { await api('POST', `/api/projects/${PID}/sweeps/${sw.id}/adopt_preview`); SNAP_VER[sw.id] = Date.now(); }
-  catch {}
-  PREVIEW_READY = false;
+  if (!PREVIEW_READY || !sw || !sw.id) return false;
+  try {
+    const r = await api('POST', `/api/projects/${PID}/sweeps/${sw.id}/adopt_preview`);
+    SNAP_VER[sw.id] = Date.now();
+    return !!(r && r.ok);
+  } catch { return false; }
+  finally { PREVIEW_READY = false; }
+}
+async function renderSweepSnapshotsQuiet(id) {
+  if (!PID || !id) return;
+  try { await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`); }
+  catch { return; }
+  const poll = async () => {
+    let st; try { st = await api('GET', `/api/projects/${PID}/sweeps/${id}/snapshots/status`); }
+    catch { return; }
+    if (st.status === 'running') { setTimeout(poll, 2000); return; }
+    if (st.status === 'done') {
+      SNAP_VER[id] = Date.now();
+      if (CUR) renderSweeps(CUR);
+    }
+  };
+  setTimeout(poll, 1500);
 }
 async function applyPlaneScan() {
   if(!PID) return;
@@ -1161,13 +1179,26 @@ async function applyPlaneScan() {
   };
   $('planeMsg').textContent = 'adding…';
   if (mode === 'cull' && !layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
+  const needsSnap = [];
   // single-kind modes adopt the just-rendered preview frames onto the new clip
-  if (mode === 'slice') await adoptPreview(await mk('slice'));
-  else if (mode === 'cull') await adoptPreview(await mk('cutaway'));
-  else { await mk('slice'); if (layer) await adoptPreview(await mk('cutaway')); }   // both
+  if (mode === 'slice') {
+    const sw = await mk('slice');
+    if (!(await adoptPreview(sw))) needsSnap.push(sw.id);
+  } else if (mode === 'cull') {
+    const sw = await mk('cutaway');
+    if (!(await adoptPreview(sw))) needsSnap.push(sw.id);
+  } else {
+    const sliceSw = await mk('slice');
+    needsSnap.push(sliceSw.id);                 // the shared preview is for the cutaway
+    if (layer) {
+      const cutSw = await mk('cutaway');
+      if (!(await adoptPreview(cutSw))) needsSnap.push(cutSw.id);
+    }
+  }
   $('planeMsg').textContent = `added (${dur}s)` + (oblique ? ' (oblique)' : '');
   $('planeSnaps').innerHTML = '';
   await reload();
+  needsSnap.forEach(renderSweepSnapshotsQuiet);
 }
 
 let JOB = null;
