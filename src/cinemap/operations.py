@@ -163,6 +163,28 @@ def add_keyframe(project: Project, keyframe: Keyframe | None = None, label: str 
     return keyframe
 
 
+def duplicate_keyframe(project: Project, source_id: str, after_id: str | None = None) -> Keyframe:
+    src_idx = next((i for i, k in enumerate(project.keyframes) if k.id == source_id), None)
+    if src_idx is None:
+        raise ValueError("no such source keyframe")
+    insert_after = src_idx
+    if after_id:
+        insert_after = next((i for i, k in enumerate(project.keyframes) if k.id == after_id), None)
+        if insert_after is None:
+            raise ValueError("no such target keyframe")
+
+    src = project.keyframes[src_idx]
+    dup = src.model_copy(deep=True)
+    dup.id = _uid("kf")
+    dup.label = (src.label or "keyframe") + " copy"
+    # A pasted frame is a normal manual keyframe, even if copied from a generated orbit/scan.
+    dup.group = None
+    dup.group_label = ""
+    project.keyframes.insert(insert_after + 1, dup)
+    store.save(project)
+    return dup
+
+
 def delete_keyframe(project: Project, keyframe_id: str) -> None:
     project.keyframes = [k for k in project.keyframes if k.id != keyframe_id]
     store.save(project)

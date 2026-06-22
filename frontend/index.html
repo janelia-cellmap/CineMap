@@ -71,6 +71,12 @@
   .kfmark.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); z-index:4; }
   .kfmark.drop { border-color:#5aff7a; box-shadow:-3px 0 0 #5aff7a; }
   .kfmark .lbl { font-weight:600; cursor:grab; padding:2px 5px; background:linear-gradient(#000a,#0000); text-shadow:0 1px 2px #000; border-radius:6px 6px 0 0; }
+  .kfmark .kftools { position:absolute; top:2px; right:3px; display:flex; gap:2px; opacity:0; transition:opacity .1s; }
+  .kfmark:hover .kftools, .kfmark.active .kftools { opacity:1; }
+  .kfmark .kfbtn { width:18px; height:18px; padding:0; border:0; border-radius:4px; background:#0009; color:#fff; font-size:11px; line-height:18px; text-align:center; text-shadow:0 1px 2px #000; }
+  .kfmark .kfbtn:hover { background:#2d3545; }
+  .kfmark .kfbtn.on { background:var(--accent); }
+  .kfmark .kfbtn.danger:hover { background:#7d2e2e; }
   .kfmark .del { position:absolute; top:2px; right:5px; color:#fff; opacity:.7; cursor:pointer; text-shadow:0 1px 2px #000; }
   .kfmark .del:hover { opacity:1; }
   .tltrans { position:absolute; top:64px; height:18px; background:linear-gradient(90deg,#3a4358,#566184); border-radius:4px; display:flex; align-items:center; padding:0 5px; cursor:pointer; overflow:hidden; z-index:1; }
@@ -133,7 +139,7 @@
     <div class="pane-title">◆ Neuroglancer — scouting
       <button class="accent" onclick="bake()" title="Capture the current Neuroglancer view as a keyframe — a saved pose in the movie (camera + layers + segments). The movie is built by rendering/interpolating between keyframes. You need at least one keyframe before you can scan or render.">★ Bake keyframe</button>
       <button onclick="updateFrame()" title="overwrite the selected keyframe with the current Neuroglancer view (camera + layers + segments)">⟳ Update current frame</button>
-      <button onclick="addKeyframe()">+ Duplicate last</button>
+      <button onclick="duplicateCurrentKeyframe()" title="duplicate the selected keyframe after itself">⧉ Duplicate selected</button>
       <button onclick="document.getElementById('statesFile').click()" title="upload a list of neuroglancer states (one link per line, or a CSV with a state column) — each becomes a keyframe">⭱ Import states</button>
       <input type="file" id="statesFile" accept=".csv,.txt,text/csv,text/plain" style="display:none" onchange="importStates(event)" />
     </div>
@@ -338,7 +344,7 @@
   </div>
   <label class="msg" title="How long the scan/cutaway takes on screen. Frames are filled in automatically from this and the fps — you set time, not frame count.">Duration (s)</label>
   <input id="planeDur" type="number" min="0.1" step="0.1" value="4" style="width:100%">
-  <label class="msg" title="Global movie time where this plane clip starts. Use 0 to show the slice on the first rendered frame.">Start (s)</label>
+  <label class="msg" title="Global movie time where this plane clip starts. Defaults to the selected keyframe; drag clips in the sweep lane to snap them to keyframe moments.">Start (s)</label>
   <input id="planeStart" type="number" min="0" step="0.1" value="0" style="width:100%">
   <label class="chk" title="Ping-pong: sweep from start to end, then back — e.g. cut in to reveal, then close back up. Same duration."><input id="planeMirror" type="checkbox"> mirror (forward + back)</label>
   <div style="margin-top:8px"><button class="primary" onclick="applyPlaneScan()"><span id="planeAddLbl">Add scan</span></button>
@@ -440,6 +446,10 @@ const api = async (m, url, body) => {
   return r.headers.get('content-type')?.includes('json') ? r.json() : r;
 };
 const setStatus = (s) => $('status').textContent = s;
+function clearFrameSelection() {
+  ACTIVE_KF = null;
+  KF_CLIPBOARD_ID = null;
+}
 
 async function refreshProjects() {
   const list = await api('GET','/api/projects');
@@ -454,6 +464,7 @@ async function createProject() {
   try {
     const p = await api('POST','/api/projects', { name: $('name').value || 'untitled', data_path: $('dataPath').value });
     PID = p.id; await refreshProjects(); $('projectSel').value = PID;
+    clearFrameSelection();
     applyRenderPrefs(p); await loadNg(); renderKeyframes(p); setStatus('project ready: ' + p.manifest.title);
   } catch (e) { setStatus('error: ' + e.message); }
 }
@@ -471,6 +482,7 @@ async function importProject(e) {
     const data = JSON.parse(await file.text());
     const p = await api('POST', '/api/projects/import', data);
     PID = p.id; await refreshProjects(); $('projectSel').value = PID;
+    clearFrameSelection();
     applyRenderPrefs(p); await loadNg(); renderKeyframes(p);
     // NOTE: don't auto-bake on import — it kicks off a long render the user didn't ask for
     // (and is awkward to stop). They hit ⟳ Render all when ready.
@@ -490,6 +502,7 @@ async function importStates(e) {
       // no project open -> create one from the first state in the script
       r = await api('POST', '/api/projects/import_states', { text, name: file.name.replace(/\.[^.]+$/, '') });
       PID = r.project.id; await refreshProjects(); $('projectSel').value = PID;
+      clearFrameSelection();
       applyRenderPrefs(r.project); await loadNg(); renderKeyframes(r.project);
     } else {
       r = await api('POST', `/api/projects/${PID}/keyframes/import_states`, { text });
@@ -506,6 +519,7 @@ async function openProject(pid) {
   PID = pid; setStatus('opening…');
   await api('POST', `/api/projects/${pid}/open`);
   const p = await api('GET', `/api/projects/${pid}`);
+  clearFrameSelection();
   applyRenderPrefs(p); await loadNg(); renderKeyframes(p); setStatus('opened ' + p.name);
 }
 
@@ -537,6 +551,7 @@ function diffBadge(id) {
 function openPropForKf(id) { ACTIVE_KF = id; openPropPanel(); }
 
 let LAST_KF_ID = null, KF_ORDER = [], THUMB_VER = {}, CUR = null, EXPANDED_GROUPS = new Set();
+let KF_CLIPBOARD_ID = null;
 let TVER = 0;   // shared thumbnail cache-buster, bumped every reload so cards never get
                 // stuck on a stale/404-cached '?v=0' image (e.g. fetched before the jpg landed)
 let KF_TIME = {};   // keyframe id -> its time on the timeline (seconds), set by renderKeyframes
@@ -614,11 +629,15 @@ function renderKeyframes(p) {
   // keyframe markers (instants) — thumbnails centered on their time
   for (let i=0;i<kfs.length;i++){
     const k=kfs[i];
-    html += `<div class="kfmark${k.thumbnail_path?' hasthumb':''}" draggable="true" data-id="${k.id}"
+    html += `<div class="kfmark${k.thumbnail_path?' hasthumb':''}${k.id===ACTIVE_KF?' active':''}" draggable="true" data-id="${k.id}"
         style="${thumbBg(k)}left:${TL_XOF(tAt[i])-MARKER/2}px"
         title="KF${i} · click to view · drag to reorder"
         onclick="gotoKf('${k.id}',this)" ondragstart="kfDragStart(event,'${k.id}')" ondragover="kfDragOver(event,this)" ondragleave="this.classList.remove('drop')" ondrop="kfDrop(event,'${k.id}')">
-      <span class="del" onclick="event.stopPropagation(); delKf('${k.id}')">✕</span>
+      <span class="kftools" onclick="event.stopPropagation()" onmousedown="event.stopPropagation()">
+        <button class="kfbtn${k.id===KF_CLIPBOARD_ID?' on':''}" draggable="false" onclick="copyKf('${k.id}',event)" title="Copy this keyframe">⧉</button>
+        <button class="kfbtn" draggable="false" onclick="pasteKf('${k.id}',event)" title="Paste copied keyframe after this one">✚</button>
+        <button class="kfbtn danger" draggable="false" onclick="delKf('${k.id}',event)" title="Delete this keyframe">✕</button>
+      </span>
       ${diffBadge(k.id)}<div class="lbl">KF${i}</div></div>`;
   }
   tl.style.width=TL_WIDTH+'px'; tl.innerHTML=html;
@@ -855,6 +874,54 @@ async function kfDrop(e, targetId) {
 }
 
 let ACTIVE_KF = null;
+function kfLabel(id) {
+  const i = KF_ORDER.indexOf(id);
+  return i >= 0 ? `KF${i}` : 'keyframe';
+}
+function copyKf(id, e) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  if (!PID || !id) return;
+  KF_CLIPBOARD_ID = id;
+  setStatus(`copied ${kfLabel(id)}`);
+  if (CUR) renderKeyframes(CUR);
+}
+async function pasteKf(afterId, e) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  if (!PID) { setStatus('open a project first'); return; }
+  if (!KF_CLIPBOARD_ID) { setStatus('copy a keyframe first'); return; }
+  const sourceId = KF_CLIPBOARD_ID;
+  const sourceLabel = kfLabel(sourceId);
+  const afterLabel = kfLabel(afterId);
+  try {
+    setStatus(`pasting ${sourceLabel}…`);
+    const kf = await api('POST', `/api/projects/${PID}/keyframes/${sourceId}/duplicate`, { after_id: afterId });
+    ACTIVE_KF = kf.id;
+    await reload();
+    showKeyframeThumb(kf.id);
+    setStatus(`pasted ${sourceLabel} after ${afterLabel}`);
+  } catch (err) { setStatus('paste failed: ' + err.message); }
+}
+async function duplicateCurrentKeyframe() {
+  const id = ACTIVE_KF || LAST_KF_ID;
+  if (!PID || !id) { setStatus('click a keyframe first'); return; }
+  try {
+    const label = kfLabel(id);
+    const kf = await api('POST', `/api/projects/${PID}/keyframes/${id}/duplicate`, { after_id: id });
+    ACTIVE_KF = kf.id;
+    await reload();
+    showKeyframeThumb(kf.id);
+    setStatus(`duplicated ${label}`);
+  } catch (err) { setStatus('duplicate failed: ' + err.message); }
+}
+function isTypingTarget(el) {
+  return el && (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName));
+}
+document.addEventListener('keydown', (e) => {
+  if (!PID || isTypingTarget(e.target) || !(e.ctrlKey || e.metaKey) || e.altKey) return;
+  const key = e.key.toLowerCase();
+  if (key === 'c' && ACTIVE_KF) { e.preventDefault(); copyKf(ACTIVE_KF); }
+  if (key === 'v' && KF_CLIPBOARD_ID) { e.preventDefault(); pasteKf(ACTIVE_KF || LAST_KF_ID); }
+});
 async function gotoKf(id, el) {
   if (!PID) return;
   ACTIVE_KF = id;
@@ -1016,8 +1083,14 @@ function toggleClaude() {
   $('chatcol').style.display = open ? 'flex' : 'none';
   $('claudeToggle').textContent = open ? '✦ Bye! Claude' : '✦ Help me! Claude';
 }
-async function addKeyframe() { if(!PID)return; await api('POST', `/api/projects/${PID}/keyframes`); reload(); }
-async function delKf(id)     { await api('DELETE', `/api/projects/${PID}/keyframes/${id}`); reload(); }
+async function addKeyframe() { if(!PID)return; const kf = await api('POST', `/api/projects/${PID}/keyframes`); ACTIVE_KF = kf.id; reload(); }
+async function delKf(id, e) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  await api('DELETE', `/api/projects/${PID}/keyframes/${id}`);
+  if (ACTIVE_KF === id) ACTIVE_KF = null;
+  if (KF_CLIPBOARD_ID === id) KF_CLIPBOARD_ID = null;
+  reload();
+}
 function openOrbitPanel() {
   if (!PID) { setStatus('open a project first'); return; }
   ['lookPanel','propPanel','planePanel'].forEach(id => { const e=$(id); if(e) e.style.display='none'; });

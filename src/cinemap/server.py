@@ -448,10 +448,23 @@ def update_from_ng(pid: str, kid: str):
 
 
 # ----------------------------- keyframes -----------------------------
+class DuplicateKeyframeReq(BaseModel):
+    after_id: str | None = None
+
+
 @app.post("/api/projects/{pid}/keyframes")
 def add_keyframe(pid: str):
     p = store.load(pid)
     return ops.add_keyframe(p).model_dump()
+
+
+@app.post("/api/projects/{pid}/keyframes/{kid}/duplicate")
+def duplicate_keyframe(pid: str, kid: str, req: DuplicateKeyframeReq):
+    p = store.load(pid)
+    try:
+        return ops.duplicate_keyframe(p, kid, after_id=req.after_id).model_dump()
+    except ValueError as e:
+        raise HTTPException(404, str(e)) from e
 
 
 @app.delete("/api/projects/{pid}/keyframes/{kid}")
