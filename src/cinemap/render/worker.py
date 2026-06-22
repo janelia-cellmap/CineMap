@@ -390,6 +390,8 @@ class RenderWorker:
         """The cutaway clip for `layer_name` at global time `t` (seconds), from any active
         Sweep — evaluated on the SWEEP's own timeline, independent of the camera keyframes.
         Returns a clip dict (same shape as _clip_params) or None. First active sweep wins."""
+        if not self._include_timeline_sweeps():
+            return None
         for sw in getattr(self.project, "sweeps", []) or []:
             if (not getattr(sw, "enabled", True) or getattr(sw, "kind", "cutaway") != "cutaway"
                     or sw.layer != layer_name):
@@ -408,6 +410,8 @@ class RenderWorker:
         a slice sweep is a timeline clip: it is visible only during its own span."""
         from .interpolate import FrameSlice
         out = []
+        if not self._include_timeline_sweeps():
+            return out
         default_em = self.manifest.em.name if self.manifest.em else "em"
         for sw in getattr(self.project, "sweeps", []) or []:
             if not getattr(sw, "enabled", True) or getattr(sw, "kind", "") != "slice":
@@ -488,6 +492,14 @@ class RenderWorker:
                     slice_seg = (list(sm.segment_ids), self._frame_colors(sm))
             out.append((sl, slice_seg))
         return out
+
+    def _include_timeline_sweeps(self) -> bool:
+        """Keyframe thumbnails are representative stills of the keyframe row.
+
+        Timeline sweeps have their own preview lane; including them in a still thumbnail
+        lets the first active EM plane/cutaway hide unrelated keyframe meshes.
+        """
+        return not bool(getattr(self.job.settings, "still", False))
 
     def _t_global(self, fi, frame_times, index_offset):
         return (frame_times[fi] if frame_times

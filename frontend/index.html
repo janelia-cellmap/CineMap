@@ -997,13 +997,24 @@ async function refreshThumbs(ids) {
 // previews (a layer's color/visibility change also shows in cutaways and slice overlays).
 async function refreshPreviews(kfIds) {
   await refreshThumbs(kfIds);
-  const sweepIds = ((CUR && CUR.sweeps) || []).map(s => s.id);
+  const sweepIds = orderedSweepIds();
   for (let i = 0; i < sweepIds.length; i++) {
     setStatus(`refreshing slice/cutaway preview ${i + 1}/${sweepIds.length}…`);
     await bakeSweepSnapAwait(sweepIds[i]);
     if (CUR) renderSweeps(CUR);
   }
   if (sweepIds.length) setStatus(`refreshed thumbnails + ${sweepIds.length} sweep preview(s)`);
+}
+function orderedSweepIds() {
+  return ((CUR && CUR.sweeps) || [])
+    .slice()
+    .sort((a, b) => {
+      // Slice/EM previews are usually the timeline-critical ones and much cheaper than
+      // capped cutaway previews, so don't let one slow cutaway block every fibsem strip.
+      const ka = (a.kind === 'slice' ? 0 : 1), kb = (b.kind === 'slice' ? 0 : 1);
+      return ka - kb || (a.start_s || 0) - (b.start_s || 0);
+    })
+    .map(s => s.id);
 }
 // bake one sweep's preview stills (slice / cutaway / EM-plane clip) and wait for it
 let SNAP_JOB = null;   // id of the in-flight sweep-snapshot render, so Stop can cancel it
@@ -1028,7 +1039,7 @@ function bakeSweepSnapAwait(id) {
 async function autoRenderThumbs() {
   if (!PID) { setStatus('open a project first'); return; }
   const ids = KF_ORDER.slice();
-  const sweepIds = ((CUR && CUR.sweeps) || []).map(s => s.id);
+  const sweepIds = orderedSweepIds();
   if (!ids.length && !sweepIds.length) return;
   AUTO_THUMBS = true;
   $('autoThumbBtn').textContent = '■ Stop';
