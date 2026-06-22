@@ -325,7 +325,13 @@ def _ng_url_for(request: Request) -> str:
 @app.post("/api/projects/{pid}/open")
 def open_project(pid: str, request: Request):
     p = store.load(pid)
-    scouting.load_dataset(p.data_path)
+    try:
+        scouting.load_dataset(p.data_path)
+    except Exception as e:  # noqa: BLE001
+        # Imported projects keep the exact source URL used to create them. Those
+        # external state links can disappear; the per-keyframe sidecars are the
+        # durable project state, so still let opening jump to the first keyframe.
+        print(f"[open] load_dataset failed for {pid}: {e}", flush=True)
     # Drive the viewer to the first keyframe so opening a project shows something
     # immediately — otherwise the iframe is blank/default until the user clicks a row.
     if p.keyframes:
