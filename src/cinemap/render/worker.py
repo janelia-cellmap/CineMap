@@ -112,6 +112,7 @@ class RenderWorker:
         self._em: EMVolume | None = None
         self._label_vols: dict[str, EMVolume] = {}
         self._slice_cache: dict[tuple, dict] = {}
+        self._slice_cache_lock = threading.Lock()
         # Resolution budgets. Draft (bake/update/preview thumbnails) trades detail
         # for speed: a coarse EM level and low-voxel meshes. The final video uses
         # full resolution. EM level is chosen by target px across the on-screen
@@ -179,6 +180,86 @@ class RenderWorker:
             return src.label_zarr, True
         return (em.zarr_url, False) if em else (None, False)
 
+    @staticmethod
+    def _slice_read_plane(sl) -> tuple[str, float, list[float] | None]:
+        """Normalize a FrameSlice for reading.
+
+        A normal like [0, -1, 0] is still an axis-aligned plane. Treat it as a cheap
+        2D read_slice, converting dot(x, normal)=position back to the axis coordinate
+        (for [0,-1,0], y = -position). Only truly tilted planes use read_oblique_slice.
+        """
+        axis = getattr(sl, "axis", "z")
+        pos = float(getattr(sl, "position_nm", 0.0))
+        normal = getattr(sl, "normal", None)
+        if not normal:
+            return axis, pos, None
+        n = [float(v) for v in normal]
+        mag = math.sqrt(sum(v * v for v in n)) or 1.0
+        n = [v / mag for v in n]
+        ai = max(range(3), key=lambda i: abs(n[i]))
+        if abs(n[ai]) >= 0.999:
+            axis = ("x", "y", "z")[ai]
+            return axis, pos / n[ai], None
+        return axis, pos, n
+
+    def _slice_cache_key(self, sl, region, seg_overlays, slice_seg=None) -> tuple:
+        center, half = region
+        axis, position_nm, normal = self._slice_read_plane(sl)
+        zurl, is_label = self._vol_for(sl.em_name)
+        seg_key = (tuple(sorted(int(i) for i in slice_seg[0])), slice_seg[1].cache_key()) \
+            if (is_label and slice_seg) else None
+        return (
+            "slice-v2",
+            sl.em_name,
+            zurl,
+            bool(is_label),
+            seg_key,
+            axis,
+            round(float(position_nm)),
+            getattr(sl, "scale_level", None),
+            tuple(round(float(x), 6) for x in normal) if normal else None,
+            tuple(round(float(c)) for c in center),
+            round(float(half)),
+            self._em_target_px,
+            tuple((u, tuple(sorted(int(i) for i in ids)), lc.cache_key())
+                  for u, ids, lc in seg_overlays),
+        )
+
+    def _slice_cache_paths(self, key: tuple, axis: str) -> tuple[Path, Path]:
+        import hashlib
+
+        sig = json.dumps(key, sort_keys=True, default=str).encode()
+        digest = hashlib.md5(sig).hexdigest()[:16]
+        path = self.assets_dir / f"slice_{axis}_{digest}.png"
+        return path, path.with_suffix(".json")
+
+    def _slice_cache_get(self, key: tuple, path: Path, meta_path: Path) -> dict | None:
+        with self._slice_cache_lock:
+            cached = self._slice_cache.get(key)
+        if cached is not None:
+            return cached
+        if path.exists() and meta_path.exists():
+            try:
+                out = json.loads(meta_path.read_text())
+                out["image_path"] = str(path)  # project dirs can move; the PNG beside us wins
+                with self._slice_cache_lock:
+                    self._slice_cache[key] = out
+                return out
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+
+    @staticmethod
+    def _atomic_write_json(data, path: Path) -> None:
+        tmp = f"{path}.{threading.get_ident()}.tmp"
+        Path(tmp).write_text(json.dumps(data, separators=(",", ":")))
+        os.replace(tmp, path)
+
+    def _slice_cache_put(self, key: tuple, out: dict, meta_path: Path) -> None:
+        self._atomic_write_json(out, meta_path)
+        with self._slice_cache_lock:
+            self._slice_cache[key] = out
+
     def _slice_png(self, sl, region, seg_overlays, slice_seg=None) -> dict:
         """Render a cross-section of the slice's chosen layer. For an EM/image layer:
         the grayscale EM with `seg_overlays` [(label_zarr, ids, lc), …] colored on top
@@ -189,24 +270,22 @@ class RenderWorker:
         from PIL import Image
 
         center, half = region
-        normal = getattr(sl, "normal", None)
+        axis, position_nm, normal = self._slice_read_plane(sl)
         zurl, is_label = self._vol_for(sl.em_name)
-        seg_key = (tuple(sorted(slice_seg[0])), slice_seg[1].cache_key()) if (is_label and slice_seg) else None
-        key = (sl.em_name, is_label, seg_key, sl.axis, round(sl.position_nm),
-               tuple(normal) if normal else None,
-               tuple(round(c) for c in center), round(half), self._em_target_px,
-               tuple((u, tuple(sorted(ids)), lc.cache_key()) for u, ids, lc in seg_overlays))
-        if key in self._slice_cache:
-            return self._slice_cache[key]
+        key = self._slice_cache_key(sl, region, seg_overlays, slice_seg=slice_seg)
+        path, meta_path = self._slice_cache_paths(key, axis)
+        cached = self._slice_cache_get(key, path, meta_path)
+        if cached is not None:
+            return cached
 
-        vol = self._label_vol(zurl) if zurl else self._em_vol()
+        vol = self._label_vol(zurl) if (is_label and zurl) else self._em_vol()
         if normal:   # oblique plane: resample the tilted plane through the projected focus
             n = np.asarray(normal, float); n = n / (np.linalg.norm(n) or 1.0)
             c = np.asarray(center, float)
-            cproj = c + (sl.position_nm - float(np.dot(c, n))) * n
+            cproj = c + (position_nm - float(np.dot(c, n))) * n
             res = vol.read_oblique_slice(normal, cproj, half, target_px=self._em_target_px)
         else:
-            res = vol.read_slice(sl.axis, sl.position_nm, level=sl.scale_level,
+            res = vol.read_slice(axis, position_nm, level=sl.scale_level,
                                  target_px=self._em_target_px, region=region, raw=is_label)
 
         if is_label:   # segmentation layer: color the labels directly (no EM grayscale)
@@ -220,11 +299,10 @@ class RenderWorker:
                 if iu == 0 or (idset is not None and iu not in idset):
                     continue
                 rgb[lab == u] = (np.array(lc.rgb(iu)) * 255 if lc else np.array([230.0, 180.0, 90.0]))
-            path = self.assets_dir / f"slice_{sl.axis}_{abs(hash(key)) % 10**8}.png"
             self._atomic_save(Image.fromarray(rgb.clip(0, 255).astype(np.uint8)), path)
             out = {"image_path": str(path), "origin_bu": _bu(res.origin_nm, self.nm_per_bu),
                    "u_bu": _bu(res.u_nm, self.nm_per_bu), "v_bu": _bu(res.v_nm, self.nm_per_bu)}
-            self._slice_cache[key] = out
+            self._slice_cache_put(key, out, meta_path)
             return out
 
         rgb = np.repeat(res.image[:, :, None].astype(np.float64), 3, axis=2)  # grayscale EM
@@ -233,7 +311,7 @@ class RenderWorker:
         for label_zarr, ids, lc in ([] if normal else seg_overlays):  # seg overlay: axis-aligned only
             if not ids:
                 continue
-            lres = self._label_vol(label_zarr).read_slice(sl.axis, sl.position_nm,
+            lres = self._label_vol(label_zarr).read_slice(axis, position_nm,
                                                           target_px=self._em_target_px,
                                                           region=region, raw=True)
             lab = np.asarray(lres.image)
@@ -250,7 +328,6 @@ class RenderWorker:
             m = mask[:, :, None]
             rgb = np.where(m, rgb * (1 - a) + color * 255 * a, rgb)
 
-        path = self.assets_dir / f"slice_{sl.axis}_{abs(hash(key)) % 10**8}.png"
         self._atomic_save(Image.fromarray(rgb.clip(0, 255).astype(np.uint8)), path)
         out = {
             "image_path": str(path),
@@ -258,7 +335,7 @@ class RenderWorker:
             "u_bu": _bu(res.u_nm, self.nm_per_bu),
             "v_bu": _bu(res.v_nm, self.nm_per_bu),
         }
-        self._slice_cache[key] = out
+        self._slice_cache_put(key, out, meta_path)
         return out
 
     def _lod_tag_for(self, nmpp) -> str:
@@ -320,8 +397,8 @@ class RenderWorker:
 
     def _slices_from_sweeps(self, t: float) -> list:
         """EM slice planes from active 'slice' sweeps at global time `t` — swept on the
-        sweep's OWN timeline (independent of the camera keyframes). Returns FrameSlice
-        objects at the interpolated position; holds at the end after the sweep finishes."""
+        sweep's OWN timeline (independent of the camera keyframes). Unlike a cutaway,
+        a slice sweep is a timeline clip: it is visible only during its own span."""
         from .interpolate import FrameSlice
         out = []
         default_em = self.manifest.em.name if self.manifest.em else "em"
@@ -329,6 +406,8 @@ class RenderWorker:
             if not getattr(sw, "enabled", True) or getattr(sw, "kind", "") != "slice":
                 continue
             if t < sw.start_s:
+                continue
+            if t > sw.start_s + (sw.duration_s or 0.0):
                 continue
             pos = sw.from_nm + (sw.to_nm - sw.from_nm) * _sweep_progress(sw, t)
             out.append(FrameSlice(sw.em_name or default_em, sw.axis, float(pos), 0,
@@ -392,7 +471,7 @@ class RenderWorker:
         file: write a per-thread temp, then atomically rename into place (last wins).
         Identical-key slices (e.g. a camera hold fetched concurrently) hit the same path."""
         tmp = f"{path}.{threading.get_ident()}.tmp"
-        img.save(tmp)
+        img.save(tmp, format="PNG")
         os.replace(tmp, path)
 
     def _mesh_obj(self, mesh_name, segment_ids, lc, nmpp=None) -> str | None:
@@ -742,10 +821,15 @@ class RenderWorker:
         from concurrent.futures import ThreadPoolExecutor
         from ..data.mesh_loader import _FETCH_WORKERS
         warm_jobs = []
+        warm_seen: set[tuple] = set()
         for fi, fr in enumerate(frames):
             region = self._frame_region(fr)
             seg_overlays = self._frame_seg_overlays(fr)
             for sl, slice_seg in self._frame_slice_reads(fr, self._t_global(fi, frame_times, index_offset)):
+                key = self._slice_cache_key(sl, region, seg_overlays, slice_seg=slice_seg)
+                if key in warm_seen:
+                    continue
+                warm_seen.add(key)
                 warm_jobs.append((sl, region, seg_overlays, slice_seg))
 
         def _warm(job):
@@ -756,14 +840,14 @@ class RenderWorker:
                 pass
 
         if warm_jobs and not self.cancel.is_set():
-            self._progress(0.45, f"fetching {len(warm_jobs)} slices…")
+            self._progress(0.45, f"fetching {len(warm_jobs)} unique slice images")
             with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
                 done = 0
                 for _ in ex.map(_warm, warm_jobs):
                     done += 1
                     if done % 8 == 0:
                         self._progress(0.45 + 0.10 * done / len(warm_jobs),
-                                       f"fetching slices {done}/{len(warm_jobs)}")
+                                       f"fetching slice images {done}/{len(warm_jobs)}")
 
         frame_specs = []
         for fi, fr in enumerate(frames):
@@ -844,7 +928,8 @@ class RenderWorker:
                 "mesh_overrides": overrides,
                 "index": index_offset + fi,   # global frame index (split cluster jobs)
             })
-            self._progress(0.45 + 0.15 * (fi + 1) / len(frames), f"slices {fi + 1}/{len(frames)}")
+            self._progress(0.45 + 0.15 * (fi + 1) / len(frames),
+                           f"building frame specs {fi + 1}/{len(frames)}")
         spec = {
             "world": {"nm_per_bu": self.nm_per_bu,
                       "background": self.project.lighting.background},

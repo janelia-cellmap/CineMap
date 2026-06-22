@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 import bpy
 from mathutils import Matrix, Vector
@@ -335,7 +336,7 @@ def _apply_clip(nt, clip, f=None) -> None:
                 n.outputs[0].keyframe_insert("default_value", frame=f)
 
 
-def _load_npz_mesh(path: str, name: str):
+def _load_npz_mesh(path: str, name: str, calc_edges: bool = False):
     """Fast direct-to-bpy mesh loader: read a `.npz` of verts/faces/colors and
     populate a `bpy.types.Mesh` via `foreach_set` (vectorized). Avoids
     `bpy.ops.wm.ply_import`, the undo stack, and operator selection state — the
@@ -362,12 +363,13 @@ def _load_npz_mesh(path: str, name: str):
         cf = (c.astype(np.float32) / 255.0).ravel()
         ca = mesh.color_attributes.new(name="Col", type="FLOAT_COLOR", domain="POINT")
         ca.data.foreach_set("color", cf)
-    # calc_edges builds the edge layer from the loops (needed downstream for the
-    # cutaway bisect/weld). We deliberately SKIP mesh.validate(): it's a full
-    # single-threaded pass over every face, and on multi-million-face meshes it was
-    # the dominant cold-load cost — minutes per mesh. The verts/faces come straight
-    # from our own decode pipeline (already well-formed), so there's nothing to fix.
-    mesh.update(calc_edges=True)
+    # calc_edges builds an explicit edge table from the loops. Only cutaway meshes need
+    # that downstream for bmesh bisect/weld/cap; normal render-only meshes can render
+    # straight from faces, and skipping edge construction saves cold-start time on big
+    # scenes. We deliberately SKIP mesh.validate(): it's a full single-threaded pass over
+    # every face. The verts/faces come from our own decode pipeline, so there is nothing
+    # to repair here.
+    mesh.update(calc_edges=calc_edges)
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
     return obj
@@ -385,10 +387,12 @@ def _import_meshes(scene_spec: dict) -> dict:
 
     out = {}
     flat_shading = scene_spec.get("direction", {}).get("material", {}).get("flat_shading", True)
+    t_all = time.perf_counter()
     for m in scene_spec["meshes"]:
+        t_mesh = time.perf_counter()
         path = m["obj_path"]
         if path.lower().endswith(".npz"):
-            obj = _load_npz_mesh(path, m["id"])
+            obj = _load_npz_mesh(path, m["id"], calc_edges=bool(m.get("clip")))
         else:
             # legacy fallback for any pre-existing .ply / .obj cached assets
             before = set(bpy.data.objects)
@@ -641,6 +645,11 @@ def _import_meshes(scene_spec: dict) -> dict:
         obj.data.materials.clear()
         obj.data.materials.append(mat)
         out[m["id"]] = (obj, mat)
+        print(f"[blender] imported {m['id']} faces={len(obj.data.polygons)} "
+              f"clip={bool(m.get('clip'))} in {time.perf_counter() - t_mesh:.1f}s",
+              flush=True)
+    print(f"[blender] imported {len(out)}/{len(scene_spec['meshes'])} meshes "
+          f"in {time.perf_counter() - t_all:.1f}s", flush=True)
     return out
 
 
@@ -926,12 +935,22 @@ def main(scene_path: str) -> None:
             meshes = None
     if meshes is None:
         _clear()
+        t_import = time.perf_counter()
         meshes = _import_meshes(spec)           # the expensive build
-        if warm:                                # cache it (a copy; current session untouched)
+        print(f"[blender] cold scene build complete in {time.perf_counter() - t_import:.1f}s",
+              flush=True)
+        skip_warm_save = _os.environ.get("CINEMAP_SKIP_WARM_SAVE", "").lower() in (
+            "1", "true", "yes", "on")
+        if warm and skip_warm_save:
+            print("[blender] warm cache save skipped (CINEMAP_SKIP_WARM_SAVE=1)",
+                  flush=True)
+        if warm and not skip_warm_save:         # cache it (a copy; current session untouched)
             try:
                 _os.makedirs(_os.path.dirname(warm), exist_ok=True)
+                t_save = time.perf_counter()
                 bpy.ops.wm.save_as_mainfile(filepath=warm, copy=True)
-                print(f"[blender] warm scene cached: {warm}", flush=True)
+                print(f"[blender] warm scene cached in {time.perf_counter() - t_save:.1f}s: "
+                      f"{warm}", flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"[blender] warm cache save failed: {e}", flush=True)
     # always (re)apply render settings + lights + bloom fresh (cheap; they change per render)
