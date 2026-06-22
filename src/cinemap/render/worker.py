@@ -410,7 +410,10 @@ class RenderWorker:
             if t > sw.start_s + (sw.duration_s or 0.0):
                 continue
             pos = sw.from_nm + (sw.to_nm - sw.from_nm) * _sweep_progress(sw, t)
-            out.append(FrameSlice(sw.em_name or default_em, sw.axis, float(pos), 0,
+            # None lets read_slice auto-pick the EM pyramid level from the camera region.
+            # 0 forces full-resolution s0, which turns full-plane sweeps into hundreds-MB
+            # PNGs and makes asset prep look like "downloading EM frames" forever.
+            out.append(FrameSlice(sw.em_name or default_em, sw.axis, float(pos), None,
                                   float(sw.opacity), normal=sw.normal))
         return out
 
