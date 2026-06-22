@@ -436,6 +436,15 @@ class RenderWorker:
             saturation=getattr(m, "saturation", 1.0),
         )
 
+    @staticmethod
+    def _layer_visible(m) -> bool:
+        return bool(getattr(m, "visible", True)) and float(getattr(m, "opacity", 1.0)) > 0.001
+
+    def _mesh_render_alpha(self, m) -> float:
+        if not self._layer_visible(m) or not getattr(m, "render_3d", True):
+            return 0.0
+        return float(getattr(m, "opacity", 1.0)) * float(getattr(m, "object_alpha", 1.0))
+
     # --- slice-read derivation (shared by the parallel warm pass and the build loop, so
     # the two can never drift) -------------------------------------------------------
     def _frame_region(self, fr):
@@ -451,9 +460,11 @@ class RenderWorker:
         return 2.0 * dist * math.tan(math.radians(fr.fov_deg) / 2) / height
 
     def _frame_seg_overlays(self, fr):
-        """Segmentation layers in this frame to overlay on the EM slice."""
+        """Visible segmentation layers in this frame to overlay on the EM slice."""
         out = []
         for m in fr.meshes:
+            if not self._layer_visible(m):
+                continue
             src = next((s for s in self.manifest.meshes if s.name == m.mesh_name), None)
             if src and src.label_zarr and m.segment_ids:
                 out.append((src.label_zarr, m.segment_ids, self._frame_colors(m)))
@@ -471,7 +482,8 @@ class RenderWorker:
             slice_seg = None
             if is_label:
                 sm = next((mm for mm in fr.meshes
-                           if mm.mesh_name == sl.em_name and mm.segment_ids), None)
+                           if mm.mesh_name == sl.em_name and mm.segment_ids
+                           and self._layer_visible(mm)), None)
                 if sm:
                     slice_seg = (list(sm.segment_ids), self._frame_colors(sm))
             out.append((sl, slice_seg))
@@ -681,7 +693,7 @@ class RenderWorker:
         layers: dict[str, tuple] = {}
         for fr in frames:
             for m in fr.meshes:
-                if not m.render_3d or not m.segment_ids or m.mesh_name in layers:
+                if self._mesh_render_alpha(m) <= 0.001 or not m.segment_ids or m.mesh_name in layers:
                     continue
                 src = next((s for s in self.manifest.meshes
                             if s.name == m.mesh_name and s.mesh_url), None)
@@ -698,7 +710,7 @@ class RenderWorker:
                 raise RenderCancelled()
             per: dict[str, str] = {}
             for m in fr.meshes:
-                if m.mesh_name not in layers:
+                if self._mesh_render_alpha(m) <= 0.001 or m.mesh_name not in layers:
                     continue
                 ld, seg_ids = layers[m.mesh_name]
                 lc = self._frame_colors(m)
@@ -779,6 +791,8 @@ class RenderWorker:
         for fi, fr in enumerate(frames):
             t = _ft(fi)
             for m in fr.meshes:
+                if self._mesh_render_alpha(m) <= 0.001:
+                    continue
                 if self._clip_from_sweeps(m.mesh_name, t) or _clip_params(getattr(m, "clip", None)):
                     clip_frames.setdefault(m.mesh_name, set()).add(fi)
         clip_nmpp = {layer: min(frame_lod_nmpp[i] for i in fis) for layer, fis in clip_frames.items()}
@@ -795,7 +809,7 @@ class RenderWorker:
                 raise RenderCancelled()
             if frame_layer_uid is None:
                 for m in fr.meshes:
-                    if not m.render_3d:       # label-only layer -> slice overlay only
+                    if self._mesh_render_alpha(m) <= 0.001:
                         continue
                     nmpp = _eff_nmpp(m.mesh_name, fi)
                     lc = self._frame_colors(m)
@@ -870,9 +884,8 @@ class RenderWorker:
                 emph_track[fi] if emph_track and fi < len(emph_track) else (None, 0.0, 1.0))
             region = self._frame_region(fr)
             target_nm_per_px = self._frame_nm_per_px(fr)
-            # segmentation layers in this frame -> overlaid on the EM slice. Decoupled from
-            # the 3D mesh opacity: the slice shows the cross-section even when the 3D meshes
-            # are faded/hidden (so they don't occlude it).
+            # Visible segmentation layers in this frame -> optional colored overlays on EM.
+            # Hidden layers stay hidden so slice-only shots do not reintroduce meshes/labels.
             seg_overlays = self._frame_seg_overlays(fr)
             slices = []
             # keyframe slices PLUS any 'slice' sweeps evaluated on the global timeline
@@ -901,9 +914,8 @@ class RenderWorker:
                     uid = self._mesh_uid(m.mesh_name, m.segment_ids,
                                          self._frame_colors(m).cache_key(), _eff_nmpp(m.mesh_name, fi))
                 if uid and uid in mesh_specs:
-                    # effective 3D alpha = cinematic fade (opacity) * NG "Opacity (3d)"
-                    oa = getattr(m, "object_alpha", 1.0)
-                    eff = m.opacity * oa
+                    # effective 3D alpha = layer visibility * cinematic fade * NG "Opacity (3d)"
+                    eff = self._mesh_render_alpha(m)
                     is_hero = (m.mesh_name == emph_hero)
                     if emph_track and not is_hero and emph_spot < 1.0:
                         eff *= emph_spot                 # spotlight: briefly dim context
