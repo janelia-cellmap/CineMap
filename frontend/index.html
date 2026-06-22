@@ -959,7 +959,9 @@ async function renderThumbnail(id) {
   AUTO_THUMBS = false;   // a manual single-thumbnail render stops the auto sweep
   if (THUMB_JOB) { api('POST', `/api/renders/${THUMB_JOB}/cancel`).catch(() => {}); }  // don't pile up
   try {
-    const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`);
+    const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`, {
+      mesh_from_labels: $('labelMeshes').checked
+    });
     THUMB_JOB = job_id;
     attachRender(job_id, () => {
       if (THUMB_JOB === job_id) THUMB_JOB = null;

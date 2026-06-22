@@ -182,6 +182,10 @@ class RenderReq(BaseModel):
     bbox_source: str = ""       # layer name to box (even if hidden); "" = auto
 
 
+class ThumbnailReq(BaseModel):
+    mesh_from_labels: bool = False  # keep thumbnails source-compatible with previews
+
+
 class ChatReq(BaseModel):
     message: str
     history: list[dict] = []
@@ -409,13 +413,15 @@ def goto_keyframe(pid: str, kid: str):
 
 
 @app.post("/api/projects/{pid}/keyframes/{kid}/thumbnail")
-def render_thumbnail(pid: str, kid: str):
+def render_thumbnail(pid: str, kid: str, req: ThumbnailReq | None = None):
     """Render this single keyframe to a still and keep it as the frame's thumbnail."""
     p = store.load(pid)
     idx = next((i for i, k in enumerate(p.keyframes) if k.id == kid), None)
     if idx is None:
         raise HTTPException(404, "no such keyframe")
-    settings = RenderSettings(width=640, height=480, samples=24, fps=1, draft=True, still=True)
+    req = req or ThumbnailReq()
+    settings = RenderSettings(width=640, height=480, samples=24, fps=1, draft=True,
+                              still=True, mesh_from_labels=req.mesh_from_labels)
     job_id = _start_render(pid, settings, kf_range=[idx, idx], thumbnail_for=kid)
     return {"job_id": job_id}
 
