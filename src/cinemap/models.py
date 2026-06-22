@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 Axis = Literal["x", "y", "z"]
 TransitionStyle = Literal["glide", "cut", "fade"]
+LayerTransitionStyle = Literal["fade", "cut"]
 
 
 # ----------------------------- data sources -----------------------------
@@ -137,9 +138,13 @@ class Keyframe(BaseModel):
     duration_in_s: float = 2.0  # transition duration INTO this keyframe (the move)
     hold_in_s: float = 0.0      # rest/dwell ON this keyframe's pose before moving on
     easing: Literal["linear", "ease-in-out", "ease-in", "ease-out"] = "ease-in-out"
-    # How the movie enters this keyframe from the previous one:
-    # glide = interpolate camera/layers, cut = hold previous pose then jump, fade = fade via black.
+    # Camera/edit transition into this keyframe. Layer appearance/style changes are controlled
+    # separately by layer_transition below.
     transition: TransitionStyle = "glide"
+    # How meshes/slices/annotations change during the camera move into this keyframe:
+    # fade = old behavior, cross-fade layer visibility/opacity; cut = keep source layers
+    # through the move and switch hard at the keyframe arrival.
+    layer_transition: LayerTransitionStyle = "fade"
     ng_state: Optional[dict] = None  # originating scouting state (round-trip)
     thumbnail_path: Optional[str] = None
     # keyframes produced together by a generated move (plane scan, orbit, …) share a

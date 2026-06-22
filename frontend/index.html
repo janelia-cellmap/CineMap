@@ -77,6 +77,7 @@
   .tltrans.hold { background:repeating-linear-gradient(45deg,#262b36,#262b36 5px,#323847 5px,#323847 10px); }
   .tltrans.cut { background:#4c5667; }
   .tltrans.fade { background:linear-gradient(90deg,#566184,#090b10 50%,#566184); }
+  .tltrans.layercut { box-shadow:inset 0 -3px 0 #ffbf4d; }
   .tltrans .trlbl { font-size:10px; color:#cdd3ff; white-space:nowrap; text-shadow:0 1px 2px #000; }
   .tltrans .trgrip { position:absolute; right:0; top:0; width:7px; height:100%; cursor:ew-resize; background:rgba(255,255,255,.28); }
   .tltrans .trgrip:hover { background:#8a8fff; }
@@ -554,6 +555,7 @@ const fmtS = v => (+v).toFixed(2).replace(/\.?0+$/, '');
 const durS = k => Math.max(0, +(k && k.duration_in_s) || 0);
 const holdS = k => Math.max(0, +(k && k.hold_in_s) || 0);
 const transStyle = k => (k && ['glide','cut','fade'].includes(k.transition)) ? k.transition : 'glide';
+const layerTrans = k => (k && ['fade','cut'].includes(k.layer_transition)) ? k.layer_transition : 'fade';
 const transIcon = s => s === 'cut' ? '⏭' : (s === 'fade' ? '◐' : '▶');
 function keyframeTimes(kfs) {
   const tAt = [0];
@@ -597,11 +599,11 @@ function renderKeyframes(p) {
   }
   // transition blocks between consecutive keyframes
   for (let i=1;i<kfs.length;i++){
-    const k=kfs[i], st=transStyle(k), x0=TL_XOF(tAt[i-1] + holdS(kfs[i-1])), w=Math.max(2,durS(k)*TL_PX);
+    const k=kfs[i], st=transStyle(k), lt=layerTrans(k), x0=TL_XOF(tAt[i-1] + holdS(kfs[i-1])), w=Math.max(2,durS(k)*TL_PX);
     const hold = JSON.stringify(kfs[i-1].camera)===JSON.stringify(k.camera);   // identical pose = a dwell
-    html += `<div class="tltrans ${hold?'hold ':''}${st}" style="left:${x0}px;width:${w}px"
-        title="${hold?'hold pose':st} into KF${i} · ${fmtS(durS(k))}s · click to edit · drag the right edge to resize" onclick="openTransEdit(event,'${k.id}')">
-      <span class="trlbl">${hold?'⏸':transIcon(st)}${fmtS(durS(k))}s</span>
+    html += `<div class="tltrans ${hold?'hold ':''}${st}${lt==='cut'?' layercut':''}" style="left:${x0}px;width:${w}px"
+        title="camera: ${hold?'hold pose':st} · layers: ${lt} · into KF${i} · ${fmtS(durS(k))}s · click to edit · drag the right edge to resize" onclick="openTransEdit(event,'${k.id}')">
+      <span class="trlbl">${hold?'⏸':transIcon(st)}${fmtS(durS(k))}s${lt==='cut'?' |cut':''}</span>
       <span class="trgrip" onmousedown="event.stopPropagation(); startTransDrag(event,'${k.id}',${durS(k)})"></span></div>`;
   }
   // keyframe markers (instants) — thumbnails centered on their time
@@ -634,12 +636,16 @@ function openTransEdit(e, id) {
   if(!k) return;
   const hold = i>0 && JSON.stringify(kfs[i-1].camera)===JSON.stringify(k.camera);
   const st = transStyle(k);
+  const lt = layerTrans(k);
   let pop=$('transEdit');
   if(!pop){ pop=document.createElement('div'); pop.id='transEdit'; document.body.appendChild(pop); }
   pop.innerHTML=`
-    <div class="te-hd">${i===0?'KF0':(hold?'⏸ Hold':'Move')} → KF${i}<span class="te-x" onclick="closeTransEdit()">✕</span></div>
-    ${i>0 ? `<label>style <select id="teTrans">
-      ${[['glide','glide / interpolate'],['cut','cut'],['fade','fade through black']].map(([v,t])=>`<option value="${v}"${st===v?' selected':''}>${t}</option>`).join('')}
+    <div class="te-hd">${i===0?'KF0':(hold?'⏸ Hold':'Transition')} → KF${i}<span class="te-x" onclick="closeTransEdit()">✕</span></div>
+    ${i>0 ? `<label>camera <select id="teTrans">
+      ${[['glide','glide / move'],['cut','cut camera'],['fade','black fade']].map(([v,t])=>`<option value="${v}"${st===v?' selected':''}>${t}</option>`).join('')}
+    </select></label>
+    <label>layers <select id="teLayerTrans">
+      ${[['fade','fade layer changes'],['cut','cut layer changes']].map(([v,t])=>`<option value="${v}"${lt===v?' selected':''}>${t}</option>`).join('')}
     </select></label>
     <label>duration <input id="teDur" type="number" min="0" step="0.1" value="${fmtS(durS(k))}" />s</label>
     <label>easing <select id="teEase">
@@ -648,7 +654,7 @@ function openTransEdit(e, id) {
     <label>hold after <input id="teHold" type="number" min="0" step="0.1" value="${fmtS(holdS(k))}" />s</label>
     <div class="te-row"><button onclick="gotoKf('${id}',null); closeTransEdit()">view</button>
       <button class="primary" onclick="applyTransEdit('${id}')">apply</button></div>
-    <div class="te-hint">Cut holds the previous pose, then jumps. Fade goes through black.</div>`;
+    <div class="te-hint">Layer cut keeps old meshes during the move, then switches at the keyframe.</div>`;
   pop.style.left=Math.min(e.clientX, window.innerWidth-252)+'px';
   pop.style.top=Math.max(10, e.clientY-210)+'px';
   pop.style.display='block';
@@ -663,6 +669,7 @@ async function applyTransEdit(id){
   if ($('teDur')) fields.duration_in_s = Math.max(0, parseFloat($('teDur').value)||0);
   if ($('teEase')) fields.easing = $('teEase').value;
   if ($('teTrans')) fields.transition = $('teTrans').value;
+  if ($('teLayerTrans')) fields.layer_transition = $('teLayerTrans').value;
   closeTransEdit();
   await setKfTiming(id, fields);
 }
