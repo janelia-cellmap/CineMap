@@ -63,7 +63,8 @@ TOOLS = [
          "hold_in_s": {"type": "number"},
          "easing": {"type": "string", "enum": ["linear", "ease-in-out"]},
          "transition": {"type": "string", "enum": ["glide", "cut", "fade"]},
-         "layer_transition": {"type": "string", "enum": ["fade", "cut"]}},
+         "layer_transition": {"type": "string", "enum": ["fade", "cut"]},
+         "layer_transition_at": {"type": "number"}},
          "required": ["index"]}},
     {"name": "set_keyframe_segments", "description": "Set which segment ids of a mesh layer are shown in a keyframe.",
      "input_schema": {"type": "object", "properties": {
@@ -92,6 +93,7 @@ def _kf_summary(p: Project) -> list[dict]:
             "index": i, "label": k.label, "duration_in_s": k.duration_in_s,
             "hold_in_s": k.hold_in_s, "transition": getattr(k, "transition", "glide"),
             "layer_transition": getattr(k, "layer_transition", "fade"),
+            "layer_transition_at": getattr(k, "layer_transition_at", 1.0),
             "look_at_nm": [round(x) for x in k.camera.look_at_nm],
             "slices": [{"axis": s.axis, "position_nm": round(s.position_nm), "visible": s.visible} for s in k.slices],
             "meshes": [{"layer": m.mesh_name, "n_segments": len(m.segment_ids), "visible": m.visible} for m in k.meshes],
@@ -141,8 +143,11 @@ def _dispatch(name: str, args: dict, p: Project, render_fn: Callable | None) -> 
         return {"ok": True}
     if name == "set_keyframe":
         fields = {k: args[k] for k in (
-            "duration_in_s", "hold_in_s", "easing", "transition", "layer_transition")
+            "duration_in_s", "hold_in_s", "easing", "transition", "layer_transition",
+            "layer_transition_at")
             if k in args}
+        if "layer_transition_at" in fields:
+            fields["layer_transition_at"] = max(0.0, min(1.0, float(fields["layer_transition_at"])))
         ops.update_keyframe(p, _kid(p, args["index"]), **fields)
         return {"ok": True}
     if name == "set_keyframe_segments":

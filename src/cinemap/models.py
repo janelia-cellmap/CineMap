@@ -143,8 +143,11 @@ class Keyframe(BaseModel):
     transition: TransitionStyle = "glide"
     # How meshes/slices/annotations change during the camera move into this keyframe:
     # fade = old behavior, cross-fade layer visibility/opacity; cut = keep source layers
-    # through the move and switch hard at the keyframe arrival.
+    # through the move and switch hard at layer_transition_at.
     layer_transition: LayerTransitionStyle = "fade"
+    # Normalized time in the transition where cut layer changes switch from source to target:
+    # 0.0 = start of move, 0.5 = halfway, 1.0 = at keyframe arrival.
+    layer_transition_at: float = 1.0
     ng_state: Optional[dict] = None  # originating scouting state (round-trip)
     thumbnail_path: Optional[str] = None
     # keyframes produced together by a generated move (plane scan, orbit, …) share a

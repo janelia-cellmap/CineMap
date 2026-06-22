@@ -556,6 +556,7 @@ const durS = k => Math.max(0, +(k && k.duration_in_s) || 0);
 const holdS = k => Math.max(0, +(k && k.hold_in_s) || 0);
 const transStyle = k => (k && ['glide','cut','fade'].includes(k.transition)) ? k.transition : 'glide';
 const layerTrans = k => (k && ['fade','cut'].includes(k.layer_transition)) ? k.layer_transition : 'fade';
+const layerAt = k => Math.max(0, Math.min(1, +(k && k.layer_transition_at != null ? k.layer_transition_at : 1)));
 const transIcon = s => s === 'cut' ? '⏭' : (s === 'fade' ? '◐' : '▶');
 function keyframeTimes(kfs) {
   const tAt = [0];
@@ -599,11 +600,11 @@ function renderKeyframes(p) {
   }
   // transition blocks between consecutive keyframes
   for (let i=1;i<kfs.length;i++){
-    const k=kfs[i], st=transStyle(k), lt=layerTrans(k), x0=TL_XOF(tAt[i-1] + holdS(kfs[i-1])), w=Math.max(2,durS(k)*TL_PX);
+    const k=kfs[i], st=transStyle(k), lt=layerTrans(k), la=layerAt(k), x0=TL_XOF(tAt[i-1] + holdS(kfs[i-1])), w=Math.max(2,durS(k)*TL_PX);
     const hold = JSON.stringify(kfs[i-1].camera)===JSON.stringify(k.camera);   // identical pose = a dwell
     html += `<div class="tltrans ${hold?'hold ':''}${st}${lt==='cut'?' layercut':''}" style="left:${x0}px;width:${w}px"
-        title="camera: ${hold?'hold pose':st} · layers: ${lt} · into KF${i} · ${fmtS(durS(k))}s · click to edit · drag the right edge to resize" onclick="openTransEdit(event,'${k.id}')">
-      <span class="trlbl">${hold?'⏸':transIcon(st)}${fmtS(durS(k))}s${lt==='cut'?' |cut':''}</span>
+        title="camera: ${hold?'hold pose':st} · layers: ${lt}${lt==='cut'?' @ '+Math.round(la*100)+'%':''} · into KF${i} · ${fmtS(durS(k))}s · click to edit · drag the right edge to resize" onclick="openTransEdit(event,'${k.id}')">
+      <span class="trlbl">${hold?'⏸':transIcon(st)}${fmtS(durS(k))}s${lt==='cut'?' |cut@'+Math.round(la*100):''}</span>
       <span class="trgrip" onmousedown="event.stopPropagation(); startTransDrag(event,'${k.id}',${durS(k)})"></span></div>`;
   }
   // keyframe markers (instants) — thumbnails centered on their time
@@ -637,6 +638,7 @@ function openTransEdit(e, id) {
   const hold = i>0 && JSON.stringify(kfs[i-1].camera)===JSON.stringify(k.camera);
   const st = transStyle(k);
   const lt = layerTrans(k);
+  const la = layerAt(k);
   let pop=$('transEdit');
   if(!pop){ pop=document.createElement('div'); pop.id='transEdit'; document.body.appendChild(pop); }
   pop.innerHTML=`
@@ -647,6 +649,7 @@ function openTransEdit(e, id) {
     <label>layers <select id="teLayerTrans">
       ${[['fade','fade layer changes'],['cut','cut layer changes']].map(([v,t])=>`<option value="${v}"${lt===v?' selected':''}>${t}</option>`).join('')}
     </select></label>
+    <label>layer switch <input id="teLayerAt" type="number" min="0" max="100" step="5" value="${Math.round(la*100)}" />%</label>
     <label>duration <input id="teDur" type="number" min="0" step="0.1" value="${fmtS(durS(k))}" />s</label>
     <label>easing <select id="teEase">
       ${['ease-in-out','linear','ease-in','ease-out'].map(o=>`<option value="${o}"${(k.easing||'ease-in-out')===o?' selected':''}>${o}</option>`).join('')}
@@ -654,7 +657,7 @@ function openTransEdit(e, id) {
     <label>hold after <input id="teHold" type="number" min="0" step="0.1" value="${fmtS(holdS(k))}" />s</label>
     <div class="te-row"><button onclick="gotoKf('${id}',null); closeTransEdit()">view</button>
       <button class="primary" onclick="applyTransEdit('${id}')">apply</button></div>
-    <div class="te-hint">Layer cut keeps old meshes during the move, then switches at the keyframe.</div>`;
+    <div class="te-hint">Layer cut switches at the chosen percent of the camera move.</div>`;
   pop.style.left=Math.min(e.clientX, window.innerWidth-252)+'px';
   pop.style.top=Math.max(10, e.clientY-210)+'px';
   pop.style.display='block';
@@ -670,6 +673,7 @@ async function applyTransEdit(id){
   if ($('teEase')) fields.easing = $('teEase').value;
   if ($('teTrans')) fields.transition = $('teTrans').value;
   if ($('teLayerTrans')) fields.layer_transition = $('teLayerTrans').value;
+  if ($('teLayerAt')) fields.layer_transition_at = Math.max(0, Math.min(100, parseFloat($('teLayerAt').value)||0)) / 100;
   closeTransEdit();
   await setKfTiming(id, fields);
 }

@@ -563,6 +563,7 @@ class DurationReq(BaseModel):
     easing: str | None = None
     transition: str | None = None
     layer_transition: str | None = None
+    layer_transition_at: float | None = None
 
 
 @app.put("/api/projects/{pid}/keyframes/{kid}/duration")
@@ -588,6 +589,8 @@ def set_keyframe_duration(pid: str, kid: str, req: DurationReq):
         if req.layer_transition not in ("fade", "cut"):
             raise HTTPException(400, "layer_transition must be fade or cut")
         fields["layer_transition"] = req.layer_transition
+    if req.layer_transition_at is not None:
+        fields["layer_transition_at"] = max(0.0, min(1.0, float(req.layer_transition_at)))
     ops.update_keyframe(p, kid, **fields)
     return {"ok": True, **fields}
 

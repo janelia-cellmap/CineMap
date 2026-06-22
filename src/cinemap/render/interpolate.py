@@ -142,22 +142,36 @@ def _lerp_clip(ca, cb, t: float) -> dict | None:
     return db if t >= 0.5 else da
 
 
-def _blend_value(av: float, bv: float, t: float, layer_transition: str) -> float:
+def _layer_cut_at(v: float | None) -> float:
+    return max(0.0, min(1.0, float(1.0 if v is None else v)))
+
+
+def _target_layer_active(layer_transition: str, layer_t: float, layer_transition_at: float) -> bool:
+    return layer_transition == "cut" and layer_t >= _layer_cut_at(layer_transition_at)
+
+
+def _blend_value(av: float, bv: float, t: float, layer_transition: str,
+                 layer_t: float, layer_transition_at: float) -> float:
     if layer_transition == "cut":
-        return bv if t >= 1.0 else av
+        return bv if _target_layer_active(layer_transition, layer_t, layer_transition_at) else av
     return av * (1 - t) + bv * t
 
 
-def _appear_opacity(base: float, has_a: bool, t: float, layer_transition: str) -> float:
+def _appear_opacity(base: float, has_a: bool, t: float, layer_transition: str,
+                    layer_t: float, layer_transition_at: float) -> float:
     if layer_transition == "cut":
-        return base if has_a or t >= 1.0 else 0.0
+        target = _target_layer_active(layer_transition, layer_t, layer_transition_at)
+        return base if (has_a and not target) or ((not has_a) and target) else 0.0
     return base * (1 - t) if has_a else base * t
 
 
 def _state_at(a: Keyframe, b: Keyframe, t: float,
-              layer_transition: str = "fade") -> FrameState:
+              layer_transition: str = "fade", layer_t: float | None = None,
+              layer_transition_at: float = 1.0) -> FrameState:
     pos, look_at, up, fov = _interp_camera(a.camera, b.camera, t)
     fs = FrameState(position_nm=pos, look_at_nm=look_at, fov_deg=fov, up=up)
+    lt = t if layer_t is None else max(0.0, min(1.0, float(layer_t)))
+    target_layer = _target_layer_active(layer_transition, lt, layer_transition_at)
     # slices matched by (em_name, axis)
     a_sl = {(s.em_name, s.axis): s for s in a.slices}
     b_sl = {(s.em_name, s.axis): s for s in b.slices}
@@ -166,18 +180,21 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
         if sa and sb:
             # plane offset scrolls; normal snaps to target if it differs (same on a scan)
             same_n = sa.normal == sb.normal
+            pos_nm = sb.position_nm if target_layer else (
+                sa.position_nm + (sb.position_nm - sa.position_nm) * t)
             fs.slices.append(FrameSlice(
                 key[0], key[1],
-                sa.position_nm + (sb.position_nm - sa.position_nm) * t,
-                sb.scale_level,
+                pos_nm,
+                sb.scale_level if target_layer else sa.scale_level,
                 _blend_value(sa.opacity if sa.visible else 0.0,
-                             sb.opacity if sb.visible else 0.0, t, layer_transition),
-                normal=(sb.normal if (same_n or t >= 0.5) else sa.normal),
+                             sb.opacity if sb.visible else 0.0, t, layer_transition,
+                             lt, layer_transition_at),
+                normal=(sb.normal if (same_n or t >= 0.5 or target_layer) else sa.normal),
             ))
         else:  # appearing or disappearing
             s = sa or sb
             base = (s.opacity if s.visible else 0.0)
-            op = _appear_opacity(base, bool(sa), t, layer_transition)
+            op = _appear_opacity(base, bool(sa), t, layer_transition, lt, layer_transition_at)
             fs.slices.append(FrameSlice(key[0], key[1], s.position_nm, s.scale_level, op, normal=s.normal))
     # Meshes are matched by (layer name + exact segment set). A different segment set
     # is different geometry; layer_transition decides whether that change cross-fades
@@ -190,18 +207,22 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
     for key in dict.fromkeys(list(a_m) + list(b_m)):
         ma, mb = a_m.get(key), b_m.get(key)
         name, ids = key[0], list(key[1])
-        src = ma if (layer_transition == "cut" and t < 1.0 and ma) else (mb or ma)
+        src = ma if (layer_transition == "cut" and not target_layer and ma) else (mb or ma)
         cc = dict(color_seed=src.color_seed, default_color=src.default_color,
                   segment_colors=src.segment_colors, saturation=src.saturation)
         if ma and mb:
             op = _blend_value(ma.opacity if ma.visible else 0.0,
-                              mb.opacity if mb.visible else 0.0, t, layer_transition)
-            oa = _blend_value(ma.object_alpha, mb.object_alpha, t, layer_transition)
-            si = _blend_value(ma.silhouette, mb.silhouette, t, layer_transition)
-            clip = _lerp_clip(ma.clip, mb.clip, t)                     # cutaway scrolls
+                              mb.opacity if mb.visible else 0.0, t, layer_transition,
+                              lt, layer_transition_at)
+            oa = _blend_value(ma.object_alpha, mb.object_alpha, t, layer_transition,
+                              lt, layer_transition_at)
+            si = _blend_value(ma.silhouette, mb.silhouette, t, layer_transition,
+                              lt, layer_transition_at)
+            clip = (_clip_dict(mb.clip) if target_layer else _clip_dict(ma.clip)) \
+                if layer_transition == "cut" else _lerp_clip(ma.clip, mb.clip, t)
             # material lerps too -> a layer can turn reflective over a transition. Only
             # emitted when a keyframe actually sets it, else None (leave the look base).
-            mtl_t = 1.0 if layer_transition == "cut" and t >= 1.0 else (0.0 if layer_transition == "cut" else t)
+            mtl_t = 1.0 if target_layer else (0.0 if layer_transition == "cut" else t)
             mtl = _mat_lerp(getattr(ma, "metallic", None), getattr(mb, "metallic", None), mtl_t, 0.0)
             rgh = _mat_lerp(getattr(ma, "roughness", None), getattr(mb, "roughness", None), mtl_t, 0.5)
             fs.meshes.append(FrameMesh(name, ids, src.color, op, src.render_3d,
@@ -210,7 +231,7 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
         else:
             m = ma or mb
             base = (m.opacity if m.visible else 0.0)
-            op = _appear_opacity(base, bool(ma), t, layer_transition)
+            op = _appear_opacity(base, bool(ma), t, layer_transition, lt, layer_transition_at)
             fs.meshes.append(FrameMesh(name, ids, m.color, op, m.render_3d,
                                        object_alpha=m.object_alpha, silhouette=m.silhouette,
                                        clip=_clip_dict(m.clip),
@@ -221,13 +242,14 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
     b_an = {an.name: an for an in b.annotations}
     for key in dict.fromkeys(list(a_an) + list(b_an)):
         aa, ab = a_an.get(key), b_an.get(key)
-        src = aa if (layer_transition == "cut" and t < 1.0 and aa) else (ab or aa)
+        src = aa if (layer_transition == "cut" and not target_layer and aa) else (ab or aa)
         if aa and ab:
             op = _blend_value(aa.opacity if aa.visible else 0.0,
-                              ab.opacity if ab.visible else 0.0, t, layer_transition)
+                              ab.opacity if ab.visible else 0.0, t, layer_transition,
+                              lt, layer_transition_at)
         else:
             base = (src.opacity if src.visible else 0.0)
-            op = _appear_opacity(base, bool(aa), t, layer_transition)
+            op = _appear_opacity(base, bool(aa), t, layer_transition, lt, layer_transition_at)
         fs.annotations.append(FrameAnnotation(
             src.name, src.color, op, src.points, src.lines, src.boxes, src.ellipsoids,
             src.point_radius_nm, src.line_radius_nm))
@@ -240,7 +262,8 @@ def _with_fade(fs: FrameState, alpha: float) -> FrameState:
 
 
 def _transition_state(a: Keyframe, b: Keyframe, t: float, style: str,
-                      easing: str, layer_transition: str = "fade") -> FrameState:
+                      easing: str, layer_transition: str = "fade",
+                      layer_transition_at: float = 1.0) -> FrameState:
     """Frame for one transition, before any global sweep overlays are evaluated."""
     if style == "cut":
         # The move has duration, but the scene itself does not interpolate: hold the
@@ -253,7 +276,8 @@ def _transition_state(a: Keyframe, b: Keyframe, t: float, style: str,
         if t < 0.5:
             return _with_fade(_state_at(a, a, 0.0), t * 2.0)
         return _with_fade(_state_at(b, b, 0.0), (1.0 - t) * 2.0)
-    return _state_at(a, b, _ease(t, easing), layer_transition=layer_transition)
+    return _state_at(a, b, _ease(t, easing), layer_transition=layer_transition,
+                     layer_t=t, layer_transition_at=layer_transition_at)
 
 
 def state_at_time(keyframes: list[Keyframe], t: float,
@@ -280,7 +304,8 @@ def state_at_time(keyframes: list[Keyframe], t: float,
                 ease = b.easing
             local = (t - cum) / dur
             return _transition_state(a, b, local, getattr(b, "transition", "glide"), ease,
-                                     getattr(b, "layer_transition", "fade"))
+                                     getattr(b, "layer_transition", "fade"),
+                                     getattr(b, "layer_transition_at", 1.0))
         cum += dur
     return _state_at(keyframes[-1], keyframes[-1], 0.0)
 
@@ -292,7 +317,7 @@ def build_frames(keyframes: list[Keyframe], fps: int,
     frames at t = k/n for k in [0, n). `duration_in_s` is stored on the DESTINATION
     keyframe (the transition into it). A duration of 0 emits no transition frames.
     `transition` controls the camera/edit transition, while `layer_transition` controls
-    whether layer appearance changes fade during the move or cut at the arrival frame.
+    whether layer appearance changes fade during the move or cut at a chosen time.
     `hold_in_s` on a keyframe adds dwell time before its outgoing transition.
 
     `smooth_ends` (the director's cinematic motion) eases into the FIRST transition
@@ -317,8 +342,10 @@ def build_frames(keyframes: list[Keyframe], fps: int,
             ease = b.easing
         style = getattr(b, "transition", "glide")
         layer_transition = getattr(b, "layer_transition", "fade")
+        layer_transition_at = getattr(b, "layer_transition_at", 1.0)
         for k in range(n):
-            frames.append(_transition_state(a, b, k / n, style, ease, layer_transition))
+            frames.append(_transition_state(a, b, k / n, style, ease, layer_transition,
+                                            layer_transition_at))
     frames.append(_state_at(keyframes[-1], keyframes[-1], 0.0))  # final keyframe, 1 frame
     final_hold_n = int(round(max(0.0, float(getattr(keyframes[-1], "hold_in_s", 0.0) or 0.0)) * fps))
     for _ in range(final_hold_n):
