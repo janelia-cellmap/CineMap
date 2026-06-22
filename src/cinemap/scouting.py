@@ -255,15 +255,28 @@ def bake_keyframe_from_state(project: Project, state: dict, label: str = "import
 def _merge_manifest(project: Project, state: dict) -> None:
     """Union one imported state's mesh/EM sources into the project manifest, so a
     layer that appears only in a later state (e.g. a skeleton layer not present in
-    state 1) is known to the renderer. Matches by layer name; first one wins."""
+    state 1) is known to the renderer. Matches by layer name; fills in source fields
+    discovered later, such as a label volume paired with an existing mesh layer."""
     from .data.manifest import analyze_state_dict
 
     m = analyze_state_dict(state)
-    have = {x.name for x in project.manifest.meshes}
+    by_name = {x.name: x for x in project.manifest.meshes}
     for ms in m.meshes:
-        if ms.name not in have:
+        cur = by_name.get(ms.name)
+        if cur is None:
             project.manifest.meshes.append(ms)
-            have.add(ms.name)
+            by_name[ms.name] = ms
+            continue
+        if not cur.mesh_url and ms.mesh_url:
+            cur.mesh_url = ms.mesh_url
+        if not cur.label_zarr and ms.label_zarr:
+            cur.label_zarr = ms.label_zarr
+        if not cur.skeleton_url and ms.skeleton_url:
+            cur.skeleton_url = ms.skeleton_url
+        if not cur.skeleton_shader and ms.skeleton_shader:
+            cur.skeleton_shader = ms.skeleton_shader
+        if not cur.segment_ids and ms.segment_ids:
+            cur.segment_ids = ms.segment_ids
     if project.manifest.em is None and m.em is not None:
         project.manifest.em = m.em
 

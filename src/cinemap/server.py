@@ -279,6 +279,8 @@ def import_project(body: dict):
     p.renders = []              # drop render history (output files won't exist)
     for kf in p.keyframes:      # thumbnails live in the OLD project dir -> stale paths; regenerate
         kf.thumbnail_path = None
+        if kf.ng_state:
+            scouting._merge_manifest(p, kf.ng_state)
     store.save(p)
     try:
         scouting.load_dataset(p.data_path)
