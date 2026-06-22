@@ -176,6 +176,25 @@ def _scene_from_view(project: Project, st: dict | None = None):
     return cam, slices, meshes, annotations, st
 
 
+def _state_declares_render_layers(project: Project, st: dict) -> bool:
+    """Whether this NG state explicitly says something about renderable layers.
+
+    If a state has known mesh/segmentation or EM layers but they are hidden or empty, that
+    is an intentional blank/slice-only state. Do not treat it as a failed capture and copy
+    previous meshes forward.
+    """
+    mesh_names = {m.name for m in project.manifest.meshes}
+    em_name = project.manifest.em.name if project.manifest.em else None
+    for layer in st.get("layers", []):
+        name = layer.get("name")
+        typ = layer.get("type")
+        if typ == "segmentation" and name in mesh_names:
+            return True
+        if typ == "image" and name == em_name:
+            return True
+    return False
+
+
 def _hex_to_rgb(h: str) -> list[float]:
     h = (h or "").lstrip("#")
     if len(h) != 6:
@@ -212,7 +231,8 @@ def bake_keyframe(project: Project, label: str = "scouted", st: dict | None = No
     """Build a NEW keyframe from a neuroglancer state (the live view by default)."""
     cam, slices, meshes, annotations, st = _scene_from_view(project, st)
     _merge_manifest(project, st)   # learn layers new to this view (e.g. an EM image just added)
-    if not meshes and not slices and project.keyframes:  # nothing on -> keep previous meshes
+    if (not meshes and not slices and project.keyframes
+            and not _state_declares_render_layers(project, st)):
         meshes = [m.model_copy() for m in project.keyframes[-1].meshes]
     kf = Keyframe(id=ops._uid("kf"), label=label, camera=cam, slices=slices,
                   meshes=meshes, annotations=annotations, ng_state=st)
