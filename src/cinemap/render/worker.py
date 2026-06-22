@@ -480,6 +480,8 @@ class RenderWorker:
         points at a SEGMENTATION layer (so it renders colored labels), else None."""
         out = []
         for sl in list(fr.slices) + self._slices_from_sweeps(t_global):
+            if not getattr(sl, "visible", True):
+                continue
             if sl.opacity <= 0.001:
                 continue
             _, is_label = self._vol_for(sl.em_name)
