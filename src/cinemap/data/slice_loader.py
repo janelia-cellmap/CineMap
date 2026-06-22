@@ -8,14 +8,14 @@ Validated path (spike): tensorstore zarr driver + http kvstore, zstd, '/' sep.
 """
 from __future__ import annotations
 
-import json
 import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from functools import lru_cache
 
 import numpy as np
 import tensorstore as ts
+
+from .local_paths import read_json, tensorstore_kvstore
 
 # OME-Zarr axes are z,y,x; cinemap world coords are x,y,z (nm).
 _AXIS_TO_ZYX = {"z": 0, "y": 1, "x": 2}
@@ -85,8 +85,7 @@ class EMVolume:
 
     @staticmethod
     def _get_json(url: str) -> dict:
-        with urllib.request.urlopen(url, timeout=30) as r:
-            return json.load(r)
+        return read_json(url, timeout=30)
 
     def _read_attrs(self) -> dict:
         """Multiscales metadata, supporting both OME-Zarr layouts:
@@ -97,8 +96,8 @@ class EMVolume:
             attrs = self._get_json(f"{self.url}/.zattrs")
             self.zarr_v3 = False
             return attrs["multiscales"][0]
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
+        except (urllib.error.HTTPError, FileNotFoundError) as e:
+            if isinstance(e, urllib.error.HTTPError) and e.code != 404:
                 raise
         # No .zattrs -> assume Zarr v3 group metadata.
         grp = self._get_json(f"{self.url}/zarr.json")
@@ -116,20 +115,19 @@ class EMVolume:
             # sharding, etc.) directly — no manual metadata massaging needed.
             return ts.open({
                 "driver": "zarr3",
-                "kvstore": {"driver": "http", "base_url": base},
+                "kvstore": tensorstore_kvstore(base),
                 "open": True,
             }, context=_TS_CONTEXT).result()
         # Zarr v2: some cellmap arrays add a non-standard "checksum" field to the
         # zstd compressor that tensorstore's strict parser rejects. Fetch the
         # .zarray, drop it, and open with assume_metadata to skip re-parsing.
-        with urllib.request.urlopen(f"{base}.zarray", timeout=30) as r:
-            meta = json.load(r)
+        meta = read_json(f"{base}.zarray", timeout=30)
         comp = meta.get("compressor")
         if isinstance(comp, dict):
             comp.pop("checksum", None)
         return ts.open({
             "driver": "zarr",
-            "kvstore": {"driver": "http", "base_url": base},
+            "kvstore": tensorstore_kvstore(base),
             "metadata": meta,
             "open": True,
             "assume_metadata": True,

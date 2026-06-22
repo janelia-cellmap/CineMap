@@ -7,11 +7,9 @@ for Blender import.
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import threading
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
@@ -23,6 +21,8 @@ _FETCH_WORKERS = int(os.environ.get("CINEMAP_FETCH_WORKERS") or (os.cpu_count() 
 import numpy as np
 import trimesh
 from cloudvolume import CloudVolume
+
+from .local_paths import localized_url, read_bytes, read_json
 
 
 def _tune_http_pool():
@@ -61,8 +61,7 @@ def _http(url: str) -> str:
 def _segment_ids(mesh_url: str) -> list[int]:
     url = _http(f"{mesh_url.rstrip('/')}/segment_properties/info")
     try:
-        with urllib.request.urlopen(url, timeout=20) as r:
-            d = json.load(r)
+        d = read_json(url, timeout=20)
         return [int(x) for x in d.get("inline", {}).get("ids", [])]
     except Exception:
         return []
@@ -72,8 +71,9 @@ class MeshLoader:
     def __init__(self, mesh_url: str = "", label_zarr: str = "", cache_dir=None):
         self.mesh_url = (mesh_url or "").rstrip("/")
         self.label_zarr = (label_zarr or "").rstrip("/")
+        self.mesh_source = localized_url(_http(self.mesh_url)).rstrip("/") if self.mesh_url else ""
         self.parent, self.subdir = (
-            self.mesh_url.rsplit("/", 1) if "/" in self.mesh_url else ("", self.mesh_url))
+            self.mesh_source.rsplit("/", 1) if "/" in self.mesh_source else ("", self.mesh_source))
         self._cv = None
         self._manual = None   # lazily: does this source need our model-space draco decode?
         self._manual_lock = threading.Lock()   # resolve _manual once, even under the fetch pool
@@ -94,9 +94,10 @@ class MeshLoader:
             #    info that names this subdir as `mesh`.
             # CloudVolume reads gs://, s3://, https:// info itself; opening a bare mesh
             # dir as a volume raises (no `scales`), which sends us to the fabricate path.
+            use_https = not self.mesh_source.startswith("file://")
             try:
                 direct = CloudVolume(
-                    f"precomputed://{self.mesh_url}", use_https=True, progress=False
+                    f"precomputed://{self.mesh_source}", use_https=use_https, progress=False
                 )
                 if "scales" in direct.info and direct.info.get("mesh"):
                     self._cv = direct
@@ -115,7 +116,7 @@ class MeshLoader:
                     }],
                 }
                 self._cv = CloudVolume(
-                    f"precomputed://{self.parent}", info=info, use_https=True, progress=False
+                    f"precomputed://{self.parent}", info=info, use_https=use_https, progress=False
                 )
         return self._cv
 
@@ -200,8 +201,8 @@ class MeshLoader:
         seg_id = int(seg_id)
         hit = self._raw_cache.get(seg_id)
         if hit is None:
-            idx = urllib.request.urlopen(_http(f"{self.mesh_url}/{seg_id}.index"), timeout=60).read()
-            data = urllib.request.urlopen(_http(f"{self.mesh_url}/{seg_id}"), timeout=180).read()
+            idx = read_bytes(_http(f"{self.mesh_url}/{seg_id}.index"), timeout=60)
+            data = read_bytes(_http(f"{self.mesh_url}/{seg_id}"), timeout=180)
             hit = (idx, data)
             if len(self._raw_cache) < 256:        # bound memory across a many-segment layer
                 self._raw_cache[seg_id] = hit

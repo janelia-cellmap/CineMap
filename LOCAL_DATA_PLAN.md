@@ -1,4 +1,4 @@
-# Local-data fast path (not yet implemented)
+# Local-data fast path
 
 When the underlying data is on a local mount (typical for cellmap work — meshes
 + zarr live under `/groups/cellmap/...`), we host it over HTTP only so the
@@ -6,7 +6,8 @@ When the underlying data is on a local mount (typical for cellmap work — meshe
 machine has no such constraint — it could read the bytes directly from disk and
 skip the entire HTTP round-trip.
 
-This plan covers two related changes that share one config knob.
+Renderer-side local reads are implemented for meshes and zarr slices. The optional
+CineMap-hosted static data route is still just a possible future extension.
 
 ## The two pieces
 
@@ -25,11 +26,15 @@ open time; the rest of the pipeline is unchanged.
 
 Config:
 ```sh
-# alias = absolute on-disk path. Multiple via colon-separated list.
+# alias = absolute on-disk path. Multiple mappings are separated with semicolons.
 export CINEMAP_DATA_ROOTS="http://my-host:8000/data/=/groups/cellmap/cellmap/data/"
 ```
 
 `localize()` checks each prefix and rewrites if matched.
+
+There is also a built-in Janelia shortcut for the common CellMap URL shape:
+`https://cellmap-vm1.int.janelia.org/nrs/data/...` maps to
+`/nrs/cellmap/data/...` when that path exists.
 
 ### B. CineMap can host the data itself
 Drop the need for a separate `python -m http.server` / nginx by mounting a
@@ -102,17 +107,12 @@ misses (different look settings, new mesh budget, fresh segment selection).
   concurrent threads under heavy parallel fetch). That's a separate, ~30-min
   unification.
 
-## Sequencing when we do this
+## Implementation status
 
-1. `localize()` helper + env-var parsing in `config.py`.
-2. Mesh loader: call `localize()` on `mesh_url` + `label_zarr` in `MeshLoader.__init__`.
-3. Slice loader: call `localize()` in `EMVolume.__init__`, switch kvstore in
-   `_open_level` when the resolved URL is local.
-4. (B) `StaticFiles` mount + CORS in `server.py`. Optional — works even with an
-   external static server.
-5. Smoke-test: open an existing project whose data is on `/groups/...`, set the
-   env var, render. Confirm with `strace -e network -p <pid>` that the fetch
-   phase issues no `connect()` syscalls.
+- Implemented: `local_paths.py` helper + env-var parsing.
+- Implemented: mesh metadata/raw bytes and CloudVolume use local file reads when mapped.
+- Implemented: tensorstore zarr opens use a `file` kvstore when mapped.
+- Not implemented: optional `StaticFiles` mount for serving local data to the browser.
 
 ## Safety notes (for whenever this lands)
 
