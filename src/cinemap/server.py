@@ -27,7 +27,7 @@ def _image_response(path: str, media: str = "image/png", cacheable: bool = False
     cc = "public, max-age=31536000, immutable" if cacheable else "no-store"
     return Response(content=data, media_type=media, headers={"Cache-Control": cc})
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import config, operations as ops
 from . import scouting, store
@@ -175,6 +175,8 @@ class RenderReq(BaseModel):
     draft: bool = False         # fast low-res preview (coarse EM + low-voxel meshes)
     mesh_detail: float = 1.0    # per-layer vertex-budget multiplier (hard-capped)
     mesh_from_labels: bool = False  # regenerate render meshes from labels with zmesh
+    label_mesh_smooth_iters: int = 0      # Taubin smoothing passes for label meshes
+    label_mesh_simplify_factor: float = 0.0  # 0=lossless only; >0 enables error-bounded simplification
     auto_direct: bool = True    # non-destructive presentation pass (lighting/material/DOF)
     lod_mode: str = "frame"     # mesh LOD: "single" | "frame" (per-frame adaptive) | "chunk"
     show_bbox: bool = False     # draw a wireframe box around each data source's extent
@@ -184,6 +186,15 @@ class RenderReq(BaseModel):
 
 class ThumbnailReq(BaseModel):
     mesh_from_labels: bool = False  # keep thumbnails source-compatible with previews
+
+
+def _effective_lod_mode(mesh_from_labels: bool, lod_mode: str) -> str:
+    lod = lod_mode if lod_mode in {"single", "frame", "chunk"} else "frame"
+    # Chunk LOD is a precomputed-mesh fragment path. Label meshes are generated from
+    # zmesh at a budget-selected scale, so keep them on the combined adaptive path.
+    if mesh_from_labels and lod == "chunk":
+        return "frame"
+    return lod
 
 
 class ChatReq(BaseModel):
@@ -674,7 +685,8 @@ def plane_move(pid: str, req: PlaneMoveReq):
 class SweepReqNew(BaseModel):
     kind: str = "cutaway"                # 'cutaway' (clip a mesh layer) or 'slice' (EM plane)
     layer: str = ""                      # mesh layer (cutaway)
-    em_name: str = ""                    # EM layer (slice)
+    em_name: str = ""                    # primary slice layer
+    overlay_layers: list[str] = Field(default_factory=list)  # extra segmentation layers on slice scans
     axis: str = "z"
     side: int = 1
     from_ng: list[float] | None = None   # NG coords: triple => oblique A->B, single => depth
@@ -694,6 +706,7 @@ def add_sweep(pid: str, req: SweepReqNew):
     decoupled from the camera keyframes."""
     p = store.load(pid)
     sw = ops.add_sweep(p, kind=req.kind, layer=req.layer, em_name=req.em_name,
+                       overlay_layers=req.overlay_layers,
                        axis=req.axis, side=req.side,
                        from_ng=req.from_ng, to_ng=req.to_ng,
                        from_nm=req.from_nm, to_nm=req.to_nm,
@@ -713,6 +726,8 @@ class SweepPatch(BaseModel):
     mirror: bool | None = None
     cap: bool | None = None
     enabled: bool | None = None
+    em_name: str | None = None
+    overlay_layers: list[str] | None = None
 
 
 @app.put("/api/projects/{pid}/sweeps/{sid}")
@@ -811,7 +826,8 @@ def preview_sweep(pid: str, req: SweepReqNew):
     import shutil
     p = store.load(pid)
     pc = p.model_copy(deep=True)               # work on a COPY; never saved
-    sw = ops.add_sweep(pc, kind=req.kind, layer=req.layer, em_name=req.em_name, axis=req.axis,
+    sw = ops.add_sweep(pc, kind=req.kind, layer=req.layer, em_name=req.em_name,
+                       overlay_layers=req.overlay_layers, axis=req.axis,
                        side=req.side, from_ng=req.from_ng, to_ng=req.to_ng,
                        from_nm=req.from_nm, to_nm=req.to_nm, start_s=req.start_s,
                        duration_s=req.duration_s, easing=req.easing, mirror=req.mirror,
@@ -1009,12 +1025,15 @@ def _evict_finished_states(keep: int = 200) -> None:
 
 @app.post("/api/projects/{pid}/render")
 def render(pid: str, req: RenderReq):
+    lod_mode = _effective_lod_mode(req.mesh_from_labels, req.lod_mode)
     settings = RenderSettings(width=req.width, height=req.height, fps=req.fps,
                               samples=req.samples, noise_threshold=req.noise_threshold,
                               engine=req.engine,
                               export_blend=req.export_blend, draft=req.draft,
                               mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels,
-                              auto_direct=req.auto_direct, lod_mode=req.lod_mode,
+                              label_mesh_smooth_iters=req.label_mesh_smooth_iters,
+                              label_mesh_simplify_factor=req.label_mesh_simplify_factor,
+                              auto_direct=req.auto_direct, lod_mode=lod_mode,
                               show_bbox=req.show_bbox,
                               bbox_color=req.bbox_color or [0.62, 0.66, 0.74],
                               bbox_source=req.bbox_source or "")

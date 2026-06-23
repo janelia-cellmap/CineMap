@@ -442,7 +442,7 @@ def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, s
               from_nm=None, to_nm=None, start_s=None, duration_s=None,
               from_ng=None, to_ng=None, easing: str = "linear",
               kind: str = "cutaway", em_name: str = "", mirror: bool = False,
-              cap: bool = True,
+              cap: bool = True, overlay_layers: list[str] | None = None,
               commit: bool = True) -> Sweep:
     """Add an independent plane sweep on its OWN timeline (decoupled from the camera).
     kind='cutaway' slides a mesh layer's clip plane; kind='slice' sweeps an EM cross-section.
@@ -489,7 +489,8 @@ def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, s
         from_nm, to_nm = (hi_off, lo_off) if side >= 0 else (lo_off, hi_off)
     # (slice keeps from->to literal: the EM plane travels from the start position to the stop)
     total = sum(k.duration_in_s for k in project.keyframes) or 4.0
-    sw = Sweep(id=_uid("sw"), kind=kind, layer=layer, em_name=em_name, axis=axis,
+    sw = Sweep(id=_uid("sw"), kind=kind, layer=layer, em_name=em_name,
+               overlay_layers=list(overlay_layers or []), axis=axis,
                normal=(normal if oblique else None),
                side=int(side), from_nm=float(from_nm), to_nm=float(to_nm),
                start_s=float(start_s if start_s is not None else 0.0),

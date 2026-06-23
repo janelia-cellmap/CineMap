@@ -188,9 +188,14 @@ class RenderSettings(BaseModel):
     # from the OME-Zarr label volume with zmesh when one is available.
     mesh_from_labels: bool = False
     # Mesh detail multiplier on the per-layer vertex budget (1.0 = default 5M full /
-    # 1.2M draft). Higher = crisper meshes but more VRAM; the worker hard-caps the
+    # 3M draft). Higher = crisper meshes but more VRAM; the worker hard-caps the
     # budget and auto-retries at lower detail if the GPU runs out of memory.
     mesh_detail: float = 1.0
+    # Label-mesh postprocessing: exact cleanup always runs. Smoothing and lossy
+    # simplification are opt-in because we usually want the label mesh to stay as
+    # representative of the voxel data as possible.
+    label_mesh_smooth_iters: int = 0
+    label_mesh_simplify_factor: float = 0.0
     # Auto-direction: a non-destructive presentation pass (camera-relative key/fill/
     # rim lighting, publication materials, subtle depth-of-field on the framed
     # subject). On by default; off renders the plain neuroglancer-faithful scene.
@@ -224,7 +229,8 @@ class Sweep(BaseModel):
     # cutaway = slice a mesh layer's clip plane; slice = sweep an EM cross-section plane.
     kind: Literal["cutaway", "slice"] = "cutaway"
     layer: str = ""                        # mesh layer name the clip plane cuts (cutaway)
-    em_name: str = ""                      # EM layer name the slice shows (slice)
+    em_name: str = ""                      # primary layer the slice shows (slice)
+    overlay_layers: list[str] = Field(default_factory=list)  # extra seg layers on slice scans
     axis: Axis = "z"
     normal: Optional[list[float]] = None   # oblique plane; None => axis-aligned
     side: int = 1

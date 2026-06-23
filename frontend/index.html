@@ -163,20 +163,35 @@
         </select></label>
       <label title="Mesh quality = the per-layer vertex budget. Higher = crisper but more GPU memory (auto-retries lower if it runs out).">quality
         <select id="detail">
-          <option value="1" selected>basic (~5M/layer)</option>
+          <option value="1">basic (~5M/layer)</option>
           <option value="2">high (~10M/layer)</option>
-          <option value="3">max (~15M/layer)</option>
+          <option value="3" selected>max (~15M/layer)</option>
+          <option value="6">ultra (~30M/layer)</option>
+          <option value="10">extreme (~50M/layer)</option>
         </select></label>
       <label class="chk" title="Generate render meshes from label voxels with zmesh instead of using precomputed Neuroglancer meshes."><input id="labelMeshes" type="checkbox" /> label meshes</label>
+      <label title="Taubin smoothing passes for label-derived meshes. Off by default; enable if the raw label mesh is too faceted.">smooth
+        <select id="labelSmooth">
+          <option value="0" selected>0</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="4">4</option>
+        </select></label>
+      <label title="Label-mesh simplification. Lossless only removes redundant topology. Gentle/budget enable zmesh's physical-error-bounded simplifier before cleanup.">simplify
+        <select id="labelSimplify">
+          <option value="0" selected>lossless</option>
+          <option value="2">gentle</option>
+          <option value="1">budget</option>
+        </select></label>
       <label class="chk" title="Director: a non-destructive presentation pass that enhances the look WITHOUT changing your neuroglancer data — camera-relative key/fill/rim lighting, publication-quality materials, and subtle depth-of-field on the framed subject. Uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
       <label class="chk" title="Draw a thin wireframe box around each data source's extent (the EM volume and/or each rendered layer's label volume), like neuroglancer's bounding box. Falls back to a tight box around the rendered meshes when a layer has no volume source."><input id="showBbox" type="checkbox" /> bbox</label>
       <input id="bboxColor" type="color" value="#9ea8bd" title="bounding-box wireframe color" style="width:24px;height:20px;padding:0;border:1px solid var(--line);background:none;cursor:pointer" />
       <select id="bboxSource" title="Which layer the bounding box is drawn from (its data/mesh extent) — works even if that layer is hidden. Auto = the EM volume, or all visible meshes." style="max-width:120px"><option value="">bbox: auto</option></select>
-      <label title="Mesh level-of-detail strategy (how fine the meshes are): Single = one resolution for the whole shot (used automatically when cutting away). Per-frame = coarser when a layer is far/small, finer on close-ups, like neuroglancer (free on orbits). Per-chunk = different detail within one mesh by on-screen size (experimental).">lod
+      <label title="Mesh level-of-detail strategy. For precomputed meshes, per-frame/per-chunk choose existing Neuroglancer LODs. For label meshes, zmesh chooses scale from the quality budget; per-chunk is disabled.">lod
         <select id="lodMode">
-          <option value="frame" selected>per-frame</option>
+          <option value="frame" selected>adaptive</option>
           <option value="single">single</option>
-          <option value="chunk">per-chunk (exp)</option>
+          <option value="chunk">per-chunk (precomputed)</option>
         </select></label>
       <button id="previewBtn" onclick="startRender('preview')">▷ Preview</button>
       <label title="preview renders at fps ÷ this">1/</label><input id="ratio" value="10" style="width:44px" />
@@ -322,8 +337,8 @@
     <option value="both">both</option>
   </select>
   <div id="planeSliceWrap">
-    <label class="msg" title="Which layer to show on the slice plane — an EM/image volume (grayscale) or a segmentation layer (its labels in color). No longer assumes a layer called 'em'/'raw'.">Slice layer</label>
-    <select id="planeSliceLayer" style="width:100%"></select>
+    <label class="msg" title="Layers to show on the scan plane. Select EM plus any segmentation overlays, or select one segmentation layer by itself for a label-only scan.">Scan layers</label>
+    <select id="planeSliceLayer" multiple size="5" style="width:100%"></select>
   </div>
   <label class="msg">Axis</label>
   <select id="planeAxis" style="width:100%" onchange="updateSideLabels()">
@@ -724,7 +739,7 @@ function renderSweeps(p) {
     const isSlice = s.kind === 'slice';
     const disabled = s.enabled === false;
     const openCut = !isSlice && s.cap === false;
-    const name = isSlice ? (s.em_name || 'EM slice') : s.layer;
+    const name = isSlice ? sweepSliceName(s) : s.layer;
     const icon = isSlice ? '▦' : '▤';
     const grad = isSlice ? 'linear-gradient(90deg,#2f8f8f,#46c2c2)' : 'linear-gradient(90deg,#5a5fcf,#8a8fff)';
     const v = SNAP_VER[s.id] ? `?v=${SNAP_VER[s.id]}` : '';
@@ -738,6 +753,10 @@ function renderSweeps(p) {
       <span class="grip" onmousedown="event.stopPropagation(); startSweepDrag(event,'${s.id}','resize')"></span>
     </div>`;
   }).join('');
+}
+function sweepSliceName(s) {
+  const names = [s.em_name || 'EM'].concat(s.overlay_layers || []).filter(Boolean);
+  return names.length ? names.join(' + ') : 'EM slice';
 }
 let SWEEP_SNAPS = [];
 // drag a sweep along the lane (move = change start; resize = change duration), snapping the
@@ -788,7 +807,7 @@ function openSweepEdit(id) {
   EDIT_SWEEP_ID = id;
   const isSlice = s.kind === 'slice';
   document.querySelector('#sweepPanel b').textContent = isSlice ? '▦ Edit EM slice sweep' : '▤ Edit cutaway sweep';
-  $('sweepWhich').textContent = `${isSlice ? (s.em_name||'EM') : s.layer} · ${s.normal ? 'oblique' : s.axis} axis`;
+  $('sweepWhich').textContent = `${isSlice ? sweepSliceName(s) : s.layer} · ${s.normal ? 'oblique' : s.axis} axis`;
   $('swSideRow').style.display = isSlice ? 'none' : 'block';   // 'side' only meaningful for a cut
   $('swCapRow').style.display = isSlice ? 'none' : 'block';
   // label the side by the cut's actual orientation (oblique => direction, not "+z")
@@ -1157,12 +1176,25 @@ async function openPlanePanel() {
   $('planeSliceLayer').innerHTML = sl.length
     ? sl.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')
     : '<option value="">(default EM)</option>';
+  const emName = (man.em && man.em.name) ? man.em.name : '';
+  Array.from($('planeSliceLayer').options).forEach(o => {
+    o.selected = o.value === emName || (!emName && o.value === '');
+  });
   if ($('planeStart')) $('planeStart').value = fmtS(activeKfTime());
   planeModeChanged(); updateSideLabels();
   PREVIEW_READY = false; if ($('planeSnaps')) $('planeSnaps').innerHTML = '';
   $('planeMsg').textContent = ''; $('planePanel').style.display='block';
 }
 let LAST_CUT_LAYER = '';
+function selectedScanLayers() {
+  const select = $('planeSliceLayer');
+  const sel = Array.from((select && select.selectedOptions) || []).map(o => o.value).filter(v => v !== '');
+  if (!sel.length) return { em_name: '', overlay_layers: [] };
+  const emOpt = Array.from((select && select.options) || []).find(o => /— EM$/.test(o.textContent || ''));
+  const emName = emOpt ? emOpt.value : '';
+  const primary = (emName && sel.includes(emName)) ? emName : sel[0];
+  return { em_name: primary, overlay_layers: sel.filter(v => v !== primary) };
+}
 // drag the divider between the scouting (NG) and preview panes to expand either one.
 // Adjusts only the left/right flex (the Claude column is untouched); the iframe gets
 // pointer-events:none mid-drag so the mouse can cross it.
@@ -1225,7 +1257,7 @@ async function previewPlaneScan() {
   // Use the selected global start time so preview and saved clips agree on placement.
   const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: start, mirror: $('planeMirror').checked };
   if (kind === 'cutaway') { body.layer = layer; body.cap = $('planeCap').checked; }
-  else body.em_name = $('planeSliceLayer').value;   // which layer the slice shows (EM or seg)
+  else Object.assign(body, selectedScanLayers());
   if (fn.length) body.from_ng = fn;
   if (tn.length) body.to_ng = tn;
   $('planeMsg').textContent = 'rendering preview…';
@@ -1281,7 +1313,7 @@ async function applyPlaneScan() {
   const mk = async (kind) => {
     const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: start, mirror: $('planeMirror').checked };
     if (kind === 'cutaway') { body.layer = layer; body.cap = $('planeCap').checked; LAST_CUT_LAYER = layer; }
-    else body.em_name = $('planeSliceLayer').value;   // which layer the slice shows (EM or seg)
+    else Object.assign(body, selectedScanLayers());
     if (fn.length) body.from_ng = fn;
     if (tn.length) body.to_ng = tn;
     return await api('POST', `/api/projects/${PID}/sweeps`, body);   // returns the new sweep
@@ -1355,12 +1387,32 @@ function rgb01ToHex(rgb) {
   const h = v => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
   return Array.isArray(rgb) && rgb.length >= 3 ? `#${h(rgb[0])}${h(rgb[1])}${h(rgb[2])}` : '#9ea8bd';
 }
+function syncMeshSourceControls() {
+  const useLabels = $('labelMeshes').checked;
+  const lod = $('lodMode');
+  $('labelSmooth').disabled = !useLabels;
+  $('labelSimplify').disabled = !useLabels;
+  const chunk = [...lod.options].find(o => o.value === 'chunk');
+  if (chunk) chunk.disabled = useLabels;
+  if (useLabels && lod.value === 'chunk') lod.value = 'frame';
+  lod.title = useLabels
+    ? 'Label meshes use zmesh scale selection from quality/ROI budgets; per-chunk Neuroglancer LOD is unavailable.'
+    : 'Precomputed meshes can use single, adaptive per-frame, or experimental per-chunk Neuroglancer LOD.';
+}
+function selectedLodMode() {
+  syncMeshSourceControls();
+  return $('lodMode').value;
+}
 // persist the render controls on the project so they survive reload + travel with export
 function saveRenderPrefs() {
   if (!PID) return;
+  syncMeshSourceControls();
   const prefs = { width: +$('w').value, height: +$('h').value, fps: +$('fps').value,
     samples: +$('samples').value, mesh_detail: +$('detail').value || 1,
-    auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
+    mesh_from_labels: $('labelMeshes').checked,
+    label_mesh_smooth_iters: +$('labelSmooth').value || 0,
+    label_mesh_simplify_factor: +$('labelSimplify').value || 0,
+    auto_direct: $('autoDirect').checked, lod_mode: selectedLodMode(),
     show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
     bbox_source: $('bboxSource').value, preview_ratio: +$('ratio').value || 10,
     fast_sample: $('fastSample').checked };
@@ -1373,11 +1425,15 @@ function applyRenderPrefs(p) {
   const set = (id, v) => { const el = $(id); if (el != null && v != null) el.value = v; };
   set('w', rp.width); set('h', rp.height); set('fps', rp.fps); set('samples', rp.samples);
   set('detail', rp.mesh_detail); set('lodMode', rp.lod_mode); set('ratio', rp.preview_ratio);
+  set('labelSmooth', rp.label_mesh_smooth_iters);
+  set('labelSimplify', rp.label_mesh_simplify_factor);
+  if (rp.mesh_from_labels != null) $('labelMeshes').checked = !!rp.mesh_from_labels;
   if (rp.auto_direct != null) $('autoDirect').checked = !!rp.auto_direct;
   if (rp.show_bbox != null) $('showBbox').checked = !!rp.show_bbox;
   if (rp.bbox_color) $('bboxColor').value = rgb01ToHex(rp.bbox_color);
   if (rp.bbox_source != null) $('bboxSource').value = rp.bbox_source;
   if (rp.fast_sample != null) $('fastSample').checked = !!rp.fast_sample;
+  syncMeshSourceControls();
 }
 async function startRender(mode) {
   AUTO_THUMBS = false;   // stop any thumbnail auto-sweep before a full render
@@ -1399,7 +1455,9 @@ async function startRender(mode) {
                  engine: $('engine').value,
                  draft: mode === 'preview', mesh_detail: +$('detail').value || 1,
                  mesh_from_labels: $('labelMeshes').checked,
-                 auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
+                 label_mesh_smooth_iters: +$('labelSmooth').value || 0,
+                 label_mesh_simplify_factor: +$('labelSimplify').value || 0,
+                 auto_direct: $('autoDirect').checked, lod_mode: selectedLodMode(),
                  show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
                  bbox_source: $('bboxSource').value };
   if (mode === 'blend') body.export_blend = true;   // bake an animated .blend, no video
@@ -1805,6 +1863,11 @@ async function undoLook() {
   } catch (e) { $('lookMsg').textContent = 'error: ' + e.message; }
 }
 
+$('labelMeshes').addEventListener('change', () => { syncMeshSourceControls(); saveRenderPrefs(); });
+$('labelSmooth').addEventListener('change', saveRenderPrefs);
+$('labelSimplify').addEventListener('change', saveRenderPrefs);
+$('lodMode').addEventListener('change', () => { syncMeshSourceControls(); saveRenderPrefs(); });
+syncMeshSourceControls();
 refreshProjects();
 checkConfig();
 </script>
