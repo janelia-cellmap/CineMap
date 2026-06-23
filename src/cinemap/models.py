@@ -187,9 +187,9 @@ class RenderSettings(BaseModel):
     # matches neuroglancer). Set this to instead regenerate higher-quality meshes
     # from the OME-Zarr label volume with zmesh when one is available.
     mesh_from_labels: bool = False
-    # Mesh detail multiplier on the per-layer vertex budget (1.0 = default 5M full /
-    # 3M draft). Higher = crisper meshes but more VRAM; the worker hard-caps the
-    # budget and auto-retries at lower detail if the GPU runs out of memory.
+    # Mesh detail multiplier on the per-layer vertex budget (1.0 = default 5M).
+    # Higher = crisper meshes but more VRAM; the worker hard-caps the budget and
+    # auto-retries at lower detail if the GPU runs out of memory.
     mesh_detail: float = 1.0
     # Label-mesh postprocessing: exact cleanup always runs. Smoothing and lossy
     # simplification are opt-in because we usually want the label mesh to stay as
