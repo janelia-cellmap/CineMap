@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import colorsys
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import numpy as np
 import trimesh
@@ -255,6 +256,11 @@ def _is_memory_error(exc: BaseException) -> bool:
     return any(token in text for token in ("memory", "bad_alloc", "std::bad_alloc", "oom", "cannot allocate"))
 
 
+def _label_source_name(label_zarr_url: str) -> str:
+    path = urlparse(label_zarr_url).path.rstrip("/")
+    return path.rsplit("/", 1)[-1] or "labels"
+
+
 def _read_plan_array(vol, plan: _ReadPlan, pad: int = 2):
     """Read the plan region and return (arr, origin_voxel_zyx, scale_zyx_nm, translation)."""
     level = plan.level
@@ -499,6 +505,14 @@ def generate_zmesh_auto(
     while True:
         try:
             arr, (z0, y0, x0), sc, tr = _read_plan_array(vol, plan, pad=3)
+            print(
+                "[labels] zmesh plan "
+                f"{_label_source_name(label_zarr_url)} ids={len(seg_ids)} "
+                f"level=s{plan.level} stride={plan.stride} "
+                f"scale_zyx_nm=({sc[0]:.3g},{sc[1]:.3g},{sc[2]:.3g}) "
+                f"target_vertices={target_vertices}",
+                flush=True,
+            )
             keep = np.isin(arr, seg_ids)
             if not keep.any():
                 raise ValueError("none of the selected segments present in labels")
