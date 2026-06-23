@@ -88,9 +88,10 @@ def _clip_params(cl) -> dict | None:
 
 
 class RenderWorker:
-    # Hard ceiling on a layer's combined vertex count, regardless of mesh_detail —
-    # keeps the worst case well under the GPUs' VRAM (~9 GB free on an 11 GB card).
-    MESH_BUDGET_CEILING = 20_000_000
+    # Hard ceiling on a layer's combined vertex count, regardless of mesh_detail.
+    # 50M is intended for high-memory GPUs/workstations; the OOM retry path backs
+    # off if Blender cannot fit the resulting scene.
+    MESH_BUDGET_CEILING = 50_000_000
 
     def __init__(self, project: Project, job: RenderJob, nm_per_bu: float = NM_PER_BU):
         self.project = project
@@ -130,14 +131,23 @@ class RenderWorker:
         # Per-layer vertex budget = base * mesh_detail, hard-capped so a too-high
         # setting can't recreate the multi-GB mesh that stalled asset prep / OOM'd the
         # GPU. The OOM-retry loop in run() halves this and rebuilds if Cycles runs out.
-        detail = max(0.25, min(float(getattr(job.settings, "mesh_detail", 1.0) or 1.0), 8.0))
+        detail = max(0.25, min(float(getattr(job.settings, "mesh_detail", 1.0) or 1.0), 10.0))
         base_budget = 3_000_000 if draft else 5_000_000
         self._mesh_budget = min(int(base_budget * detail), self.MESH_BUDGET_CEILING)
+        self._label_smooth_iters = max(
+            0,
+            min(8, int(getattr(job.settings, "label_mesh_smooth_iters", 0) or 0)),
+        )
+        self._label_simplify_factor = max(
+            0.0,
+            min(8.0, float(getattr(job.settings, "label_mesh_simplify_factor", 0.0) or 0.0)),
+        )
         self._nm_per_px = None  # finest on-screen scale across frames (set per build)
         # mesh LOD strategy: "single" (one build), "frame" (per-frame adaptive, like
-        # neuroglancer; free on orbits), or "chunk" (per-chunk spatial — not yet
-        # implemented, treated as "frame").
+        # neuroglancer; free on orbits), or "chunk" (precomputed-mesh fragments).
         self._lod_mode = getattr(job.settings, "lod_mode", "frame") or "frame"
+        if self._prefer_labels and self._lod_mode == "chunk":
+            self._lod_mode = "frame"
         # A cutaway needs a watertight cross-section to cap, which requires the CUT LAYER
         # at ONE consistent LOD across the frames where it's clipped (mixed LODs leave
         # non-welding fragment seams -> the cap cracks/can't close). We DON'T force that on
@@ -207,7 +217,7 @@ class RenderWorker:
         seg_key = (tuple(sorted(int(i) for i in slice_seg[0])), slice_seg[1].cache_key()) \
             if (is_label and slice_seg) else None
         return (
-            "slice-v2",
+            "slice-v3",
             sl.em_name,
             zurl,
             bool(is_label),
@@ -348,9 +358,16 @@ class RenderWorker:
     def _lod_tag_for(self, nmpp) -> str:
         """Cache-key component for a mesh built at on-screen scale `nmpp` (nm/px):
         re-framing, draft, source, budget, or a different LOD bucket each rebuild."""
-        return (f"npp{nmpp:.3g}|{'draft' if self._draft else 'full'}"
-                f"|{'lab' if self._prefer_labels else 'pre'}|b{self._mesh_budget}"
-                if nmpp else f"b{self._mesh_budget}")
+        source_tag = (
+            f"lab-zmesh-clean-v4-s{self._label_smooth_iters}-q{self._label_simplify_factor:.3g}"
+            if self._prefer_labels else "pre"
+        )
+        quality_tag = "draft" if self._draft else "full"
+        return (
+            f"npp{nmpp:.3g}|{quality_tag}|{source_tag}|b{self._mesh_budget}"
+            if nmpp
+            else f"{quality_tag}|{source_tag}|b{self._mesh_budget}"
+        )
 
     def _lod_bucket_nmpp(self, nmpps, max_buckets: int = 4) -> list:
         """Per-frame nm/px to BUILD the mesh at. With dynamic LOD, far frames (large
@@ -424,8 +441,9 @@ class RenderWorker:
             # None lets read_slice auto-pick the EM pyramid level from the camera region.
             # 0 forces full-resolution s0, which turns full-plane sweeps into hundreds-MB
             # PNGs and makes asset prep look like "downloading EM frames" forever.
-            out.append(FrameSlice(sw.em_name or default_em, sw.axis, float(pos), None,
-                                  float(sw.opacity), normal=sw.normal))
+            sl = FrameSlice(sw.em_name or default_em, sw.axis, float(pos), None,
+                            float(sw.opacity), normal=sw.normal)
+            out.append((sl, list(getattr(sw, "overlay_layers", []) or [])))
         return out
 
     @staticmethod
@@ -474,12 +492,31 @@ class RenderWorker:
                 out.append((src.label_zarr, m.segment_ids, self._frame_colors(m)))
         return out
 
-    def _frame_slice_reads(self, fr, t_global):
-        """Visible slices in this frame as (FrameSlice, slice_seg) — keyframe slices plus
-        any 'slice' sweeps on the global timeline. slice_seg=(ids, colors) when the slice
-        points at a SEGMENTATION layer (so it renders colored labels), else None."""
+    def _frame_seg_overlays_for_layers(self, fr, layer_names):
+        wanted = {str(x) for x in (layer_names or []) if str(x)}
+        if not wanted:
+            return []
         out = []
-        for sl in list(fr.slices) + self._slices_from_sweeps(t_global):
+        for m in fr.meshes:
+            if m.mesh_name not in wanted or not self._layer_visible(m):
+                continue
+            src = next((s for s in self.manifest.meshes if s.name == m.mesh_name), None)
+            if src and src.label_zarr and m.segment_ids:
+                out.append((src.label_zarr, m.segment_ids, self._frame_colors(m)))
+        return out
+
+    def _frame_slice_reads(self, fr, t_global):
+        """Visible slices in this frame as (FrameSlice, slice_seg, include_seg_overlays).
+
+        Keyframe EM slices keep the neuroglancer-like visible segmentation overlays.
+        Timeline plane-scan sweeps are EM-only unless the sweep explicitly targets a
+        segmentation layer; otherwise an EM scan unexpectedly drags every visible label
+        source through the slice cache and paints labels onto the scan.
+        """
+        out = []
+        slice_items = [(sl, True, None) for sl in list(fr.slices)]
+        slice_items.extend((sl, False, overlay_layers) for sl, overlay_layers in self._slices_from_sweeps(t_global))
+        for sl, allow_seg_overlays, overlay_layers in slice_items:
             if not getattr(sl, "visible", True):
                 continue
             if sl.opacity <= 0.001:
@@ -492,7 +529,7 @@ class RenderWorker:
                            and self._layer_visible(mm)), None)
                 if sm:
                     slice_seg = (list(sm.segment_ids), self._frame_colors(sm))
-            out.append((sl, slice_seg))
+            out.append((sl, slice_seg, bool(allow_seg_overlays and not is_label), list(overlay_layers or [])))
         return out
 
     def _include_timeline_sweeps(self) -> bool:
@@ -545,13 +582,119 @@ class RenderWorker:
                     target_voxels_single=self._mesh_voxels_single,
                     target_voxels_union=self._mesh_voxels_union,
                     nm_per_px=nmpp, draft=self._draft,
-                    prefer_labels=self._prefer_labels, total_budget=self._mesh_budget)
+                    prefer_labels=self._prefer_labels, total_budget=self._mesh_budget,
+                    label_smooth_iters=self._label_smooth_iters,
+                    label_simplify_factor=self._label_simplify_factor)
         except Exception as e:  # noqa: BLE001
             print(f"[worker] mesh {mesh_name} ({len(ids)} segs) failed: {e}")
             return None
         os.makedirs(out.parent, exist_ok=True)
         _export_mesh_npz(combined, out)
         return str(out)
+
+    @staticmethod
+    def _clip_normal(cl: dict) -> list[float]:
+        nrm = cl.get("normal")
+        if nrm:
+            mag = math.sqrt(sum(float(v) * float(v) for v in nrm)) or 1.0
+            return [float(v) / mag for v in nrm]
+        return {
+            "x": [1.0, 0.0, 0.0],
+            "y": [0.0, 1.0, 0.0],
+            "z": [0.0, 0.0, 1.0],
+        }.get(cl.get("axis", "z"), [0.0, 0.0, 1.0])
+
+    def _fast_cutaway_assets(
+        self,
+        *,
+        mesh_name: str,
+        segment_ids,
+        lc,
+        base_uid: str,
+        base_path: str,
+        clip: dict,
+        color,
+    ) -> tuple[str, str] | None:
+        """Build cached pre-clipped geometry + voxel cap for label-derived cutaways.
+
+        This replaces Blender's per-frame bmesh cap path for zmesh/label renders.
+        It is intentionally conservative: precomputed mesh renders still use the old
+        Blender path because their surface may not match the label volume exactly.
+        """
+        if not self._prefer_labels:
+            return None
+        src = next((m for m in self.manifest.meshes if m.name == mesh_name), None)
+        if not src or not src.label_zarr:
+            return None
+        ids = list(segment_ids or src.segment_ids or [])
+        if not ids:
+            return None
+
+        import hashlib
+        import numpy as np
+
+        normal = self._clip_normal(clip)
+        side = 1.0 if float(clip.get("side", 1)) >= 0 else -1.0
+        position_nm = float(clip.get("position_nm", 0.0))
+        sig_src = json.dumps(
+            [
+                "fast-cutaway-v1",
+                base_uid,
+                src.label_zarr,
+                sorted(int(s) for s in ids),
+                lc.cache_key(),
+                [round(float(x), 6) for x in normal],
+                round(position_nm, 3),
+                side,
+                self._mesh_budget,
+            ],
+            sort_keys=True,
+            default=str,
+        )
+        sig = hashlib.md5(sig_src.encode()).hexdigest()[:10]
+        cut_uid = f"{base_uid}_cut_{sig}"
+        cap_uid = f"{base_uid}_cap_{sig}"
+        cut_path = self.assets_dir / f"mesh_{cut_uid}.npz"
+        cap_path = self.assets_dir / f"mesh_{cap_uid}.npz"
+
+        try:
+            if not cut_path.exists() or not cap_path.exists():
+                with np.load(base_path, allow_pickle=False) as z:
+                    verts = np.asarray(z["v"], dtype=np.float32)
+                    lo = verts.min(axis=0)
+                    hi = verts.max(axis=0)
+                bbox = (tuple(float(x) for x in lo), tuple(float(x) for x in hi))
+                from ..data.cutaway import write_exact_clipped_npz, write_voxel_cap_npz
+
+                cut_info = write_exact_clipped_npz(
+                    Path(base_path),
+                    cut_path,
+                    normal_xyz=normal,
+                    position_nm=position_nm,
+                    side=side,
+                )
+                cap_info = write_voxel_cap_npz(
+                    src.label_zarr,
+                    ids,
+                    cap_path,
+                    bbox_xyz_nm=bbox,
+                    normal_xyz=normal,
+                    position_nm=position_nm,
+                    target_vertices=self._mesh_budget,
+                    colorize=lc.rgb,
+                )
+                print(
+                    "[worker] fast cutaway "
+                    f"{mesh_name}: cut_faces={cut_info.get('faces')} "
+                    f"cap_faces={cap_info.get('faces')}"
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"[worker] fast cutaway {mesh_name} failed; falling back to bmesh cap: {e}")
+            return None
+
+        # Treat both assets as plain meshes: no Blender clip nodes, no bmesh cap.
+        # The cap carries vertex colors when possible; color remains as material fallback.
+        return cut_uid, cap_uid
 
     @staticmethod
     def _ann_uid(an) -> str:
@@ -865,13 +1008,19 @@ class RenderWorker:
             region = self._frame_region(fr)
             target_nm_per_px = self._frame_nm_per_px(fr)
             seg_overlays = self._frame_seg_overlays(fr)
-            for sl, slice_seg in self._frame_slice_reads(fr, self._t_global(fi, frame_times, index_offset)):
-                key = self._slice_cache_key(sl, region, seg_overlays, slice_seg=slice_seg,
+            for sl, slice_seg, include_seg_overlays, overlay_layers in self._frame_slice_reads(
+                fr, self._t_global(fi, frame_times, index_offset)
+            ):
+                slice_overlays = (
+                    seg_overlays if include_seg_overlays
+                    else self._frame_seg_overlays_for_layers(fr, overlay_layers)
+                )
+                key = self._slice_cache_key(sl, region, slice_overlays, slice_seg=slice_seg,
                                             target_nm_per_px=target_nm_per_px)
                 if key in warm_seen:
                     continue
                 warm_seen.add(key)
-                warm_jobs.append((sl, region, seg_overlays, slice_seg, target_nm_per_px))
+                warm_jobs.append((sl, region, slice_overlays, slice_seg, target_nm_per_px))
 
         def _warm(job):
             sl, region, seg_overlays, slice_seg, target_nm_per_px = job
@@ -905,14 +1054,18 @@ class RenderWorker:
             slices = []
             # keyframe slices PLUS any 'slice' sweeps evaluated on the global timeline
             t_global = self._t_global(fi, frame_times, index_offset)
-            for sl, slice_seg in self._frame_slice_reads(fr, t_global):
+            for sl, slice_seg, include_seg_overlays, overlay_layers in self._frame_slice_reads(fr, t_global):
                 # slot is stable across frames (matches interpolate's slice identity)
                 # so the blend exporter can group a slice's per-frame images into one
                 # animated image-sequence plane. A slice that can't be read (e.g. a
                 # non-OME-Zarr EM source) is skipped, not fatal to the whole render.
                 # _slice_png is already cached from the parallel warm pass above.
                 try:
-                    png = self._slice_png(sl, region, seg_overlays, slice_seg=slice_seg,
+                    slice_overlays = (
+                        seg_overlays if include_seg_overlays
+                        else self._frame_seg_overlays_for_layers(fr, overlay_layers)
+                    )
+                    png = self._slice_png(sl, region, slice_overlays, slice_seg=slice_seg,
                                           target_nm_per_px=target_nm_per_px)
                 except Exception as e:  # noqa: BLE001
                     print(f"[worker] slice {sl.em_name}:{sl.axis} failed: {e}")
@@ -950,7 +1103,40 @@ class RenderWorker:
                     cl = self._clip_from_sweeps(m.mesh_name, t_global) or _clip_params(
                         getattr(m, "clip", None))
                     if cl:
-                        ov["clip"] = {**cl, "position_bu": cl["position_nm"] / self.nm_per_bu}
+                        cl = {**cl, "position_bu": cl["position_nm"] / self.nm_per_bu}
+                        fast = None
+                        if cl.get("cap", True) and uid in mesh_specs:
+                            fast = self._fast_cutaway_assets(
+                                mesh_name=m.mesh_name,
+                                segment_ids=m.segment_ids,
+                                lc=self._frame_colors(m),
+                                base_uid=uid,
+                                base_path=mesh_specs[uid]["obj_path"],
+                                clip=cl,
+                                color=m.color,
+                            )
+                        if fast:
+                            cut_uid, cap_uid = fast
+                            mesh_specs[cut_uid] = {
+                                "id": cut_uid,
+                                "obj_path": str(self.assets_dir / f"mesh_{cut_uid}.npz"),
+                                "color": m.color,
+                                "clip": False,
+                                "clip_cap": False,
+                            }
+                            mesh_specs[cap_uid] = {
+                                "id": cap_uid,
+                                "obj_path": str(self.assets_dir / f"mesh_{cap_uid}.npz"),
+                                "color": m.color,
+                                "clip": False,
+                                "clip_cap": False,
+                            }
+                            overrides[cut_uid] = dict(ov)
+                            cap_ov = dict(ov)
+                            cap_ov["silhouette"] = 0.0
+                            overrides[cap_uid] = cap_ov
+                            continue
+                        ov["clip"] = cl
                         # clip=True means the material needs animated clip nodes. cap=True
                         # additionally requests the expensive geometric cut + filled face.
                         mesh_specs[uid]["clip"] = True
@@ -978,6 +1164,8 @@ class RenderWorker:
             })
             self._progress(0.45 + 0.15 * (fi + 1) / len(frames),
                            f"building frame specs {fi + 1}/{len(frames)}")
+        used_mesh_ids = {mid for fr in frame_specs for mid in fr.get("mesh_overrides", {})}
+        mesh_specs = {mid: spec for mid, spec in mesh_specs.items() if mid in used_mesh_ids}
         spec = {
             "world": {"nm_per_bu": self.nm_per_bu,
                       "background": self.project.lighting.background},
