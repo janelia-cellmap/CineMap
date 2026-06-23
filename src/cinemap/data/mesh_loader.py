@@ -609,7 +609,8 @@ class MeshLoader:
     def load_many(self, seg_ids, colorize=None, target_voxels_single: int = 8_000_000,
                   target_voxels_union: int = 20_000_000, nm_per_px: float | None = None,
                   draft: bool = False, prefer_labels: bool = False,
-                  total_budget: int | None = None) -> trimesh.Trimesh:
+                  total_budget: int | None = None, label_smooth_iters: int = 0,
+                  label_simplify_factor: float = 0.0) -> trimesh.Trimesh:
         """One mesh for a set of segments. By default downloads the precomputed
         meshes (LOD picked from on-screen scale `nm_per_px`); with `prefer_labels`
         it regenerates meshes from the label volume with zmesh at the finest scale
@@ -621,25 +622,15 @@ class MeshLoader:
         if prefer_labels and self.label_zarr:
             from .mesh_from_labels import generate_zmesh_auto
 
-            bbox = None
-            if self.mesh_url and len(seg_ids) <= 128:
-                boxes = []
-                for seg_id in seg_ids:
-                    try:
-                        boxes.append(self._draco(int(seg_id)).bounds)
-                    except Exception:  # noqa: BLE001
-                        pass
-                if boxes:
-                    lo = np.min([b[0] for b in boxes], axis=0)
-                    hi = np.max([b[1] for b in boxes], axis=0)
-                    bbox = (tuple(float(x) for x in lo), tuple(float(x) for x in hi))
             target_voxels = target_voxels_single if len(seg_ids) == 1 else target_voxels_union
             return generate_zmesh_auto(
                 self.label_zarr,
                 seg_ids,
-                bbox_xyz_nm=bbox,
+                bbox_xyz_nm=None,
                 target_voxels=target_voxels,
                 target_vertices=int(total_budget) if total_budget else None,
+                smooth_iters=max(0, int(label_smooth_iters)),
+                simplify_budget_factor=max(0.0, float(label_simplify_factor)),
                 colorize=colorize,
             )
         # default: precomputed meshes (LOD-adaptive, total vertex budget per layer so

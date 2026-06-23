@@ -19,7 +19,21 @@ from .slice_loader import get_volume
 
 
 _ZMESH_VERTEX_PER_VOXEL_ESTIMATE = 0.15
+_ZMESH_VERTEX_PER_SURFACE_FACE_ESTIMATE = 1.0
 _ROI_SCAN_VOXELS = 24_000_000
+_ROI_REFINE_MAX_VOXELS = 256_000_000
+_PLAN_EXACT_COUNT_MAX_VOXELS = 96_000_000
+_PLAN_MAX_READ_VOXELS = 512_000_000
+_ROI_REFINE_PAD_FRACTION = 0.50
+_ROI_FINAL_PAD_FRACTION = 0.15
+_ROI_EDGE_MARGIN_VOXELS = 2
+_FACES_PER_VERTEX_BUDGET = 2.1
+_LOSSLESS_VERTEX_DEDUP_LIMIT = 8_000_000
+_MIN_DECIMATE_FACES = 100_000
+_PYFQMR_MISSING = False
+_ZMESH_GENTLE_REDUCTION_FACTOR = 20
+_ZMESH_BUDGET_REDUCTION_FACTOR = 50
+_ZMESH_MAX_ERROR_VOXEL_FRACTION = 0.25
 
 
 def _layer_offset(layer: str) -> float:
@@ -68,31 +82,157 @@ def _bbox_voxels_for_level(vol, bbox_xyz_nm, level: int, pad: int = 2) -> int:
     return max(1, z1 - z0) * max(1, y1 - y0) * max(1, x1 - x0)
 
 
+def _volume_extent_xyz_nm(vol):
+    return vol.extent_nm()
+
+
+def _pad_bbox_xyz_nm(vol, bbox_xyz_nm, fraction: float):
+    (lo, hi) = bbox_xyz_nm
+    lo = np.asarray(lo, dtype=float)
+    hi = np.asarray(hi, dtype=float)
+    span = np.maximum(hi - lo, 1.0)
+    pad = span * float(fraction)
+    ext_lo, ext_hi = _volume_extent_xyz_nm(vol)
+    out_lo = np.maximum(lo - pad, np.asarray(ext_lo, dtype=float))
+    out_hi = np.minimum(hi + pad, np.asarray(ext_hi, dtype=float))
+    return (tuple(float(v) for v in out_lo), tuple(float(v) for v in out_hi))
+
+
+def _bbox_from_indices_xyz_nm(vol, level: int, z0: int, z1: int, y0: int, y1: int, x0: int, x1: int):
+    sc = vol.level_scale_nm[level]
+    tr = vol.level_translation_nm[level]
+    lo = (x0 * sc[2] + tr[2], y0 * sc[1] + tr[1], z0 * sc[0] + tr[0])
+    hi = (x1 * sc[2] + tr[2], y1 * sc[1] + tr[1], z1 * sc[0] + tr[0])
+    return (lo, hi)
+
+
+def _selected_bbox_in_array(arr, ids):
+    zz, yy, xx = np.where(np.isin(arr, list(ids)))
+    if len(zz) == 0:
+        return None
+    return (
+        int(zz.min()), int(zz.max()) + 1,
+        int(yy.min()), int(yy.max()) + 1,
+        int(xx.min()), int(xx.max()) + 1,
+    )
+
+
+def _touches_read_edge(local_bbox, shape) -> bool:
+    z0, z1, y0, y1, x0, x1 = local_bbox
+    margin = _ROI_EDGE_MARGIN_VOXELS
+    return (
+        z0 <= margin or y0 <= margin or x0 <= margin
+        or z1 >= int(shape[0]) - margin
+        or y1 >= int(shape[1]) - margin
+        or x1 >= int(shape[2]) - margin
+    )
+
+
+def _selected_voxel_count_for_level(vol, bbox_xyz_nm, level: int, ids, cache: dict[int, int]) -> int:
+    if level in cache:
+        return cache[level]
+    arr, *_ = vol.read_box(bbox_xyz_nm, level, pad=2)
+    count = int(np.isin(arr, list(ids)).sum())
+    cache[level] = count
+    return count
+
+
+def _selected_surface_faces(arr: np.ndarray, ids) -> int:
+    """Count selected-label voxel faces that become mesh boundary candidates.
+
+    For multiple selected labels, a face between two different selected IDs counts
+    once for each ID, because zmesh emits separate instance surfaces.
+    """
+    id_values = list(ids)
+    total = 0
+    for axis in range(3):
+        first = np.take(arr, 0, axis=axis)
+        last = np.take(arr, -1, axis=axis)
+        total += int(np.isin(first, id_values).sum())
+        total += int(np.isin(last, id_values).sum())
+
+        left = np.take(arr, range(arr.shape[axis] - 1), axis=axis)
+        right = np.take(arr, range(1, arr.shape[axis]), axis=axis)
+        changed = left != right
+        total += int(np.count_nonzero(np.isin(left, id_values) & changed))
+        total += int(np.count_nonzero(np.isin(right, id_values) & changed))
+    return total
+
+
+def _selected_surface_faces_for_level(vol, bbox_xyz_nm, level: int, ids, cache: dict[int, int]) -> int:
+    if level in cache:
+        return cache[level]
+    arr, *_ = vol.read_box(bbox_xyz_nm, level, pad=2)
+    count = _selected_surface_faces(arr, ids)
+    cache[level] = count
+    return count
+
+
+def _surface_area_scale_nm(vol, level: int) -> float:
+    z, y, x = (float(v) for v in vol.level_scale_nm[level])
+    return max(1.0, (x * y + x * z + y * z) / 3.0)
+
+
+def _estimate_surface_faces_for_level(vol, bbox_xyz_nm, level: int, ids, cache: dict[int, int]) -> int:
+    """Estimate selected-label surface faces without treating empty ROI as mesh.
+
+    zmesh output grows roughly with boundary surface area, not filled volume.
+    Count exact boundary faces where the ROI read is modest; for finer levels,
+    scale from the nearest coarser exact count by voxel face area. This avoids
+    the 8x-per-octave overestimate that selected-volume counts produce.
+    """
+    voxels = _bbox_voxels_for_level(vol, bbox_xyz_nm, level)
+    if voxels <= _PLAN_EXACT_COUNT_MAX_VOXELS:
+        return _selected_surface_faces_for_level(vol, bbox_xyz_nm, level, ids, cache)
+
+    for coarser in range(level + 1, len(vol.level_scale_nm)):
+        coarse_voxels = _bbox_voxels_for_level(vol, bbox_xyz_nm, coarser)
+        if coarse_voxels > _PLAN_EXACT_COUNT_MAX_VOXELS:
+            continue
+        coarse_count = _selected_surface_faces_for_level(vol, bbox_xyz_nm, coarser, ids, cache)
+        fine_area = _surface_area_scale_nm(vol, level)
+        coarse_area = _surface_area_scale_nm(vol, coarser)
+        return max(1, int(np.ceil(coarse_count * (coarse_area / fine_area))))
+
+    return voxels
+
+
 def _choose_plan(
     vol,
     bbox_xyz_nm,
     *,
     target_voxels: int,
     target_vertices: int | None,
+    seg_ids=None,
 ) -> _ReadPlan:
     """Finest level/stride whose estimated memory and mesh size fit the budget."""
-    vertex_voxel_budget = None
-    if target_vertices:
-        vertex_voxel_budget = max(1, int(target_vertices / _ZMESH_VERTEX_PER_VOXEL_ESTIMATE))
-    budget = max(1, int(target_voxels))
-    if vertex_voxel_budget is not None:
-        budget = min(budget, vertex_voxel_budget)
-
     chosen_level = len(vol.level_scale_nm) - 1
     chosen_voxels = _bbox_voxels_for_level(vol, bbox_xyz_nm, chosen_level)
-    for level in range(len(vol.level_scale_nm)):
-        voxels = _bbox_voxels_for_level(vol, bbox_xyz_nm, level)
-        if voxels <= budget:
-            chosen_level = level
-            chosen_voxels = voxels
-            break
 
-    stride = max(1, int(np.ceil((chosen_voxels / budget) ** (1 / 3))))
+    if target_vertices and seg_ids:
+        ids = set(int(s) for s in seg_ids)
+        surface_budget = max(1, int(target_vertices / _ZMESH_VERTEX_PER_SURFACE_FACE_ESTIMATE))
+        count_cache: dict[int, int] = {}
+        for level in range(len(vol.level_scale_nm)):
+            voxels = _bbox_voxels_for_level(vol, bbox_xyz_nm, level)
+            if voxels > _PLAN_MAX_READ_VOXELS:
+                continue
+            surface_faces = _estimate_surface_faces_for_level(vol, bbox_xyz_nm, level, ids, count_cache)
+            if surface_faces <= surface_budget:
+                chosen_level = level
+                chosen_voxels = voxels
+                break
+        read_budget = _PLAN_MAX_READ_VOXELS
+    else:
+        read_budget = max(1, int(target_voxels))
+        for level in range(len(vol.level_scale_nm)):
+            voxels = _bbox_voxels_for_level(vol, bbox_xyz_nm, level)
+            if voxels <= read_budget:
+                chosen_level = level
+                chosen_voxels = voxels
+                break
+
+    stride = max(1, int(np.ceil((chosen_voxels / read_budget) ** (1 / 3))))
     return _ReadPlan(level=chosen_level, stride=stride, bbox_xyz_nm=bbox_xyz_nm)
 
 
@@ -124,19 +264,56 @@ def _bbox_for_ids(label_zarr_url: str, seg_ids, target_voxels: int = _ROI_SCAN_V
         if _shape_voxels(vol.level_shape_zyx(lvl)) <= target_voxels:
             level = lvl
             break
-    arr = np.asarray(vol._open_level(level)[:, :, :].read().result())
-    zz, yy, xx = np.where(np.isin(arr, list(ids)))
-    if len(zz) == 0:
+
+    initial_bbox = None
+    # Start with the coarsest cheap full-volume scan, but if a thin label
+    # disappears completely at that level, step finer while the full scan remains
+    # within a bounded planning read.
+    for lvl in range(level, -1, -1):
+        if _shape_voxels(vol.level_shape_zyx(lvl)) > _ROI_REFINE_MAX_VOXELS:
+            break
+        arr = np.asarray(vol._open_level(lvl)[:, :, :].read().result())
+        bbox_idx = _selected_bbox_in_array(arr, ids)
+        if bbox_idx is None:
+            continue
+        initial_bbox = _bbox_from_indices_xyz_nm(vol, lvl, *bbox_idx)
+        level = lvl
+        break
+    if initial_bbox is None:
         return None
-    sc = vol.level_scale_nm[level]
-    tr = vol.level_translation_nm[level]
-    margin = 4
-    z0, z1 = max(0, zz.min() - margin), min(arr.shape[0], zz.max() + margin + 1)
-    y0, y1 = max(0, yy.min() - margin), min(arr.shape[1], yy.max() + margin + 1)
-    x0, x1 = max(0, xx.min() - margin), min(arr.shape[2], xx.max() + margin + 1)
-    lo = (x0 * sc[2] + tr[2], y0 * sc[1] + tr[1], z0 * sc[0] + tr[0])
-    hi = (x1 * sc[2] + tr[2], y1 * sc[1] + tr[1], z1 * sc[0] + tr[0])
-    return (lo, hi)
+
+    bbox = initial_bbox
+    # Refine the bbox at progressively finer levels. Each refinement reads a
+    # generously padded version of the previous bbox; if the selected label still
+    # touches the read boundary, expand and retry instead of accepting a clipped
+    # ROI. Stop when the next finer read would be too large for planning.
+    for lvl in range(level - 1, -1, -1):
+        padded = _pad_bbox_xyz_nm(vol, bbox, _ROI_REFINE_PAD_FRACTION)
+        if _bbox_voxels_for_level(vol, padded, lvl, pad=0) > _ROI_REFINE_MAX_VOXELS:
+            break
+        accepted = False
+        for _ in range(4):
+            sub, (oz, oy, ox), _sc, _tr = vol.read_box(padded, lvl, pad=0)
+            local_bbox = _selected_bbox_in_array(sub, ids)
+            if local_bbox is None:
+                break
+            z0, z1, y0, y1, x0, x1 = local_bbox
+            bbox = _bbox_from_indices_xyz_nm(
+                vol, lvl,
+                oz + z0, oz + z1,
+                oy + y0, oy + y1,
+                ox + x0, ox + x1,
+            )
+            if not _touches_read_edge(local_bbox, sub.shape):
+                accepted = True
+                break
+            padded = _pad_bbox_xyz_nm(vol, bbox, _ROI_REFINE_PAD_FRACTION)
+            if _bbox_voxels_for_level(vol, padded, lvl, pad=0) > _ROI_REFINE_MAX_VOXELS:
+                break
+        if not accepted:
+            break
+
+    return _pad_bbox_xyz_nm(vol, bbox, _ROI_FINAL_PAD_FRACTION)
 
 
 def _mesh_to_trimesh(mesh, seg_id: int, origin_zyx_nm, colorize=None) -> trimesh.Trimesh | None:
@@ -144,12 +321,128 @@ def _mesh_to_trimesh(mesh, seg_id: int, origin_zyx_nm, colorize=None) -> trimesh
         return None
     verts_zyx = np.asarray(mesh.vertices, dtype=np.float64) + np.asarray(origin_zyx_nm)
     verts_xyz = verts_zyx[:, ::-1]
-    faces = np.asarray(mesh.faces, dtype=np.int64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)[:, ::-1]
     vcolors = None
     if colorize is not None:
         r, g, b = colorize(int(seg_id))
         vcolors = np.tile(np.array([r, g, b, 1.0]) * 255, (len(verts_xyz), 1)).astype(np.uint8)
     return trimesh.Trimesh(vertices=verts_xyz, faces=faces, vertex_colors=vcolors, process=False)
+
+
+def _zmesh_simplify_params(simplify_budget_factor: float, scale_zyx_nm) -> tuple[int, float | None]:
+    """Map UI simplification policy to zmesh's physical-error simplifier."""
+    if simplify_budget_factor <= 0:
+        return 0, None
+    min_voxel_nm = min(float(s) for s in scale_zyx_nm)
+    max_error = _ZMESH_MAX_ERROR_VOXEL_FRACTION * min_voxel_nm
+    if simplify_budget_factor <= 1.25:
+        return _ZMESH_BUDGET_REDUCTION_FACTOR, max_error
+    return _ZMESH_GENTLE_REDUCTION_FACTOR, max_error
+
+
+def _cleanup_mesh_lossless(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Remove strictly redundant topology without moving the represented surface."""
+    if len(mesh.faces) == 0:
+        return mesh
+    try:
+        if hasattr(mesh, "nondegenerate_faces"):
+            mesh.update_faces(mesh.nondegenerate_faces())
+        elif hasattr(mesh, "remove_degenerate_faces"):
+            mesh.remove_degenerate_faces()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if hasattr(mesh, "unique_faces"):
+            mesh.update_faces(mesh.unique_faces())
+        elif hasattr(mesh, "remove_duplicate_faces"):
+            mesh.remove_duplicate_faces()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        mesh.remove_unreferenced_vertices()
+    except Exception:  # noqa: BLE001
+        pass
+    if 0 < len(mesh.vertices) <= _LOSSLESS_VERTEX_DEDUP_LIMIT:
+        try:
+            verts, first_idx, inverse = np.unique(
+                np.asarray(mesh.vertices), axis=0, return_index=True, return_inverse=True
+            )
+            if len(verts) < len(mesh.vertices):
+                faces = inverse[np.asarray(mesh.faces)]
+                colors = None
+                try:
+                    vc = np.asarray(mesh.visual.vertex_colors)
+                    if len(vc) == len(mesh.vertices):
+                        colors = vc[first_idx]
+                except Exception:  # noqa: BLE001
+                    colors = None
+                mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=colors, process=False)
+                mesh.remove_unreferenced_vertices()
+        except Exception:  # noqa: BLE001
+            pass
+    return mesh
+
+
+def _simplify_with_pyfqmr(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh | None:
+    global _PYFQMR_MISSING
+    if _PYFQMR_MISSING:
+        return None
+    try:
+        import pyfqmr  # type: ignore
+    except Exception:  # noqa: BLE001
+        _PYFQMR_MISSING = True
+        return None
+    if len(mesh.faces) <= target_faces:
+        return mesh
+    try:
+        simp = pyfqmr.Simplify()
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh.faces, dtype=np.uint32)
+        if hasattr(simp, "setMesh"):
+            simp.setMesh(verts, faces)
+        else:
+            simp.set_mesh(verts, faces)
+        kwargs = {
+            "target_count": max(4, int(target_faces)),
+            "preserve_border": True,
+            "verbose": False,
+        }
+        try:
+            simp.simplify_mesh(**kwargs)
+        except TypeError:
+            kwargs.pop("verbose", None)
+            simp.simplify_mesh(**kwargs)
+        result = simp.getMesh() if hasattr(simp, "getMesh") else simp.get_mesh()
+        out_verts, out_faces = result[:2]
+        colors = None
+        try:
+            vc = np.asarray(mesh.visual.vertex_colors)
+            if len(vc):
+                rgba = vc[0]
+                colors = np.tile(rgba, (len(out_verts), 1)).astype(np.uint8)
+        except Exception:  # noqa: BLE001
+            colors = None
+        return trimesh.Trimesh(vertices=out_verts, faces=out_faces, vertex_colors=colors, process=False)
+    except Exception as e:  # noqa: BLE001
+        print(f"[labels] pyfqmr simplification skipped: {e}")
+        return None
+
+
+def _postprocess_label_mesh(
+    mesh: trimesh.Trimesh,
+    *,
+    target_faces: int | None = None,
+    smooth_iters: int = 0,
+) -> trimesh.Trimesh:
+    mesh = _cleanup_mesh_lossless(mesh)
+    if smooth_iters:
+        trimesh.smoothing.filter_taubin(mesh, iterations=smooth_iters)
+        mesh = _cleanup_mesh_lossless(mesh)
+    if target_faces is not None and len(mesh.faces) > max(_MIN_DECIMATE_FACES, int(target_faces)):
+        simplified = _simplify_with_pyfqmr(mesh, int(target_faces))
+        if simplified is not None:
+            mesh = _cleanup_mesh_lossless(simplified)
+    return mesh
 
 
 def generate_zmesh_auto(
@@ -160,6 +453,7 @@ def generate_zmesh_auto(
     target_voxels: int = 20_000_000,
     target_vertices: int | None = None,
     smooth_iters: int = 0,
+    simplify_budget_factor: float = 0.0,
     colorize=None,
 ) -> trimesh.Trimesh:
     """Generate selected IDs with zmesh at the finest scale that fits the budget.
@@ -173,7 +467,7 @@ def generate_zmesh_auto(
     if not seg_ids:
         raise ValueError("no segment ids")
     vol = get_volume(label_zarr_url)
-    if bbox_xyz_nm is None and len(seg_ids) <= 128:
+    if bbox_xyz_nm is None:
         bbox_xyz_nm = _bbox_for_ids(label_zarr_url, seg_ids)
 
     plan = _choose_plan(
@@ -181,6 +475,7 @@ def generate_zmesh_auto(
         bbox_xyz_nm,
         target_voxels=target_voxels,
         target_vertices=target_vertices,
+        seg_ids=seg_ids,
     )
     arr, (z0, y0, x0), sc, tr = _read_plan_array(vol, plan, pad=3)
     keep = np.isin(arr, seg_ids)
@@ -191,25 +486,57 @@ def generate_zmesh_auto(
 
     mesher = zmesh.Mesher(tuple(float(s) for s in sc))
     mesher.mesh(labels)
+    zmesh_reduction, zmesh_max_error = _zmesh_simplify_params(simplify_budget_factor, sc)
     origin_zyx_nm = (
         (z0 - 1) * sc[0] + tr[0],
         (y0 - 1) * sc[1] + tr[1],
         (x0 - 1) * sc[2] + tr[2],
     )
-    parts = []
+    raw_parts = []
     available = set(int(s) for s in mesher.ids())
     for seg_id in seg_ids:
         if seg_id not in available:
             continue
-        part = _mesh_to_trimesh(mesher.get(seg_id), seg_id, origin_zyx_nm, colorize=colorize)
+        try:
+            raw_mesh = mesher.get(
+                seg_id,
+                reduction_factor=zmesh_reduction,
+                max_error=zmesh_max_error,
+                voxel_centered=False,
+            )
+        except TypeError:
+            raw_mesh = mesher.get(seg_id)
+        part = _mesh_to_trimesh(raw_mesh, seg_id, origin_zyx_nm, colorize=colorize)
         if part is not None:
-            parts.append(part)
+            raw_parts.append(part)
+    if not raw_parts:
+        raise ValueError("zmesh produced no geometry for the selected segments")
+
+    target_faces_total = None
+    if target_vertices and simplify_budget_factor > 0:
+        target_faces_total = max(
+            1,
+            int(target_vertices * _FACES_PER_VERTEX_BUDGET * float(simplify_budget_factor)),
+        )
+    total_faces = sum(len(p.faces) for p in raw_parts)
+
+    parts = []
+    for part in raw_parts:
+        part_target = None
+        if target_faces_total is not None and total_faces > target_faces_total:
+            frac = len(part.faces) / max(1, total_faces)
+            part_target = max(256, int(target_faces_total * frac))
+        parts.append(
+            _postprocess_label_mesh(
+                part,
+                target_faces=part_target,
+                smooth_iters=smooth_iters,
+            )
+        )
     if not parts:
         raise ValueError("zmesh produced no geometry for the selected segments")
     mesh = trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
-    if smooth_iters:
-        trimesh.smoothing.filter_taubin(mesh, iterations=smooth_iters)
-    return mesh
+    return _cleanup_mesh_lossless(mesh)
 
 
 def _vertex_colors(verts_world_zyx, normals, sc, tr, arr, colorize=None) -> np.ndarray:
@@ -278,7 +605,7 @@ def generate(
     if colorize is not None:  # uniform color for this single segment (NG color)
         r, g, b = colorize(int(seg_id))
         vcolors = np.tile(np.array([r, g, b, 1.0]) * 255, (len(verts_xyz), 1)).astype(np.uint8)
-    mesh = trimesh.Trimesh(vertices=verts_xyz, faces=faces, vertex_colors=vcolors, process=False)
+    mesh = trimesh.Trimesh(vertices=verts_xyz, faces=faces[:, ::-1], vertex_colors=vcolors, process=False)
     if smooth_iters:
         trimesh.smoothing.filter_taubin(mesh, iterations=smooth_iters)
     return mesh
@@ -319,7 +646,7 @@ def generate_union(
     verts, faces, normals, _ = measure.marching_cubes(mask, level=0.5, spacing=sc)
     verts_world_zyx = verts + np.array([tr[0] - sc[0], tr[1] - sc[1], tr[2] - sc[2]])  # undo pad + translation
     colors = _vertex_colors(verts_world_zyx, normals, sc, tr, arr, colorize)  # per-segment color
-    mesh = trimesh.Trimesh(vertices=verts_world_zyx[:, ::-1], faces=faces,
+    mesh = trimesh.Trimesh(vertices=verts_world_zyx[:, ::-1], faces=faces[:, ::-1],
                            vertex_colors=colors, process=False)
     if smooth_iters:
         trimesh.smoothing.filter_taubin(mesh, iterations=smooth_iters)
