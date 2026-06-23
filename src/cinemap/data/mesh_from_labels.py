@@ -205,7 +205,12 @@ def _choose_plan(
     target_vertices: int | None,
     seg_ids=None,
 ) -> _ReadPlan:
-    """Finest level/stride whose estimated memory and mesh size fit the budget."""
+    """Finest level/stride whose estimated mesh size fits the budget.
+
+    When `target_vertices` is supplied, do not cap the final label read by a
+    separate voxel-count budget. The quality control is the expected mesh size;
+    memory failures are handled by retrying one pyramid level coarser.
+    """
     chosen_level = len(vol.level_scale_nm) - 1
     chosen_voxels = _bbox_voxels_for_level(vol, bbox_xyz_nm, chosen_level)
 
@@ -215,14 +220,12 @@ def _choose_plan(
         count_cache: dict[int, int] = {}
         for level in range(len(vol.level_scale_nm)):
             voxels = _bbox_voxels_for_level(vol, bbox_xyz_nm, level)
-            if voxels > _PLAN_MAX_READ_VOXELS:
-                continue
             surface_faces = _estimate_surface_faces_for_level(vol, bbox_xyz_nm, level, ids, count_cache)
             if surface_faces <= surface_budget:
                 chosen_level = level
                 chosen_voxels = voxels
                 break
-        read_budget = _PLAN_MAX_READ_VOXELS
+        read_budget = chosen_voxels
     else:
         read_budget = max(1, int(target_voxels))
         for level in range(len(vol.level_scale_nm)):
@@ -234,6 +237,22 @@ def _choose_plan(
 
     stride = max(1, int(np.ceil((chosen_voxels / read_budget) ** (1 / 3))))
     return _ReadPlan(level=chosen_level, stride=stride, bbox_xyz_nm=bbox_xyz_nm)
+
+
+def _coarsen_plan(vol, plan: _ReadPlan) -> _ReadPlan | None:
+    level = int(plan.level) + 1
+    if level < len(vol.level_scale_nm):
+        return _ReadPlan(level=level, stride=1, bbox_xyz_nm=plan.bbox_xyz_nm)
+    if int(plan.stride) < 16:
+        return _ReadPlan(level=plan.level, stride=int(plan.stride) * 2, bbox_xyz_nm=plan.bbox_xyz_nm)
+    return None
+
+
+def _is_memory_error(exc: BaseException) -> bool:
+    if isinstance(exc, MemoryError):
+        return True
+    text = str(exc).lower()
+    return any(token in text for token in ("memory", "bad_alloc", "std::bad_alloc", "oom", "cannot allocate"))
 
 
 def _read_plan_array(vol, plan: _ReadPlan, pad: int = 2):
@@ -477,40 +496,55 @@ def generate_zmesh_auto(
         target_vertices=target_vertices,
         seg_ids=seg_ids,
     )
-    arr, (z0, y0, x0), sc, tr = _read_plan_array(vol, plan, pad=3)
-    keep = np.isin(arr, seg_ids)
-    if not keep.any():
-        raise ValueError("none of the selected segments present in labels")
-    labels = np.where(keep, arr, 0).astype(np.uint32, copy=False)
-    labels = np.pad(labels, 1)
-
-    mesher = zmesh.Mesher(tuple(float(s) for s in sc))
-    mesher.mesh(labels)
-    zmesh_reduction, zmesh_max_error = _zmesh_simplify_params(simplify_budget_factor, sc)
-    origin_zyx_nm = (
-        (z0 - 1) * sc[0] + tr[0],
-        (y0 - 1) * sc[1] + tr[1],
-        (x0 - 1) * sc[2] + tr[2],
-    )
-    raw_parts = []
-    available = set(int(s) for s in mesher.ids())
-    for seg_id in seg_ids:
-        if seg_id not in available:
-            continue
+    while True:
         try:
-            raw_mesh = mesher.get(
-                seg_id,
-                reduction_factor=zmesh_reduction,
-                max_error=zmesh_max_error,
-                voxel_centered=False,
+            arr, (z0, y0, x0), sc, tr = _read_plan_array(vol, plan, pad=3)
+            keep = np.isin(arr, seg_ids)
+            if not keep.any():
+                raise ValueError("none of the selected segments present in labels")
+            labels = np.where(keep, arr, 0).astype(np.uint32, copy=False)
+            labels = np.pad(labels, 1)
+
+            mesher = zmesh.Mesher(tuple(float(s) for s in sc))
+            mesher.mesh(labels)
+            zmesh_reduction, zmesh_max_error = _zmesh_simplify_params(simplify_budget_factor, sc)
+            origin_zyx_nm = (
+                (z0 - 1) * sc[0] + tr[0],
+                (y0 - 1) * sc[1] + tr[1],
+                (x0 - 1) * sc[2] + tr[2],
             )
-        except TypeError:
-            raw_mesh = mesher.get(seg_id)
-        part = _mesh_to_trimesh(raw_mesh, seg_id, origin_zyx_nm, colorize=colorize)
-        if part is not None:
-            raw_parts.append(part)
-    if not raw_parts:
-        raise ValueError("zmesh produced no geometry for the selected segments")
+            raw_parts = []
+            available = set(int(s) for s in mesher.ids())
+            for seg_id in seg_ids:
+                if seg_id not in available:
+                    continue
+                try:
+                    raw_mesh = mesher.get(
+                        seg_id,
+                        reduction_factor=zmesh_reduction,
+                        max_error=zmesh_max_error,
+                        voxel_centered=False,
+                    )
+                except TypeError:
+                    raw_mesh = mesher.get(seg_id)
+                part = _mesh_to_trimesh(raw_mesh, seg_id, origin_zyx_nm, colorize=colorize)
+                if part is not None:
+                    raw_parts.append(part)
+            if not raw_parts:
+                raise ValueError("zmesh produced no geometry for the selected segments")
+            break
+        except Exception as e:  # noqa: BLE001
+            if not _is_memory_error(e):
+                raise
+            next_plan = _coarsen_plan(vol, plan)
+            if next_plan is None:
+                raise
+            print(
+                "[labels] label mesh memory fallback: "
+                f"level={plan.level} stride={plan.stride} failed ({e}); "
+                f"retrying level={next_plan.level} stride={next_plan.stride}"
+            )
+            plan = next_plan
 
     target_faces_total = None
     if target_vertices and simplify_budget_factor > 0:
