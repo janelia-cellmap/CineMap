@@ -359,7 +359,7 @@ class RenderWorker:
         """Cache-key component for a mesh built at on-screen scale `nmpp` (nm/px):
         re-framing, draft, source, budget, or a different LOD bucket each rebuild."""
         source_tag = (
-            f"lab-zmesh-clean-v4-s{self._label_smooth_iters}-q{self._label_simplify_factor:.3g}"
+            f"lab-zmesh-clean-v5-s{self._label_smooth_iters}-q{self._label_simplify_factor:.3g}"
             if self._prefer_labels else "pre"
         )
         quality_tag = "draft" if self._draft else "full"
