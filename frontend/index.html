@@ -828,7 +828,7 @@ async function renderSweepSnapshots() {
   const id = EDIT_SWEEP_ID;
   $('swMsg').textContent = 'rendering preview frames… (runs in the background)';
   try {
-    await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`);
+    await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`, draftRenderSettings());
   } catch (e) { $('swMsg').textContent = 'failed to start: ' + (e.message||e); return; }
   const poll = async () => {
     let st; try { st = await api('GET', `/api/projects/${PID}/sweeps/${id}/snapshots/status`); }
@@ -974,13 +974,19 @@ function showKeyframeThumb(id) {
 
 // render the single keyframe to a still; show it live and keep it as the frame thumbnail
 let THUMB_JOB = null;
+function draftRenderSettings() {
+  return {
+    mesh_from_labels: $('labelMeshes').checked,
+    mesh_detail: +$('detail').value || 1,
+    label_mesh_smooth_iters: +$('labelSmooth').value || 0,
+    label_mesh_simplify_factor: +$('labelSimplify').value || 0
+  };
+}
 async function renderThumbnail(id) {
   AUTO_THUMBS = false;   // a manual single-thumbnail render stops the auto sweep
   if (THUMB_JOB) { api('POST', `/api/renders/${THUMB_JOB}/cancel`).catch(() => {}); }  // don't pile up
   try {
-    const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`, {
-      mesh_from_labels: $('labelMeshes').checked
-    });
+    const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`, draftRenderSettings());
     THUMB_JOB = job_id;
     attachRender(job_id, () => {
       if (THUMB_JOB === job_id) THUMB_JOB = null;
@@ -996,7 +1002,7 @@ let AUTO_THUMBS = false;
 function renderThumbAwait(id) {
   return new Promise(async (resolve) => {
     try {
-      const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`);
+      const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`, draftRenderSettings());
       THUMB_JOB = job_id;
       attachRender(job_id, () => { if (THUMB_JOB === job_id) THUMB_JOB = null; THUMB_VER[id] = Date.now(); resolve(); }, true);
     } catch (e) { resolve(); }   // one failure shouldn't stall the rest
@@ -1042,7 +1048,7 @@ function orderedSweepIds() {
 let SNAP_JOB = null;   // id of the in-flight sweep-snapshot render, so Stop can cancel it
 function bakeSweepSnapAwait(id) {
   return new Promise(async (resolve) => {
-    try { const r = await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`); SNAP_JOB = r.job_id || `snap_${id}`; }
+    try { const r = await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`, draftRenderSettings()); SNAP_JOB = r.job_id || `snap_${id}`; }
     catch { return resolve(); }
     const poll = async () => {
       if (!AUTO_THUMBS) { SNAP_JOB = null; return resolve(); }   // stopped
@@ -1256,6 +1262,7 @@ async function previewPlaneScan() {
   if (kind === 'cutaway' && !layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
   // Use the selected global start time so preview and saved clips agree on placement.
   const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: start, mirror: $('planeMirror').checked };
+  Object.assign(body, draftRenderSettings());
   if (kind === 'cutaway') { body.layer = layer; body.cap = $('planeCap').checked; }
   else Object.assign(body, selectedScanLayers());
   if (fn.length) body.from_ng = fn;

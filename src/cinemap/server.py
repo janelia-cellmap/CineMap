@@ -186,6 +186,31 @@ class RenderReq(BaseModel):
 
 class ThumbnailReq(BaseModel):
     mesh_from_labels: bool = False  # keep thumbnails source-compatible with previews
+    mesh_detail: float = 1.0
+    label_mesh_smooth_iters: int = 0
+    label_mesh_simplify_factor: float = 0.0
+
+
+class SnapshotReq(BaseModel):
+    mesh_from_labels: bool = False
+    mesh_detail: float = 1.0
+    label_mesh_smooth_iters: int = 0
+    label_mesh_simplify_factor: float = 0.0
+
+
+def _draft_render_settings(req: SnapshotReq | ThumbnailReq | None = None) -> RenderSettings:
+    req = req or SnapshotReq()
+    return RenderSettings(
+        width=240,
+        height=160,
+        samples=12,
+        fps=2,
+        draft=True,
+        mesh_detail=req.mesh_detail,
+        mesh_from_labels=req.mesh_from_labels,
+        label_mesh_smooth_iters=req.label_mesh_smooth_iters,
+        label_mesh_simplify_factor=req.label_mesh_simplify_factor,
+    )
 
 
 def _effective_lod_mode(mesh_from_labels: bool, lod_mode: str) -> str:
@@ -440,7 +465,10 @@ def render_thumbnail(pid: str, kid: str, req: ThumbnailReq | None = None):
         raise HTTPException(404, "no such keyframe")
     req = req or ThumbnailReq()
     settings = RenderSettings(width=640, height=480, samples=24, fps=1, draft=True,
-                              still=True, mesh_from_labels=req.mesh_from_labels)
+                              still=True, mesh_detail=req.mesh_detail,
+                              mesh_from_labels=req.mesh_from_labels,
+                              label_mesh_smooth_iters=req.label_mesh_smooth_iters,
+                              label_mesh_simplify_factor=req.label_mesh_simplify_factor)
     job_id = _start_render(pid, settings, kf_range=[idx, idx], thumbnail_for=kid)
     return {"job_id": job_id}
 
@@ -698,6 +726,10 @@ class SweepReqNew(BaseModel):
     easing: str = "linear"
     mirror: bool = False
     cap: bool = True
+    mesh_from_labels: bool = False
+    mesh_detail: float = 1.0
+    label_mesh_smooth_iters: int = 0
+    label_mesh_simplify_factor: float = 0.0
 
 
 @app.post("/api/projects/{pid}/sweeps")
@@ -761,7 +793,7 @@ def _snapshot_times(sw) -> list[float]:
 
 
 @app.post("/api/projects/{pid}/sweeps/{sid}/snapshots")
-def render_sweep_snapshots(pid: str, sid: str):
+def render_sweep_snapshots(pid: str, sid: str, req: SnapshotReq | None = None):
     """Kick off (in the background) a few small preview stills of a clip so the timeline
     bar can show what the sweep looks like. A MIRROR sweep gets 5 evenly-spaced frames
     (0/25/50/75/100%) since start & end look identical; others get 3 (start/mid/end).
@@ -780,7 +812,7 @@ def render_sweep_snapshots(pid: str, sid: str):
     job_id = f"snap_{sid}"
 
     def _run():
-        settings = RenderSettings(width=240, height=160, samples=12, fps=2, draft=True)
+        settings = _draft_render_settings(req)
         worker = RenderWorker(p, RenderJob(id=job_id, settings=settings))
         _workers[job_id] = worker   # registered so Stop/cancel + shutdown can kill it
         try:
@@ -841,7 +873,7 @@ def preview_sweep(pid: str, req: SweepReqNew):
     def _run():
         try:
             shutil.rmtree(out, ignore_errors=True)
-            settings = RenderSettings(width=240, height=160, samples=12, fps=2, draft=True)
+            settings = _draft_render_settings(req)
             worker = RenderWorker(pc, RenderJob(id="snap_preview", settings=settings))
             paths = worker.render_snapshots(times, out)
             _snap_state[key] = {"status": "done", "count": len(paths)}
