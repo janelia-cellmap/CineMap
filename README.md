@@ -85,6 +85,9 @@ conda run -n mv_env pip install -e .     # installs all deps incl. bpy (Blender/
 Requires an NVIDIA GPU (OPTIX / Cycles) and network access to the data host (data
 is read over https; `/nrs` need not be mounted).
 
+Projects and render assets are stored under `./projects/` by default. Set
+`CINEMAP_PROJECTS_DIR` to use shared storage or another project root.
+
 **Choosing a GPU.** By default the renderer uses every available NVIDIA GPU. On a
 multi-GPU machine, set `CINEMAP_GPU` to pick one (or several) by index — the
 render log prints `OPTIX GPUs available: [0:…, 1:…]` so you know the indices:
