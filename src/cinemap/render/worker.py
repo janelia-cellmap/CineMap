@@ -114,9 +114,8 @@ class RenderWorker:
         self._label_vols: dict[str, EMVolume] = {}
         self._slice_cache: dict[tuple, dict] = {}
         self._slice_cache_lock = threading.Lock()
-        # Resolution budgets. Draft (bake/update/preview thumbnails) trades EM detail
-        # for speed, but keeps the same mesh budget semantics as final renders so the
-        # UI's "~50M/layer" quality option means the same thing everywhere. EM scale is selected
+        # Resolution budgets. Draft (bake/update/preview thumbnails) trades detail
+        # for speed: a coarse EM level and low-voxel meshes. EM scale is selected
         # per frame from physical nm/pixel, matching Neuroglancer's multiscale choice;
         # meshes use zmesh voxel/vertex budgets for label-derived geometry.
         draft = bool(getattr(job.settings, "draft", False))
@@ -133,7 +132,7 @@ class RenderWorker:
         # setting can't recreate the multi-GB mesh that stalled asset prep / OOM'd the
         # GPU. The OOM-retry loop in run() halves this and rebuilds if Cycles runs out.
         detail = max(0.25, min(float(getattr(job.settings, "mesh_detail", 1.0) or 1.0), 10.0))
-        base_budget = 5_000_000
+        base_budget = 3_000_000 if draft else 5_000_000
         self._mesh_budget = min(int(base_budget * detail), self.MESH_BUDGET_CEILING)
         self._label_smooth_iters = max(
             0,
