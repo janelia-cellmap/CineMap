@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# Repo root (…/cinemap) and where projects + render assets live.
+# Repo root (.../cinemap) and where projects + render assets live.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROJECTS_DIR = REPO_ROOT / "projects"
 PROJECTS_DIR = Path(os.environ.get("CINEMAP_PROJECTS_DIR", DEFAULT_PROJECTS_DIR))

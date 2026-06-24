@@ -38,10 +38,10 @@ def main(argv: list[str]) -> int:
         return 2
     pid, job_id = argv[1], argv[2]
 
-    # Catch SIGTERM so a graceful Stop has a chance to leave the project.json in a
-    # sane state before the parent escalates to SIGKILL on the process group.
+    # Catch SIGTERM so an external termination is visible to the parent instead of
+    # being mislabeled as a user cancel.
     def _sigterm(_sig, _frm):
-        _emit({"final": "cancelled"})
+        _emit({"final": "error", "message": "render process received SIGTERM"})
         sys.exit(143)
     signal.signal(signal.SIGTERM, _sigterm)
 

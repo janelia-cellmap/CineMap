@@ -9,9 +9,19 @@ ENV="${CINEMAP_ENV:-cinemap}"
 HOST="${CINEMAP_HOST:-0.0.0.0}"          # uvicorn bind (0.0.0.0 = all interfaces)
 PORT="${CINEMAP_PORT:-8000}"
 
+# Local machine/user overrides. Keep site-specific paths (for example shared NRS
+# project storage) out of tracked source.
+LOCAL_ENV="${CINEMAP_ENV_FILE:-$HOME/.config/cinemap/env}"
+if [[ -f "$LOCAL_ENV" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$LOCAL_ENV"
+  set +a
+fi
+
 # Where project state + per-project render assets (meshes, slice PNGs, frames, the
-# .mesh_cache fragment cache) live. Override with CINEMAP_PROJECTS_DIR for shared
-# storage or scratch/testing.
+# .mesh_cache fragment cache) live. Override with CINEMAP_PROJECTS_DIR in
+# ~/.config/cinemap/env, the shell, or another CINEMAP_ENV_FILE.
 export CINEMAP_PROJECTS_DIR="${CINEMAP_PROJECTS_DIR:-$PWD/projects}"
 
 # Bind the neuroglancer viewer to all interfaces (incl. loopback) by default; the app

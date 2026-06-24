@@ -51,6 +51,49 @@ _render_state: dict[str, dict] = {}
 _workers: dict[str, Any] = {}
 
 
+def _returncode_message(returncode: int | None) -> str:
+    if returncode is None:
+        return "render process exited without a final status"
+    if returncode < 0:
+        import signal as _signal
+        sig = -returncode
+        try:
+            name = _signal.Signals(sig).name
+        except ValueError:
+            name = f"signal {sig}"
+        return f"render process was killed by {name}"
+    return f"render process exited {returncode}"
+
+
+def _persist_render_status(
+    pid: str,
+    job_id: str,
+    status: str,
+    message: str,
+    progress: float,
+    output: str | None = None,
+) -> None:
+    """Mirror terminal subprocess state into project.json for later UI reloads.
+
+    Full renders run in a child process, so the server's project cache can be stale.
+    Always invalidate before writing the terminal status.
+    """
+    try:
+        store.invalidate(pid)
+        p = store.load(pid)
+        job = next((j for j in p.renders if j.id == job_id), None)
+        if job is None:
+            return
+        job.status = status
+        job.message = message
+        job.progress = progress
+        if output:
+            job.output_path = output
+        store.save(p)
+    except Exception as e:  # noqa: BLE001
+        print(f"[run_job {job_id}] failed to persist render status: {e}", flush=True)
+
+
 class _SubprocHandle:
     """Wraps the Popen of a `cinemap.render.run_job` subprocess so it presents the same
     `.terminate()` + `.frames_dir` interface as an in-process RenderWorker.
@@ -1020,27 +1063,55 @@ def _drain_render_subprocess(pid: str, job_id: str, proc) -> None:
     finally:
         proc.wait()
         # Cancel/normal exit: translate the final marker (or exit code) into a status.
+        status: str
+        message: str
+        progress: float
+        output: str | None = None
         if final and final.get("final") == "done":
-            _render_state[job_id] = {"progress": 1.0, "message": "done",
-                                     "status": "done", "output": final.get("output")}
+            status = "done"
+            message = "done"
+            progress = 1.0
+            output = final.get("output")
+            _render_state[job_id] = {"progress": progress, "message": message,
+                                     "status": status, "output": output}
         elif final and final.get("final") == "cancelled":
-            _render_state[job_id] = {"progress": 0.0, "message": "cancelled",
-                                     "status": "cancelled"}
+            cur = _render_state.get(job_id, {}).get("status")
+            if cur == "cancelling":
+                status = "cancelled"
+                message = "cancelled"
+            else:
+                status = "error"
+                message = "render process reported cancellation without a cancel request"
+            progress = 0.0
+            _render_state[job_id] = {"progress": progress, "message": message,
+                                     "status": status}
         elif final and final.get("final") == "error":
-            _render_state[job_id] = {"progress": 0.0,
-                                     "message": str(final.get("message", "render failed")),
-                                     "status": "error"}
+            status = "error"
+            message = str(final.get("message", "render failed"))
+            progress = 0.0
+            _render_state[job_id] = {"progress": progress, "message": message,
+                                     "status": status}
         else:
             # process died without emitting a final marker (e.g. SIGKILL'd) — infer
             # from the status that was set when cancel was requested, else error.
             cur = _render_state.get(job_id, {}).get("status")
-            if cur == "cancelling" or proc.returncode in (-9, 143):  # SIGKILL / SIGTERM
-                _render_state[job_id] = {"progress": 0.0, "message": "cancelled",
-                                         "status": "cancelled"}
+            progress = 0.0
+            if cur == "cancelling":
+                status = "cancelled"
+                message = "cancelled"
+                _render_state[job_id] = {"progress": progress, "message": message,
+                                         "status": status}
             else:
-                _render_state[job_id] = {"progress": 0.0,
-                                         "message": f"render exited {proc.returncode}",
-                                         "status": "error"}
+                status = "error"
+                message = _returncode_message(proc.returncode)
+                _render_state[job_id] = {"progress": progress, "message": message,
+                                         "status": status}
+        print(
+            f"[run_job {job_id}] finished status={status} returncode={proc.returncode} "
+            f"message={message!r}",
+            flush=True,
+        )
+        _persist_render_status(pid, job_id, status, message, progress, output)
         _workers.pop(job_id, None)
 
 
