@@ -118,6 +118,15 @@ def _clip_arrays(
             add_one_inside(crossing[(ci.sum(axis=1) == 1) & ci[:, slot]], slot)
             add_two_inside(crossing[(ci.sum(axis=1) == 2) & ~ci[:, slot]], slot)
 
+    if not out_faces:
+        out = {
+            "v": np.empty((0, 3), dtype=np.float32),
+            "f": np.empty((0, 3), dtype=np.int32),
+        }
+        if colors is not None:
+            out["c"] = np.empty((0, colors.shape[1]), dtype=np.uint8)
+        return out
+
     all_faces = np.concatenate(out_faces, axis=0).astype(np.int64, copy=False)
     if out_verts:
         extra = np.concatenate(out_verts, axis=0).astype(np.float32, copy=False)
@@ -244,6 +253,35 @@ def write_voxel_cap_npz(
     t_sample = time.perf_counter()
 
     cell_y, cell_x = np.nonzero(mask)
+    if len(cell_y) == 0:
+        arrs: dict[str, np.ndarray] = {
+            "v": np.empty((0, 3), dtype=np.float32),
+            "f": np.empty((0, 3), dtype=np.int32),
+        }
+        if colorize is not None:
+            arrs["c"] = np.empty((0, 4), dtype=np.uint8)
+        np.savez(out_npz, **arrs)
+        t_export = time.perf_counter()
+        result = {
+            "path": str(out_npz),
+            "method": "voxel_plane_cap",
+            "level": int(plan.level),
+            "scale_zyx_nm": [float(x) for x in sc],
+            "sample_nm": float(step),
+            "read_shape_zyx": [int(x) for x in arr.shape],
+            "plane_grid_yx": [int(x) for x in mask.shape],
+            "occupied_plane_cells": 0,
+            "vertices": 0,
+            "faces": 0,
+            "read_seconds": float(t_read - t0),
+            "sample_seconds": float(t_sample - t_read),
+            "mesh_export_seconds": float(t_export - t_sample),
+            "total_seconds": float(t_export - t0),
+            "reused": False,
+        }
+        summary_path.write_text(json.dumps(result, indent=2))
+        return result
+
     used = np.zeros((mask.shape[0] + 1, mask.shape[1] + 1), dtype=bool)
     used[cell_y, cell_x] = True
     used[cell_y, cell_x + 1] = True

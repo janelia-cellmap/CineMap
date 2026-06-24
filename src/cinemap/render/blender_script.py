@@ -19,7 +19,22 @@ import sys
 import time
 
 import bpy
-from mathutils import Matrix, Vector
+from mathutils import Euler, Matrix, Vector
+
+
+def _srgb_channel_to_linear(c: float) -> float:
+    c = max(0.0, min(1.0, float(c)))
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _color_for_blender(color, color_space: str = "linear") -> tuple[float, float, float, float]:
+    vals = list(color or [1.0, 1.0, 1.0])
+    while len(vals) < 4:
+        vals.append(1.0)
+    rgba = [float(vals[0]), float(vals[1]), float(vals[2]), float(vals[3])]
+    if str(color_space).lower() == "srgb":
+        rgba[:3] = [_srgb_channel_to_linear(c) for c in rgba[:3]]
+    return (rgba[0], rgba[1], rgba[2], rgba[3])
 
 
 def _clear() -> None:
@@ -80,6 +95,12 @@ def _setup_render(scene_spec: dict) -> None:
         except Exception as e:  # noqa: BLE001
             print(f"[blender] GPU unavailable, CPU: {e}", flush=True)
         scene.cycles.samples = r.get("samples", 64)
+        material_profile = scene_spec.get("direction", {}).get("material", {})
+        if material_profile.get("transparent_max_bounces") is not None:
+            try:
+                scene.cycles.transparent_max_bounces = int(material_profile["transparent_max_bounces"])
+            except Exception as e:  # noqa: BLE001
+                print(f"[blender] transparent_max_bounces: {e}", flush=True)
         # Adaptive sampling + a denoiser do most of the work: `samples` becomes a CEILING,
         # Cycles stops early on pixels that already look clean (flat areas, the black bg)
         # and spends rays only where it's still noisy (shadows/edges), then the denoiser
@@ -115,19 +136,19 @@ def _setup_render(scene_spec: dict) -> None:
     scene.render.resolution_x = r["width"]
     scene.render.resolution_y = r["height"]
     scene.render.image_settings.file_format = "PNG"
-    # View transform from the director (default AgX + "Punchy"). AgX rolls bright values
-    # off smoothly instead of clipping them to neon -> no oversaturation/blowout, and it
-    # gives soft, dimensional filmic shadows; the "Punchy" look restores color richness so
-    # it isn't washed. (Standard/sRGB matches NG's flat look but clips -> oversaturation.)
+    # View transform from the preset. Empty fields leave Blender's defaults alone; the
+    # Neuroglancer preset uses Raw so Blender does not apply display-tone mapping to
+    # WebGL/display-space colors.
     view = scene_spec.get("direction", {}).get("view", {})
-    try:
-        scene.view_settings.view_transform = view.get("transform", "AgX")
-    except Exception as e:  # noqa: BLE001
-        print(f"[blender] view transform: {e}")
-    look = view.get("look", "AgX - Punchy")
-    if look:
+    transform = view.get("transform")
+    if transform:
         try:
-            scene.view_settings.look = look
+            scene.view_settings.view_transform = transform
+        except Exception as e:  # noqa: BLE001
+            print(f"[blender] view transform: {e}")
+    if "look" in view:
+        try:
+            scene.view_settings.look = view.get("look") or "None"
         except Exception as e:  # noqa: BLE001
             print(f"[blender] view look: {e}")
 
@@ -156,6 +177,11 @@ def _setup_render(scene_spec: dict) -> None:
     nt.links.new(bg_cam.outputs[0], mix.inputs[2])
     nt.links.new(mix.outputs[0], out.inputs["Surface"])
     scene.world = world
+    if amb <= 0.0:
+        try:
+            world.cycles_visibility.diffuse = False
+        except Exception:  # noqa: BLE001
+            pass
 
     _setup_freestyle(scene_spec)
 
@@ -187,12 +213,95 @@ def _setup_freestyle(scene_spec: dict) -> None:
         print(f"[blender] freestyle skipped: {e}")
 
 
+def _scene_center_radius() -> tuple[Vector, float]:
+    coords = []
+    for obj in bpy.context.scene.objects:
+        if obj.type != "MESH" or obj.name.startswith("slice_") or obj.name.startswith("cm_"):
+            continue
+        try:
+            for c in obj.bound_box:
+                coords.append(obj.matrix_world @ Vector(c))
+        except Exception:  # noqa: BLE001
+            continue
+    if not coords:
+        return Vector((0.0, 0.0, 0.0)), 10.0
+    lo = Vector((min(p[i] for p in coords) for i in range(3)))
+    hi = Vector((max(p[i] for p in coords) for i in range(3)))
+    center = (lo + hi) * 0.5
+    radius = max((p - center).length for p in coords) or 10.0
+    return center, radius
+
+
+def _add_neuvid_lights(scene_spec: dict, rig: dict) -> None:
+    """neuVid's render.py uses three fixed AREA lights around the neuron bounds.
+
+    Directions/colors/power scaling are ported from neuVid commit be416cba:
+    lamp distance = radius * 2.5, size = radius, energy =
+    2400000 * (distance / 425.1282)^2 * lightPowerScale[i].
+    """
+    center, radius = _scene_center_radius()
+    specs = [
+        {"direction": (-0.892, 0.3, 0.9), "color": rig.get("key_color", [1.0, 1.0, 1.0])},
+        {"direction": (0.588, 0.46, 0.248), "color": rig.get("fill_color", [1.0, 1.0, 1.0])},
+        {"direction": (0.216, -0.392, -0.216), "color": rig.get("rim_color", [1.0, 1.0, 1.0])},
+    ]
+    rot = rig.get("neuvid_light_rotation", [0.0, 0.0, 0.0])
+    try:
+        # Match neuVid render.py exactly: it converts the JSON X/Y values to radians
+        # but accidentally builds the Euler with the original X/Y values and only the
+        # converted Z value. Defaults are zero, so this matters only when a neuVid-style
+        # lightRotation override is used.
+        rot_euler = Euler(
+            (float(rot[0]), float(rot[1]), math.radians(float(rot[2]))),
+            "XYZ",
+        ).to_matrix()
+    except Exception:  # noqa: BLE001
+        rot_euler = Matrix.Identity(3)
+    # neuVid parents all lights to a rotator with Y=180 degrees for the standard view.
+    light_rotation = (
+        Matrix.Rotation(math.radians(180.0), 4, "Y").to_3x3() @ rot_euler
+    ).to_3x3()
+    power_scale = list(rig.get("neuvid_power_scale", [1.0, 1.0, 1.0]) or [1.0, 1.0, 1.0])
+    size_scale = float(rig.get("neuvid_size_scale", 1.0) or 1.0)
+    distance_scale = float(rig.get("neuvid_distance_scale", 1.0) or 1.0)
+    distance = radius * 2.5 * distance_scale
+    for i, spec in enumerate(specs):
+        data = bpy.data.lights.new(f"Lamp.{i}", type="AREA")
+        data.size = max(1e-6, radius * size_scale)
+        scale_i = float(power_scale[i] if i < len(power_scale) else 1.0)
+        data.energy = 2_400_000.0 * (distance / 425.1282) ** 2 * scale_i
+        try:
+            data.cycles.cast_shadow = True
+            data.cycles.use_multiple_importance_sampling = True
+        except Exception:  # noqa: BLE001
+            pass
+        col = spec["color"]
+        data.color = (col[0], col[1], col[2])
+        obj = bpy.data.objects.new(f"Lamp.{i}", data)
+        direction = Vector(spec["direction"])
+        direction = light_rotation @ direction
+        direction.normalize()
+        obj.location = center + direction * distance
+        obj.rotation_euler = (center - obj.location).to_track_quat("-Z", "X").to_euler()
+        try:
+            obj.visible_camera = False
+        except Exception:  # noqa: BLE001
+            pass
+        bpy.context.scene.collection.objects.link(obj)
+
+
 def _add_light(scene_spec: dict) -> None:
-    """Three-point key/fill/rim rig. The director (auto-direct) supplies energies and
-    asks for a camera-relative rig — _update_lights then re-aims these per frame so
-    the rim/key stay consistent as the camera orbits. Without it, the fixed world
-    rotations below are the faithful fallback."""
+    """Add the selected preset's lights."""
+    for obj in list(bpy.context.scene.objects):
+        if obj.type == "LIGHT":
+            bpy.data.objects.remove(obj, do_unlink=True)
     rig = scene_spec.get("direction", {}).get("lighting", {})
+    kind = rig.get("kind", "sun" if rig else "sun")
+    if kind == "none":
+        return
+    if kind == "neuvid":
+        _add_neuvid_lights(scene_spec, rig)
+        return
     energy = scene_spec.get("lighting", {}).get("key_energy", 3000.0)
     base = rig.get("key_energy") or max(2.0, energy / 600.0)
     fill_mult, rim_mult = rig.get("fill_ratio", 0.45), rig.get("rim_ratio", 0.6)
@@ -356,7 +465,7 @@ def _apply_clip(nt, clip, f=None) -> None:
                 n.outputs[0].keyframe_insert("default_value", frame=f)
 
 
-def _load_npz_mesh(path: str, name: str, calc_edges: bool = False):
+def _load_npz_mesh(path: str, name: str, calc_edges: bool = False, color_space: str = "linear"):
     """Fast direct-to-bpy mesh loader: read a `.npz` of verts/faces/colors and
     populate a `bpy.types.Mesh` via `foreach_set` (vectorized). Avoids
     `bpy.ops.wm.ply_import`, the undo stack, and operator selection state — the
@@ -380,9 +489,25 @@ def _load_npz_mesh(path: str, name: str, calc_edges: bool = False):
         c = np.ascontiguousarray(arrs["c"], dtype=np.uint8)
         if c.ndim == 2 and c.shape[1] == 3:    # add opaque alpha
             c = np.concatenate([c, np.full((len(c), 1), 255, dtype=np.uint8)], axis=1)
-        cf = (c.astype(np.float32) / 255.0).ravel()
-        ca = mesh.color_attributes.new(name="Col", type="FLOAT_COLOR", domain="POINT")
-        ca.data.foreach_set("color", cf)
+        # Trimesh creates a uniform [102,102,102,255] visual by default even when
+        # CineMap did not intentionally bake colors. Treat that as uncolored geometry
+        # so the explicit mesh material/NG color in scene.json drives the render.
+        is_default_trimesh_gray = (
+            len(c) > 0
+            and np.all(c == np.array([102, 102, 102, 255], dtype=np.uint8))
+        )
+        if not is_default_trimesh_gray:
+            cf = c.astype(np.float32) / 255.0
+            if str(color_space).lower() == "srgb":
+                rgb = cf[:, :3]
+                cf[:, :3] = np.where(
+                    rgb <= 0.04045,
+                    rgb / 12.92,
+                    ((rgb + 0.055) / 1.055) ** 2.4,
+                )
+            cf = cf.ravel()
+            ca = mesh.color_attributes.new(name="Col", type="FLOAT_COLOR", domain="POINT")
+            ca.data.foreach_set("color", cf)
     # calc_edges builds an explicit edge table from the loops. Only cutaway meshes need
     # that downstream for bmesh bisect/weld/cap; normal render-only meshes can render
     # straight from faces, and skipping edge construction saves cold-start time on big
@@ -390,6 +515,14 @@ def _load_npz_mesh(path: str, name: str, calc_edges: bool = False):
     # every face. The verts/faces come from our own decode pipeline, so there is nothing
     # to repair here.
     mesh.update(calc_edges=calc_edges)
+    if "n" in arrs.files:
+        try:
+            n = np.ascontiguousarray(arrs["n"], dtype=np.float32)
+            if n.shape == (Nv, 3):
+                mesh.normals_split_custom_set_from_vertices(n)
+                mesh.update()
+        except Exception as e:  # noqa: BLE001
+            print(f"[blender] custom normals skipped for {name}: {e}", flush=True)
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
     return obj
@@ -406,14 +539,17 @@ def _import_meshes(scene_spec: dict) -> dict:
     import numpy as np
 
     out = {}
-    flat_shading = scene_spec.get("direction", {}).get("material", {}).get("flat_shading", True)
+    prof = scene_spec.get("direction", {}).get("material", {})
+    flat_shading = prof.get("flat_shading", True)
+    color_space = prof.get("color_space", "linear")
     t_all = time.perf_counter()
     for m in scene_spec["meshes"]:
         t_mesh = time.perf_counter()
         path = m["obj_path"]
         if path.lower().endswith(".npz"):
             obj = _load_npz_mesh(path, m["id"],
-                                 calc_edges=bool(m.get("clip_cap", m.get("clip"))))
+                                 calc_edges=bool(m.get("clip_cap", m.get("clip"))),
+                                 color_space=color_space)
         else:
             # legacy fallback for any pre-existing .ply / .obj cached assets
             before = set(bpy.data.objects)
@@ -446,16 +582,48 @@ def _import_meshes(scene_spec: dict) -> dict:
         mat.use_nodes = True
         nt = mat.node_tree
         bsdf = nt.nodes["Principled BSDF"]
-        col = m["color"]
-        # publication-quality shading over the NG color: tuned roughness/specular +
-        # a touch of sheen. From the director when auto-direct is on; sensible
-        # defaults otherwise. Input names vary by Blender version, so set defensively.
-        prof = scene_spec.get("direction", {}).get("material", {})
+        col = _color_for_blender(m["color"], color_space)
+        alpha_v = nt.nodes.new("ShaderNodeValue")
+        alpha_v.name = "cm_alpha"
+        alpha_v.outputs[0].default_value = 1.0
+        silh_v = nt.nodes.new("ShaderNodeValue")
+        silh_v.name = "cm_silh"
+        silh_v.outputs[0].default_value = 0.0
+
         def _set_in(node, key, val):
-            if key in node.inputs:
-                node.inputs[key].default_value = val
+            sock = node.inputs.get(key)
+            if sock is None:
+                return
+            try:
+                cur = sock.default_value
+                if hasattr(cur, "__len__") and not isinstance(val, (list, tuple)):
+                    vals = [float(val)] * len(cur)
+                    if len(vals) == 4:
+                        vals[3] = 1.0
+                    sock.default_value = vals
+                else:
+                    sock.default_value = val
+            except Exception:
+                sock.default_value = val
+
+        def _link_specular(node, val):
+            key = "Specular IOR Level" if "Specular IOR Level" in node.inputs else "Specular"
+            if key not in node.inputs:
+                return
+            spec_v = nt.nodes.new("ShaderNodeValue")
+            spec_v.name = "cm_specular"
+            spec_v.outputs[0].default_value = float(val)
+            out = spec_v.outputs[0]
+            if prof.get("alpha_scaled_specular", False):
+                mult = nt.nodes.new("ShaderNodeMath")
+                mult.operation = "MULTIPLY"
+                nt.links.new(alpha_v.outputs[0], mult.inputs[0])
+                nt.links.new(spec_v.outputs[0], mult.inputs[1])
+                out = mult.outputs[0]
+            nt.links.new(out, node.inputs[key])
+
         _set_in(bsdf, "Roughness", prof.get("roughness", 0.35))
-        _set_in(bsdf, "Specular IOR Level", prof.get("specular", 0.5))
+        _link_specular(bsdf, prof.get("specular", 0.5))
         _set_in(bsdf, "Metallic", prof.get("metallic", 0.0))
         # per-frame material override: value nodes drive Metallic/Roughness so a layer can
         # turn reflective over the movie (set per frame in _set_mesh_state; default = the
@@ -479,8 +647,21 @@ def _import_meshes(scene_spec: dict) -> dict:
             color_out = csrc.outputs["Color"]
         else:  # solid color
             csrc = nt.nodes.new("ShaderNodeRGB")
-            csrc.outputs[0].default_value = (col[0], col[1], col[2], 1.0)
+            csrc.name = "cm_color"
+            csrc.outputs[0].default_value = col
             color_out = csrc.outputs[0]
+        if "Specular Tint" in bsdf.inputs:
+            tint = float(prof.get("specular_tint", 0.0) or 0.0)
+            sock = bsdf.inputs["Specular Tint"]
+            cur = getattr(sock, "default_value", None)
+            if hasattr(cur, "__len__") and len(cur) >= 3:
+                mix_tint = nt.nodes.new("ShaderNodeMixRGB")
+                mix_tint.inputs["Fac"].default_value = tint
+                mix_tint.inputs["Color1"].default_value = (1.0, 1.0, 1.0, 1.0)
+                nt.links.new(color_out, mix_tint.inputs["Color2"])
+                nt.links.new(mix_tint.outputs["Color"], sock)
+            else:
+                _set_in(bsdf, "Specular Tint", tint)
         # Ambient occlusion: darken crevices/concavities so bumpy surfaces read crisp
         # and defined (the "within-mesh shadows" that make NG meshes pop). The AO node
         # outputs the color attenuated by occlusion; blend it in by the `ao` amount.
@@ -542,20 +723,28 @@ def _import_meshes(scene_spec: dict) -> dict:
             nt.links.new(color_out, edmix.inputs[1])
             nt.links.new(esub.outputs[0], edmix.inputs[2])       # color * factor (broadcast)
             color_out = edmix.outputs[0]
+        ng_absdot = None
         if prof.get("ng_shader"):
             # Faithful port of neuroglancer's mesh GLSL: per fragment,
-            #   lightingFactor = abs(dot(normal, viewDir)) * 0.8 + 0.2
+            #   lightingFactor = abs(dot(normal, lightDirection)) * 0.8 + 0.2
             #   color = lightingFactor * baseColor
-            # A HEADLIGHT (viewDir) from geometry, emission-only (no external lights), so
-            # it's exactly NG: vivid (factor<=1 -> never clips/oversaturates), camera-relative
-            # shading, no cast shadows. Base Color black so lights/world don't add. NOTE: no
-            # cm_emit node here -> _set_mesh_state can't reset Emission Strength (it stays 1).
+            # Neuroglancer uses one camera-oriented light vector for the whole frame, not
+            # Blender's per-fragment Incoming vector. _set_ng_shader_light drives these nodes
+            # from the current camera before every render/export keyframe.
             geo = nt.nodes.new("ShaderNodeNewGeometry")
+            lx = nt.nodes.new("ShaderNodeValue"); lx.name = "cm_ng_light_x"; lx.outputs[0].default_value = 0.0
+            ly = nt.nodes.new("ShaderNodeValue"); ly.name = "cm_ng_light_y"; ly.outputs[0].default_value = 0.0
+            lz = nt.nodes.new("ShaderNodeValue"); lz.name = "cm_ng_light_z"; lz.outputs[0].default_value = 1.0
+            light_vec = nt.nodes.new("ShaderNodeCombineXYZ")
+            nt.links.new(lx.outputs[0], light_vec.inputs["X"])
+            nt.links.new(ly.outputs[0], light_vec.inputs["Y"])
+            nt.links.new(lz.outputs[0], light_vec.inputs["Z"])
             dotp = nt.nodes.new("ShaderNodeVectorMath"); dotp.operation = "DOT_PRODUCT"
             nt.links.new(geo.outputs["Normal"], dotp.inputs[0])
-            nt.links.new(geo.outputs["Incoming"], dotp.inputs[1])   # viewDir (toward camera)
+            nt.links.new(light_vec.outputs["Vector"], dotp.inputs[1])
             absd = nt.nodes.new("ShaderNodeMath"); absd.operation = "ABSOLUTE"
             nt.links.new(dotp.outputs["Value"], absd.inputs[0])
+            ng_absdot = absd.outputs[0]
             fac = nt.nodes.new("ShaderNodeMath"); fac.operation = "MULTIPLY_ADD"
             fac.inputs[1].default_value = 0.8                       # directionalLighting
             fac.inputs[2].default_value = 0.2                       # ambientLighting
@@ -580,19 +769,28 @@ def _import_meshes(scene_spec: dict) -> dict:
             if "Emission Strength" in bsdf.inputs:
                 nt.links.new(emit_v.outputs[0], bsdf.inputs["Emission Strength"])
 
-        # neuroglancer 3D render state: Alpha = object_alpha * facing^silhouette, where
-        # `facing` is Blender's LayerWeight Facing output = 0 head-on, 1 at grazing
-        # (== neuroglancer's 1 - |normal·view|). So with silhouette>0 the head-on faces
-        # go transparent and only the rim stays opaque (NG's meshSilhouetteRendering, a
-        # glassy shell); silhouette=0 -> facing^0 = 1 -> plain object_alpha everywhere.
-        # Driven per frame by the cm_alpha / cm_silh value nodes.
-        lw = nt.nodes.new("ShaderNodeLayerWeight")
-        powr = nt.nodes.new("ShaderNodeMath"); powr.operation = "POWER"
-        mul = nt.nodes.new("ShaderNodeMath"); mul.operation = "MULTIPLY"; mul.use_clamp = True
-        alpha_v = nt.nodes.new("ShaderNodeValue"); alpha_v.name = "cm_alpha"; alpha_v.outputs[0].default_value = 1.0
-        silh_v = nt.nodes.new("ShaderNodeValue"); silh_v.name = "cm_silh"; silh_v.outputs[0].default_value = 0.0
-        nt.links.new(lw.outputs["Facing"], powr.inputs[0])   # base = facing (0 head-on, 1 grazing)
+        # NG 3D render state: alpha = object_alpha * silhouette_factor.  In NG shader mode
+        # the factor is Neuroglancer's exact pow(1 - 0.8*abs(dot(N, light)), power);
+        # the other presets keep the older Blender-facing approximation.
+        # silhouette=0 -> factor 1 -> plain object_alpha everywhere.
+        if prof.get("ng_shader") and ng_absdot is not None:
+            # Neuroglancer applies silhouette after directional scaling:
+            # vColor *= pow(1.0 - absCosAngle, uSilhouettePower), where
+            # absCosAngle = abs(dot(normal, lightDirection * 0.8)).
+            scaled = nt.nodes.new("ShaderNodeMath"); scaled.operation = "MULTIPLY"
+            scaled.inputs[1].default_value = 0.8
+            nt.links.new(ng_absdot, scaled.inputs[0])
+            one_minus = nt.nodes.new("ShaderNodeMath"); one_minus.operation = "SUBTRACT"
+            one_minus.inputs[0].default_value = 1.0
+            nt.links.new(scaled.outputs[0], one_minus.inputs[1])
+            powr = nt.nodes.new("ShaderNodeMath"); powr.operation = "POWER"
+            nt.links.new(one_minus.outputs[0], powr.inputs[0])
+        else:
+            lw = nt.nodes.new("ShaderNodeLayerWeight")
+            powr = nt.nodes.new("ShaderNodeMath"); powr.operation = "POWER"
+            nt.links.new(lw.outputs["Facing"], powr.inputs[0])   # base = facing (0 head-on, 1 grazing)
         nt.links.new(silh_v.outputs[0], powr.inputs[1])      # exponent = silhouette power
+        mul = nt.nodes.new("ShaderNodeMath"); mul.operation = "MULTIPLY"; mul.use_clamp = True
         nt.links.new(alpha_v.outputs[0], mul.inputs[0])
         nt.links.new(powr.outputs[0], mul.inputs[1])
         if "Alpha" in bsdf.inputs:
@@ -602,7 +800,7 @@ def _import_meshes(scene_spec: dict) -> dict:
         # makes structures read as 'lit' against the dark background, esp. with bloom).
         # Emission Strength = cm_emit (base/pulse) + Facing * edge_glow.
         edge = prof.get("edge_glow", 0.0)
-        if edge > 0 and "Emission Strength" in bsdf.inputs:
+        if edge > 0 and "Emission Strength" in bsdf.inputs and "emit_v" in locals():
             egw = nt.nodes.new("ShaderNodeMath"); egw.operation = "MULTIPLY"
             egw.inputs[1].default_value = edge
             nt.links.new(lw.outputs["Facing"], egw.inputs[0])    # 0 head-on, 1 grazing
@@ -664,7 +862,39 @@ def _import_meshes(scene_spec: dict) -> dict:
         if out_node is not None:
             nt.links.new(surf, out_node.inputs["Surface"])
 
-        mat.blend_method = "BLEND"
+        try:
+            mat.blend_method = prof.get("blend_method", "BLEND")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            mat.shadow_method = prof.get("shadow_method", "HASHED")
+        except Exception:  # noqa: BLE001
+            pass
+        if prof.get("show_transparent_back") is not None:
+            try:
+                mat.show_transparent_back = bool(prof.get("show_transparent_back"))
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            if hasattr(mat, "surface_render_method"):
+                desired = {
+                    "HASHED": "DITHERED",
+                    "DITHERED": "DITHERED",
+                    "BLEND": "BLENDED",
+                    "BLENDED": "BLENDED",
+                }.get(prof.get("blend_method"))
+                if desired:
+                    try:
+                        mat.surface_render_method = desired
+                    except Exception:  # noqa: BLE001
+                        mat.surface_render_method = "DITHERED"
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if hasattr(mat, "cycles"):
+                mat.cycles.use_transparent_shadow = bool(prof.get("transparent_shadows", True))
+        except Exception:  # noqa: BLE001
+            pass
         obj.data.materials.clear()
         obj.data.materials.append(mat)
         out[m["id"]] = (obj, mat)
@@ -743,7 +973,13 @@ def _geometric_clip(obj, clip) -> None:
     bm.free()
 
 
-def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> None:
+def _set_mesh_state(
+    meshes: dict,
+    overrides: dict,
+    base_emit: float = 0.15,
+    cast_shadows: bool = True,
+    color_space: str = "linear",
+) -> None:
     for mid, (obj, mat) in meshes.items():
         ov = overrides.get(mid)
         if ov is None:  # not referenced this frame -> hidden (belongs to another keyframe)
@@ -759,7 +995,11 @@ def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> N
         # with opacity. A hard on/off threshold here instead caused a one-frame brightness
         # POP whenever a layer faded through it (e.g. the segmentation reveal at ~2s):
         # below the cutoff no shadow, above it the whole tangle self-shadowed at once.
-        obj.visible_shadow = visible and not os.environ.get("CINEMAP_NO_CAST_SHADOWS")
+        obj.visible_shadow = (
+            visible
+            and cast_shadows
+            and not os.environ.get("CINEMAP_NO_CAST_SHADOWS")
+        )
         nt = mat.node_tree
         av, sv = nt.nodes.get("cm_alpha"), nt.nodes.get("cm_silh")
         if av is not None:
@@ -770,6 +1010,9 @@ def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> N
         ev = nt.nodes.get("cm_emit")
         if ev is not None:
             ev.outputs[0].default_value = base_emit + ov.get("emphasis", 0.0)
+        cv = nt.nodes.get("cm_color")
+        if cv is not None and ov.get("color") is not None:
+            cv.outputs[0].default_value = _color_for_blender(ov["color"], color_space)
         if av is None and "Alpha" in nt.nodes["Principled BSDF"].inputs:
             nt.nodes["Principled BSDF"].inputs["Alpha"].default_value = opacity
         # per-frame material: override metallic/roughness when this frame sets them, else
@@ -782,6 +1025,36 @@ def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> N
             if rv is not None:
                 rv.outputs[0].default_value = br if r_ov is None else float(r_ov)
         _apply_clip(nt, ov.get("clip"))
+
+
+def _ng_light_direction(frame: dict) -> Vector:
+    """Neuroglancer's mesh light direction is camera orientation-derived and constant
+    for the whole frame. The sign is immaterial because NG uses abs(dot(...))."""
+    pos = Vector(frame["camera"]["position_bu"])
+    look = Vector(frame["camera"]["look_at_bu"])
+    direction = look - pos
+    if direction.length <= 1e-9:
+        return Vector((0.0, 0.0, 1.0))
+    return direction.normalized()
+
+
+def _set_ng_shader_light(meshes: dict, frame: dict, f: int | None = None) -> None:
+    light = _ng_light_direction(frame)
+    vals = {
+        "cm_ng_light_x": light.x,
+        "cm_ng_light_y": light.y,
+        "cm_ng_light_z": light.z,
+    }
+    for _mid, (_obj, mat) in meshes.items():
+        if mat is None or not getattr(mat, "use_nodes", False):
+            continue
+        for name, val in vals.items():
+            node = mat.node_tree.nodes.get(name)
+            if node is None:
+                continue
+            node.outputs[0].default_value = float(val)
+            if f is not None:
+                node.outputs[0].keyframe_insert("default_value", frame=f)
 
 
 _slice_objs: list = []
@@ -1050,13 +1323,19 @@ def main(scene_path: str) -> None:
     scene = bpy.context.scene
     out_dir = spec["output_dir"]
     rig = spec.get("direction", {}).get("lighting", {})
-    base_emit = spec.get("direction", {}).get("material", {}).get("emission_strength", 0.15)
+    material_profile = spec.get("direction", {}).get("material", {})
+    base_emit = material_profile.get("emission_strength", 0.15)
+    cast_shadows = bool(material_profile.get("cast_shadows", True))
+    color_space = material_profile.get("color_space", "linear")
     for fi, frame in enumerate(spec["frames"]):
         _set_camera(frame)
         if rig:
             _update_lights(frame, rig)
+        _set_ng_shader_light(meshes, frame)
         _build_slices(frame)
-        _set_mesh_state(meshes, frame.get("mesh_overrides", {}), base_emit)
+        _set_mesh_state(
+            meshes, frame.get("mesh_overrides", {}), base_emit, cast_shadows, color_space
+        )
         _set_fade_overlay(frame)
         idx = frame.get("index", fi)  # global frame index (for split cluster jobs)
         scene.render.filepath = f"{out_dir}/frame_{idx:05d}.png"
@@ -1110,7 +1389,25 @@ def _keyframe_camera(frame: dict, f: int) -> None:
         cam.data.keyframe_insert("lens", frame=f)  # lens_unit=FOV -> lens tracks fov
 
 
-def _keyframe_meshes(meshes: dict, overrides: dict, f: int) -> None:
+def _keyframe_lights(frame: dict, rig: dict, f: int) -> None:
+    """Bake camera-relative light orientation exactly as the still renderer drives it."""
+    if not rig:
+        return
+    _update_lights(frame, rig)
+    for name in ("Key", "Fill", "Rim", "Kick"):
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            obj.keyframe_insert("rotation_euler", frame=f)
+
+
+def _keyframe_meshes(
+    meshes: dict,
+    overrides: dict,
+    f: int,
+    base_emit: float = 0.15,
+    cast_shadows: bool = True,
+    color_space: str = "linear",
+) -> None:
     for _mid, (obj, mat) in meshes.items():
         ov = overrides.get(_mid)
         opacity = ov.get("opacity", 1.0) if ov else 0.0
@@ -1118,8 +1415,13 @@ def _keyframe_meshes(meshes: dict, overrides: dict, f: int) -> None:
         visible = bool(ov) and ov.get("visible", True) and opacity > 0.001
         obj.hide_render = not visible
         obj.hide_viewport = not visible
+        obj.visible_shadow = visible and cast_shadows
         obj.keyframe_insert("hide_render", frame=f)
         obj.keyframe_insert("hide_viewport", frame=f)
+        try:
+            obj.keyframe_insert("visible_shadow", frame=f)
+        except Exception:  # noqa: BLE001
+            pass
         nt = mat.node_tree
         av, sv = nt.nodes.get("cm_alpha"), nt.nodes.get("cm_silh")
         if av is not None:
@@ -1128,17 +1430,40 @@ def _keyframe_meshes(meshes: dict, overrides: dict, f: int) -> None:
         if sv is not None:
             sv.outputs[0].default_value = silh
             sv.outputs[0].keyframe_insert("default_value", frame=f)
+        cv = nt.nodes.get("cm_color")
+        if cv is not None and ov and ov.get("color") is not None:
+            cv.outputs[0].default_value = _color_for_blender(ov["color"], color_space)
+            cv.outputs[0].keyframe_insert("default_value", frame=f)
+        ev = nt.nodes.get("cm_emit")
+        if ev is not None:
+            ev.outputs[0].default_value = base_emit + (ov.get("emphasis", 0.0) if ov else 0.0)
+            ev.outputs[0].keyframe_insert("default_value", frame=f)
+        mv, rv = nt.nodes.get("cm_metal"), nt.nodes.get("cm_rough")
+        if mv is not None:
+            bm, br = _mat_base.get(obj.name, (0.0, 0.35))
+            m_ov = ov.get("metallic") if ov else None
+            r_ov = ov.get("roughness") if ov else None
+            mv.outputs[0].default_value = bm if m_ov is None else float(m_ov)
+            mv.outputs[0].keyframe_insert("default_value", frame=f)
+            if rv is not None:
+                rv.outputs[0].default_value = br if r_ov is None else float(r_ov)
+                rv.outputs[0].keyframe_insert("default_value", frame=f)
         _apply_clip(nt, ov.get("clip") if ov else None, f)
 
 
 def export_blend(spec: dict) -> None:
     blend_path = spec["export_blend"]
     _clear()
+    meshes = _import_meshes(spec)
     _setup_render(spec)
     _add_light(spec)
-    meshes = _import_meshes(spec)
     scene = bpy.context.scene
     frames = spec["frames"]
+    material_profile = spec.get("direction", {}).get("material", {})
+    rig = spec.get("direction", {}).get("lighting", {})
+    base_emit = material_profile.get("emission_strength", 0.15)
+    cast_shadows = bool(material_profile.get("cast_shadows", True))
+    color_space = material_profile.get("color_space", "linear")
     n = len(frames)
     scene.frame_start = 1
     scene.frame_end = max(1, n)
@@ -1150,7 +1475,16 @@ def export_blend(spec: dict) -> None:
         f = fi + 1
         scene.frame_set(f)
         _keyframe_camera(frame, f)
-        _keyframe_meshes(meshes, frame.get("mesh_overrides", {}), f)
+        _keyframe_lights(frame, rig, f)
+        _set_ng_shader_light(meshes, frame, f)
+        _keyframe_meshes(
+            meshes,
+            frame.get("mesh_overrides", {}),
+            f,
+            base_emit,
+            cast_shadows,
+            color_space,
+        )
         _set_fade_overlay(frame, f)
         print(f"[blender] frame {fi + 1}/{n}", flush=True)
 

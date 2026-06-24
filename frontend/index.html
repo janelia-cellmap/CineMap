@@ -183,7 +183,7 @@
           <option value="2">gentle</option>
           <option value="1">budget</option>
         </select></label>
-      <label class="chk" title="Director: a non-destructive presentation pass that enhances the look WITHOUT changing your neuroglancer data — camera-relative key/fill/rim lighting, publication-quality materials, and subtle depth-of-field on the framed subject. Uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
+      <label class="chk" title="Director: optional camera smoothing and per-frame emphasis around the selected Look preset. If no Look preset is selected, uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
       <label class="chk" title="Draw a thin wireframe box around each data source's extent (the EM volume and/or each rendered layer's label volume), like neuroglancer's bounding box. Falls back to a tight box around the rendered meshes when a layer has no volume source."><input id="showBbox" type="checkbox" /> bbox</label>
       <input id="bboxColor" type="color" value="#9ea8bd" title="bounding-box wireframe color" style="width:24px;height:20px;padding:0;border:1px solid var(--line);background:none;cursor:pointer" />
       <select id="bboxSource" title="Which layer the bounding box is drawn from (its data/mesh extent) — works even if that layer is hidden. Auto = the EM volume, or all visible meshes." style="max-width:120px"><option value="">bbox: auto</option></select>
@@ -289,7 +289,7 @@
   <label class="msg">Preset</label>
   <select id="lookPreset" onchange="lookPresetChanged()" style="width:100%">
     <option value="neuvid">neuVid — glossy 3-point (default)</option>
-    <option value="ng">neuroglancer — flat headlight</option>
+    <option value="ng">neuroglancer — WebGL shader</option>
     <option value="rake">raking — matte directional</option>
     <option value="drama">drama — deep shadows</option>
   </select>
@@ -1763,16 +1763,16 @@ let PREV_LOOK = null, PREV_IMG = null;
 // material "type" presets — set the Principled knobs (the look panel exposes glow/
 // roughness/specular sliders; metallic/transmission/sheen come from the type).
 const MAT_STYLES = {
-  glossy:     { roughness: 0.25, specular: 0.5, glow: 0.02 },
-  matte:      { roughness: 0.9,  specular: 0.1, glow: 0.02 },
-  plastic:    { roughness: 0.4,  specular: 0.6, glow: 0.02 },
-  metallic:   { roughness: 0.3,  specular: 0.5, metallic: 1.0, glow: 0.02 },
-  chrome:     { roughness: 0.05, specular: 0.5, metallic: 1.0, glow: 0.02 },
-  ceramic:    { roughness: 0.25, specular: 0.5, coat: 1.0, glow: 0.02 },
-  waxy:       { roughness: 0.5,  specular: 0.3, sheen: 1.0, glow: 0.02 },
-  subsurface: { roughness: 0.45, specular: 0.4, subsurface: 1.0, glow: 0.02 },
-  glassy:     { roughness: 0.0,  specular: 0.5, transmission: 1.0, glow: 0.02 },
-  frosted:    { roughness: 0.4,  specular: 0.5, transmission: 0.7, glow: 0.02 },
+  glossy:     { roughness: 0.25, specular: 0.5, glow: 0.0 },
+  matte:      { roughness: 0.9,  specular: 0.1, glow: 0.0 },
+  plastic:    { roughness: 0.4,  specular: 0.6, glow: 0.0 },
+  metallic:   { roughness: 0.3,  specular: 0.5, metallic: 1.0, glow: 0.0 },
+  chrome:     { roughness: 0.05, specular: 0.5, metallic: 1.0, glow: 0.0 },
+  ceramic:    { roughness: 0.25, specular: 0.5, coat: 1.0, glow: 0.0 },
+  waxy:       { roughness: 0.5,  specular: 0.3, sheen: 1.0, glow: 0.0 },
+  subsurface: { roughness: 0.45, specular: 0.4, subsurface: 1.0, glow: 0.0 },
+  glassy:     { roughness: 0.0,  specular: 0.5, transmission: 1.0, glow: 0.0 },
+  frosted:    { roughness: 0.4,  specular: 0.5, transmission: 0.7, glow: 0.0 },
   glow:       { roughness: 0.4,  specular: 0.4, glow: 0.4 },
 };
 function syncLookVals() {
@@ -1787,7 +1787,7 @@ function setLookControls(L) {
   L = L || {};
   $('lookPreset').value = L.preset || 'neuvid';
   $('lookMat').value = L.material || 'glossy';
-  $('lookGlow').value = L.glow != null ? L.glow : 0.02;
+  $('lookGlow').value = L.glow != null ? L.glow : 0.0;
   $('lookRough').value = L.roughness != null ? L.roughness : 0.25;
   $('lookSpec').value = L.specular != null ? L.specular : 0.5;
   syncLookVals();

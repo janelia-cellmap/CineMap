@@ -7,6 +7,7 @@ keyframe (camera target from the NG position; framing from the project defaults)
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 
 import neuroglancer
 
@@ -43,6 +44,52 @@ def load_dataset(data_path: str) -> None:
 
 def current_state() -> dict:
     return get_viewer().state.to_json()
+
+
+def _numeric_pair(value) -> list[float] | None:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        return None
+    vals = list(value)
+    if len(vals) != 2:
+        return None
+    try:
+        lo, hi = float(vals[0]), float(vals[1])
+    except (TypeError, ValueError):
+        return None
+    if hi <= lo:
+        return None
+    return [lo, hi]
+
+
+def _find_contrast_pair(obj) -> list[float] | None:
+    """Extract a Neuroglancer image-layer intensity window from nested controls.
+
+    NG states commonly store this under shaderControls.<control>.window, but older
+    or hand-written states may use a simple range pair. Prefer window because it
+    represents the displayed black/white points rather than the control bounds.
+    """
+    if isinstance(obj, dict):
+        for key in ("window", "contrastLimits", "contrast_limits"):
+            pair = _numeric_pair(obj.get(key))
+            if pair is not None:
+                return pair
+        for value in obj.values():
+            pair = _find_contrast_pair(value)
+            if pair is not None:
+                return pair
+        return _numeric_pair(obj.get("range"))
+    if isinstance(obj, list):
+        for value in obj:
+            pair = _find_contrast_pair(value)
+            if pair is not None:
+                return pair
+    return None
+
+
+def _image_contrast_from_layer(layer: dict | None) -> list[float] | None:
+    if not layer or layer.get("type") != "image":
+        return None
+    return _find_contrast_pair(layer.get("shaderControls") or layer)
 
 
 def current_layer_visibility(project: Project) -> dict[str, bool]:
@@ -95,8 +142,23 @@ def current_layer_colors(project: Project, st: dict | None = None) -> dict:
 
     if st is None:
         st = get_viewer().state.to_json()
-    return {l.get("name"): _colors.from_layer_dict(l)
-            for l in st.get("layers", []) if l.get("type") == "segmentation"}
+    layers = {
+        l.get("name"): l for l in st.get("layers", [])
+        if l.get("type") == "segmentation" and l.get("name")
+    }
+
+    def color_source(layer: dict) -> dict:
+        # Neuroglancer's linkedSegmentationColorGroup defaults to
+        # linkedSegmentationGroup when omitted, but an explicit false keeps colors local.
+        if layer.get("linkedSegmentationColorGroup") is False:
+            return layer
+        source_name = layer.get("linkedSegmentationColorGroup")
+        if source_name is None:
+            source_name = layer.get("linkedSegmentationGroup")
+        return layers.get(source_name, layer) if source_name else layer
+
+    return {name: _colors.from_layer_dict(color_source(layer))
+            for name, layer in layers.items()}
 
 
 def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = None,
@@ -165,11 +227,12 @@ def _scene_from_view(project: Project, st: dict | None = None):
         st = get_viewer().state.to_json()  # serialize the live viewer ONCE; reuse below
     cam = ng_to_camera(st, project.manifest.voxel_size_nm)
     em_name = project.manifest.em.name if project.manifest.em else "em"
-    layer_vis = {l.get("name"): l.get("visible", True) is not False
-                 for l in st.get("layers", [])}
+    layers = {l.get("name"): l for l in st.get("layers", [])}
+    layer_vis = {name: l.get("visible", True) is not False for name, l in layers.items()}
     # a "3d" layout shows no cross-section in neuroglancer, so bake no EM slice
     show_slice = layer_vis.get(em_name, True) and st.get("layout") != "3d"
-    slices = ([SlicePlane(em_name=em_name, axis="z", position_nm=cam.look_at_nm[2])]
+    slices = ([SlicePlane(em_name=em_name, axis="z", position_nm=cam.look_at_nm[2],
+                          contrast_limits=_image_contrast_from_layer(layers.get(em_name)))]
               if show_slice else [])
     prev = project.keyframes[-1].meshes if project.keyframes else None
     meshes = _meshes_from_visible(project, prev=prev, st=st)   # inherit material from last kf
@@ -364,13 +427,21 @@ def sync_segments(project: Project, keyframe_id: str) -> Keyframe | None:
     st = get_viewer().state.to_json()  # serialize once; reuse for meshes
     vis = current_layer_visibility(project)
     meshes = _meshes_from_visible(project, kf.meshes, st=st)
+    layers = {l.get("name"): l for l in st.get("layers", [])}
 
     # slice on/off follows the EM image layer; keep its axis/position
     em_name = project.manifest.em.name if project.manifest.em else "em"
     if kf.slices:
-        slices = [s.model_copy(update={"visible": vis.get(s.em_name, True)}) for s in kf.slices]
+        slices = [
+            s.model_copy(update={
+                "visible": vis.get(s.em_name, True),
+                "contrast_limits": _image_contrast_from_layer(layers.get(s.em_name)),
+            })
+            for s in kf.slices
+        ]
     elif vis.get(em_name, True):  # EM turned on but keyframe had no slice -> add one
-        slices = [SlicePlane(em_name=em_name, axis="z", position_nm=kf.camera.look_at_nm[2])]
+        slices = [SlicePlane(em_name=em_name, axis="z", position_nm=kf.camera.look_at_nm[2],
+                             contrast_limits=_image_contrast_from_layer(layers.get(em_name)))]
     else:
         slices = []
 
@@ -407,9 +478,14 @@ def _state_from_keyframe(project: Project, kf: Keyframe, base: dict) -> dict:
             layer["colorSeed"] = int(getattr(m, "color_seed", 0) or 0)
             if getattr(m, "default_color", None):
                 layer["segmentDefaultColor"] = _rgb_to_hex(m.default_color)
+            else:
+                layer.pop("segmentDefaultColor", None)
             if getattr(m, "segment_colors", None):
                 layer["segmentColors"] = {str(k): _rgb_to_hex(v)
                                           for k, v in m.segment_colors.items()}
+            else:
+                layer.pop("segmentColors", None)
+            layer["saturation"] = float(getattr(m, "saturation", 1.0))
             layer["objectAlpha"] = float(getattr(m, "object_alpha", 1.0))      # Opacity (3d)
             layer["meshSilhouetteRendering"] = float(getattr(m, "silhouette", 0.0))  # Silhouette (3d)
         elif em_name and name == em_name:                   # EM image layer

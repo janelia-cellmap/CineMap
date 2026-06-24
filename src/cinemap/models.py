@@ -64,6 +64,7 @@ class SlicePlane(BaseModel):
     # an oblique plane with that normal (the EM is resampled on the tilted plane).
     normal: Optional[list[float]] = None
     scale_level: Optional[int] = None  # None => auto-pick from on-screen extent
+    contrast_limits: Optional[list[float]] = None  # [black, white] intensity window
     opacity: float = 1.0
     visible: bool = True
 
@@ -93,7 +94,7 @@ class MeshInstance(BaseModel):
     color_seed: int = 0
     default_color: Optional[list[float]] = None
     segment_colors: dict[str, list[float]] = Field(default_factory=dict)
-    saturation: float = 1.0     # NG layer saturation (0 = grayscale meshes)
+    saturation: float = 1.0     # NG layer saturation (0 = white, 1 = full color)
     # neuroglancer 3D mesh render state (per keyframe -> can change frame to frame)
     object_alpha: float = 1.0   # NG "Opacity (3d)"  (objectAlpha)
     silhouette: float = 0.0     # NG "Silhouette (3d)" (meshSilhouetteRendering)
@@ -196,9 +197,9 @@ class RenderSettings(BaseModel):
     # representative of the voxel data as possible.
     label_mesh_smooth_iters: int = 0
     label_mesh_simplify_factor: float = 0.0
-    # Auto-direction: a non-destructive presentation pass (camera-relative key/fill/
-    # rim lighting, publication materials, subtle depth-of-field on the framed
-    # subject). On by default; off renders the plain neuroglancer-faithful scene.
+    # Auto-direction: optional cinematic smoothing/emphasis around the selected Look
+    # preset. On by default; if no Look preset is selected, off renders the plain
+    # neuroglancer-faithful scene.
     auto_direct: bool = True
     # Mesh LOD strategy:
     #   "single" — one LOD for the whole shot (built at the closest frame's scale).

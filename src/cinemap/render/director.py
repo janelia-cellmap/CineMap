@@ -12,8 +12,9 @@ fields, so the look is "professionally directed" without any manual input:
   - an inferred "hero" object per keyframe (focus/emphasis metadata; used more by
     later phases — appear/highlight emphasis, focus pulls, reveals)
 
-With auto-direct off, `plan()` is never called and the render is the plain,
-neuroglancer-faithful scene (every directive field is optional in the spec).
+The worker always calls `plan()` so the chosen Look preset is explicit in the
+scene spec. With no Look preset and auto-direct off, the worker requests the
+plain neuroglancer-faithful preset.
 """
 from __future__ import annotations
 
@@ -22,18 +23,18 @@ from dataclasses import asdict, dataclass, field
 
 @dataclass
 class MaterialProfile:
-    """Principled-BSDF tuning. Default is the neuVid-style beauty look: a glossy-ish
-    Principled (roughness ~0.25 + specular -> highlights) lit by the 3-point rig, which
-    gives real form-contrast (neuVid is Janelia's neuron-video tool; this mirrors its
-    material). Smooth-shaded. Paired with AgX so highlights roll off (no oversaturation)."""
-    roughness: float = 0.25      # glossy-ish (neuVid) -> specular highlights = pop/contrast
-    specular: float = 0.5        # specular highlights catch the 3-point lights
+    """Principled-BSDF tuning. Default is the neuVid neuron material: roughness 0.25,
+    specular 0.5, specular tint 0.75, and specular scaled by alpha."""
+    roughness: float = 0.25
+    specular: float = 0.5
+    specular_tint: float = 0.75
+    alpha_scaled_specular: bool = True
     metallic: float = 0.0        # 0 = dielectric (default); 1 = metal (shiny, tinted reflection)
     transmission: float = 0.0    # 0 = opaque; >0 = glassy/translucent
     subsurface: float = 0.0      # subsurface scattering — soft inner glow (jade/wax/skin)
     sheen: float = 0.0           # soft velvety edge sheen (waxy/velvet look)
     coat: float = 0.0            # clearcoat — a glossy lacquer layer (ceramic/car paint)
-    emission_strength: float = 0.02  # near-zero: shading comes from the lights, not self-glow
+    emission_strength: float = 0.0
     edge_glow: float = 0.0       # off — the rim glow washed out the faceting
     ao: float = 0.0              # neuVid uses no AO; the 3-point lighting carries the form
     ao_distance_nm: float = 2000  # AO reach (only used if ao > 0)
@@ -53,23 +54,36 @@ class MaterialProfile:
                                  # form-shading on the tubes (not faceted)
     ng_shader: bool = False      # faithful neuroglancer mesh shader (emission-only headlight,
                                  # abs(N·view)*0.8+0.2) instead of lit Principled. The "ng" look.
+    cast_shadows: bool = True
+    blend_method: str = "HASHED"      # neuVid uses Alpha Hashed/Dithered for normal meshes.
+    shadow_method: str = "HASHED"
+    show_transparent_back: bool | None = None
+    color_space: str = "linear"       # neuVid feeds Blender node colors directly.
+    transparent_max_bounces: int = 32 # neuVid default avoids black patches through alpha layers.
+    transparent_shadows: bool = True
 
 
 @dataclass
 class LightRig:
-    """Three-point rig, oriented relative to the camera each frame."""
-    # neuVid-style 3-point: a gray KEY (raking) + camera-front FILL + cool RIM. Colors
-    # follow neuVid (key neutral-gray, fill slightly cool, rim cool/blue) -> a subtle
-    # warm/cool studio dimension. With AgX the glossy highlights roll off (no clipping).
-    key_energy: float = 6.0      # SUN irradiance (W/m^2)
-    fill_ratio: float = 0.6      # camera-front fill (lifts the shadow side)
-    rim_ratio: float = 0.5       # rim separates silhouettes from the dark background
-    camera_relative: bool = True
-    ambient: float = 0.18        # modest ambient
-    key_color: tuple = (0.8, 0.8, 0.8)     # neutral gray key (neuVid)
-    fill_color: tuple = (0.5, 0.5, 0.6)    # slightly cool fill (neuVid)
-    rim_color: tuple = (0.8, 0.84, 1.0)    # cool/blue rim (neuVid)
+    """Lighting rig. ``neuvid`` matches neuVid's fixed three area lights; ``sun`` is the
+    old CineMap camera-relative presentation rig; ``none`` is for Neuroglancer shader mode."""
+    kind: str = "neuvid"
+    key_energy: float = 6.0      # SUN irradiance for the CineMap sun rig.
+    fill_ratio: float = 0.6
+    rim_ratio: float = 0.5
+    camera_relative: bool = False
+    ambient: float = 0.0         # neuVid disables world diffuse lighting.
+    # neuVid's Cycles branch defines colored lampSpecs but never assigns them to
+    # AREA light data; the default Cycles render therefore uses white lights.
+    key_color: tuple = (1.0, 1.0, 1.0)
+    fill_color: tuple = (1.0, 1.0, 1.0)
+    rim_color: tuple = (1.0, 1.0, 1.0)
     ambient_color: tuple = (1.0, 1.0, 1.0)
+    use_neuvid_power: bool = True
+    neuvid_power_scale: tuple = (1.0, 1.0, 1.0)
+    neuvid_size_scale: float = 1.0
+    neuvid_distance_scale: float = 1.0
+    neuvid_light_rotation: tuple = (0.0, 0.0, 0.0)
     # Optional 2nd back/edge light on the OPPOSITE side from the rim, in a contrasting
     # color -> cinematic two-tone edge separation (off by default; set kick_ratio > 0).
     kick_ratio: float = 0.0
@@ -78,7 +92,7 @@ class LightRig:
 
 @dataclass
 class DepthOfField:
-    enabled: bool = True
+    enabled: bool = False
     fstop: float = 4.0           # subtle; higher = less background blur
 
 
@@ -98,7 +112,7 @@ class Bloom:
     """Soft glow on bright/emissive areas (compositor) — bright structures bloom
     against the dark background, the 'publication glow'. Constant, so it works the
     same with one object or thousands (unlike a per-object flash)."""
-    enabled: bool = True
+    enabled: bool = False
     threshold: float = 0.6       # brightness above which it blooms
     size: int = 7                # blur radius (larger = softer/wider glow)
     mix: float = -0.55           # -1 image only … +1 glare only; small = subtle add
@@ -114,9 +128,8 @@ class DirectorSettings:
     smooth_camera: bool = False  # cinematic ease of the FIRST/LAST transition. Off by
                                  # default: neuroglancer's video_tool is pure linear, so
                                  # linear keeps our timing/motion exactly NG-faithful.
-    # AgX rolls the bright raking highlights off instead of clipping to neon. Plain AgX
-    # (no "Punchy") keeps the lighter, more even non-dramatic look closer to neuroglancer.
-    view_transform: str = "AgX"
+    # neuVid leaves Blender's default filmic color management in place unless overridden.
+    view_transform: str = ""
     view_look: str = ""
 
 
@@ -130,18 +143,29 @@ def make_settings(look: dict | None = None) -> "DirectorSettings":
     look = look or {}
     preset = (look.get("preset") or "").lower()
     m, lr = s.material, s.lighting
-    if preset == "ng":                       # faithful neuroglancer flat headlight shader
+    if preset in ("ng", "neuroglancer"):      # faithful neuroglancer flat headlight shader
         m.ng_shader = True; m.flat_shading = False; m.ao = 0.0
-        s.view_transform = "Standard"; s.view_look = ""
+        m.roughness = 1.0; m.specular = 0.0; m.specular_tint = 0.0
+        m.alpha_scaled_specular = False; m.cast_shadows = False
+        m.blend_method = "BLEND"; m.shadow_method = "NONE"
+        m.show_transparent_back = True
+        m.color_space = "display"     # NG shader colors are WebGL/display RGB values.
+        lr.kind = "none"; lr.ambient = 0.0; lr.camera_relative = False
+        s.dof.enabled = False; s.bloom.enabled = False
+        s.view_transform = "Raw"; s.view_look = ""
     elif preset == "rake":                    # raking key + camera fill, matte
         m.ng_shader = False; m.roughness = 0.55; m.specular = 0.15; m.ao = 0.6
+        m.alpha_scaled_specular = False; m.blend_method = "BLEND"; m.shadow_method = "HASHED"
         m.ao_distance_nm = 2000; m.flat_shading = True
+        lr.kind = "sun"; lr.camera_relative = True; lr.use_neuvid_power = False
         lr.key_energy = 7.5; lr.fill_ratio = 0.5; lr.rim_ratio = 0.5; lr.ambient = 0.18
         lr.key_color = lr.fill_color = lr.rim_color = lr.ambient_color = (1.0, 1.0, 1.0)
         s.view_transform = "AgX"; s.view_look = ""
     elif preset == "drama":                   # deep raking shadows + warm/cool + punchy
         m.ng_shader = False; m.roughness = 0.55; m.specular = 0.05; m.ao = 0.75
+        m.alpha_scaled_specular = False; m.blend_method = "BLEND"; m.shadow_method = "HASHED"
         m.ao_distance_nm = 1800; m.flat_shading = True
+        lr.kind = "sun"; lr.camera_relative = True; lr.use_neuvid_power = False
         lr.key_energy = 8.5; lr.fill_ratio = 0.3; lr.rim_ratio = 0.8; lr.ambient = 0.10
         lr.key_color = (1.0, 0.88, 0.72); lr.fill_color = (0.72, 0.82, 1.0)
         lr.rim_color = (0.78, 0.85, 1.0); lr.ambient_color = (0.85, 0.9, 1.0)
@@ -150,6 +174,7 @@ def make_settings(look: dict | None = None) -> "DirectorSettings":
     # explicit per-knob overrides on top of the preset
     if look.get("roughness") is not None: m.roughness = float(look["roughness"])
     if look.get("specular") is not None: m.specular = float(look["specular"])
+    if look.get("specular_tint") is not None: m.specular_tint = float(look["specular_tint"])
     if look.get("metallic") is not None: m.metallic = float(look["metallic"])
     if look.get("transmission") is not None: m.transmission = float(look["transmission"])
     if look.get("subsurface") is not None: m.subsurface = float(look["subsurface"])
@@ -160,6 +185,9 @@ def make_settings(look: dict | None = None) -> "DirectorSettings":
     if look.get("edge_glow") is not None: m.edge_glow = float(look["edge_glow"])
     if look.get("emission_strength") is not None: m.emission_strength = float(look["emission_strength"])
     if look.get("ng_shader") is not None: m.ng_shader = bool(look["ng_shader"])
+    if look.get("cast_shadows") is not None: m.cast_shadows = bool(look["cast_shadows"])
+    if look.get("light_kind"): lr.kind = str(look["light_kind"])
+    if look.get("ambient") is not None: lr.ambient = float(look["ambient"])
     if look.get("view_transform"): s.view_transform = look["view_transform"]
     if look.get("view_look") is not None: s.view_look = look["view_look"]
     return s

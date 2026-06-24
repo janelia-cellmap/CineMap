@@ -90,7 +90,7 @@ class FrameMesh:
     color_seed: int = 0
     default_color: list[float] | None = None
     segment_colors: dict = field(default_factory=dict)
-    saturation: float = 1.0     # NG layer saturation (0 = grayscale)
+    saturation: float = 1.0     # NG layer saturation (0 = white, 1 = full color)
     object_alpha: float = 1.0   # NG "Opacity (3d)"
     silhouette: float = 0.0     # NG "Silhouette (3d)"
     clip: dict | None = None    # cutaway plane {axis, position_nm, side} or None

@@ -25,6 +25,8 @@ _ROI_SCAN_VOXELS = 24_000_000
 _ROI_REFINE_MAX_VOXELS = 256_000_000
 _PLAN_EXACT_COUNT_MAX_VOXELS = 96_000_000
 _PLAN_MAX_READ_VOXELS = 512_000_000
+_PLAN_NEXT_LEVEL_VERTEX_FACTOR = 4.0
+_PLAN_NEXT_LEVEL_TOLERANCE = 1.10
 _ROI_REFINE_PAD_FRACTION = 0.50
 _ROI_FINAL_PAD_FRACTION = 0.15
 _ROI_EDGE_MARGIN_VOXELS = 2
@@ -61,6 +63,8 @@ class _ReadPlan:
     level: int
     stride: int
     bbox_xyz_nm: tuple[tuple[float, float, float], tuple[float, float, float]] | None
+    surface_faces_estimate: int | None = None
+    surface_budget: int | None = None
 
 
 def _shape_voxels(shape) -> int:
@@ -210,10 +214,14 @@ def _choose_plan(
 
     When `target_vertices` is supplied, do not cap the final label read by a
     separate voxel-count budget. The quality control is the expected mesh size;
-    memory failures are handled by retrying one pyramid level coarser.
+    memory failures are handled by retrying one pyramid level coarser. Surface
+    estimates are an advisory starting point; actual zmesh vertex counts decide
+    whether to refine to the next finer level.
     """
     chosen_level = len(vol.level_scale_nm) - 1
     chosen_voxels = _bbox_voxels_for_level(vol, bbox_xyz_nm, chosen_level)
+    chosen_surface_faces = None
+    surface_budget = None
 
     if target_vertices and seg_ids:
         ids = set(int(s) for s in seg_ids)
@@ -225,6 +233,7 @@ def _choose_plan(
             if surface_faces <= surface_budget:
                 chosen_level = level
                 chosen_voxels = voxels
+                chosen_surface_faces = surface_faces
                 break
         read_budget = chosen_voxels
     else:
@@ -237,7 +246,77 @@ def _choose_plan(
                 break
 
     stride = max(1, int(np.ceil((chosen_voxels / read_budget) ** (1 / 3))))
-    return _ReadPlan(level=chosen_level, stride=stride, bbox_xyz_nm=bbox_xyz_nm)
+    return _ReadPlan(
+        level=chosen_level,
+        stride=stride,
+        bbox_xyz_nm=bbox_xyz_nm,
+        surface_faces_estimate=chosen_surface_faces,
+        surface_budget=surface_budget,
+    )
+
+
+def _candidate_plans(
+    vol,
+    bbox_xyz_nm,
+    *,
+    target_voxels: int,
+    target_vertices: int | None,
+    seg_ids=None,
+) -> list[_ReadPlan]:
+    """Return candidate plans from a conservative level toward finer levels.
+
+    The surface estimate is only a guardrail to avoid obviously unreasonable
+    fine reads. The actual zmesh vertex count is checked after each candidate is
+    generated, and the refinement loop uses measured vertices at the current
+    scale to decide whether the next finer scale is worth trying.
+    """
+    if not (target_vertices and seg_ids):
+        return [
+            _choose_plan(
+                vol,
+                bbox_xyz_nm,
+                target_voxels=target_voxels,
+                target_vertices=target_vertices,
+                seg_ids=seg_ids,
+            )
+        ]
+
+    ids = set(int(s) for s in seg_ids)
+    surface_budget = max(1, int(target_vertices / _ZMESH_VERTEX_PER_SURFACE_FACE_ESTIMATE))
+    count_cache: dict[int, int] = {}
+    levels: list[int] = []
+    for level in range(len(vol.level_scale_nm)):
+        surface_faces = _estimate_surface_faces_for_level(vol, bbox_xyz_nm, level, ids, count_cache)
+        if surface_faces <= 0:
+            continue
+        if surface_faces <= surface_budget:
+            levels.append(level)
+    if levels:
+        finest_advisory = min(levels)
+        coarsest_level = len(vol.level_scale_nm) - 1
+        start = min(finest_advisory + 1, coarsest_level)
+        plans = []
+        for level in range(start, -1, -1):
+            surface_faces = _estimate_surface_faces_for_level(vol, bbox_xyz_nm, level, ids, count_cache)
+            plans.append(
+                _ReadPlan(
+                    level=level,
+                    stride=1,
+                    bbox_xyz_nm=bbox_xyz_nm,
+                    surface_faces_estimate=surface_faces,
+                    surface_budget=surface_budget,
+                )
+            )
+        return plans
+    return [
+        _choose_plan(
+            vol,
+            bbox_xyz_nm,
+            target_voxels=target_voxels,
+            target_vertices=target_vertices,
+            seg_ids=seg_ids,
+        )
+    ]
 
 
 def _coarsen_plan(vol, plan: _ReadPlan) -> _ReadPlan | None:
@@ -495,27 +574,40 @@ def generate_zmesh_auto(
     if bbox_xyz_nm is None:
         bbox_xyz_nm = _bbox_for_ids(label_zarr_url, seg_ids)
 
-    plan = _choose_plan(
+    plans = _candidate_plans(
         vol,
         bbox_xyz_nm,
         target_voxels=target_voxels,
         target_vertices=target_vertices,
         seg_ids=seg_ids,
     )
-    while True:
+    best_mesh: trimesh.Trimesh | None = None
+    best_plan: _ReadPlan | None = None
+    best_vertices = 0
+    best_faces = 0
+    last_error: BaseException | None = None
+
+    for plan in plans:
         try:
             arr, (z0, y0, x0), sc, tr = _read_plan_array(vol, plan, pad=3)
             print(
-                "[labels] zmesh plan "
+                "[labels] zmesh probe "
                 f"{_label_source_name(label_zarr_url)} ids={len(seg_ids)} "
                 f"level=s{plan.level} stride={plan.stride} "
                 f"scale_zyx_nm=({sc[0]:.3g},{sc[1]:.3g},{sc[2]:.3g}) "
-                f"target_vertices={target_vertices}",
+                f"target_vertices={target_vertices} "
+                f"surface_faces_estimate={plan.surface_faces_estimate} "
+                f"surface_budget={plan.surface_budget}",
                 flush=True,
             )
             keep = np.isin(arr, seg_ids)
             if not keep.any():
-                raise ValueError("none of the selected segments present in labels")
+                print(
+                    "[labels] zmesh probe empty; trying finer level "
+                    f"{_label_source_name(label_zarr_url)} level=s{plan.level}",
+                    flush=True,
+                )
+                continue
             labels = np.where(keep, arr, 0).astype(np.uint32, copy=False)
             labels = np.pad(labels, 1)
 
@@ -545,46 +637,149 @@ def generate_zmesh_auto(
                 if part is not None:
                     raw_parts.append(part)
             if not raw_parts:
-                raise ValueError("zmesh produced no geometry for the selected segments")
-            break
+                print(
+                    "[labels] zmesh probe produced no geometry; trying finer level "
+                    f"{_label_source_name(label_zarr_url)} level=s{plan.level}",
+                    flush=True,
+                )
+                continue
+
+            target_faces_total = None
+            if target_vertices and simplify_budget_factor > 0:
+                target_faces_total = max(
+                    1,
+                    int(target_vertices * _FACES_PER_VERTEX_BUDGET * float(simplify_budget_factor)),
+                )
+            total_faces = sum(len(p.faces) for p in raw_parts)
+
+            parts = []
+            for part in raw_parts:
+                part_target = None
+                if target_faces_total is not None and total_faces > target_faces_total:
+                    frac = len(part.faces) / max(1, total_faces)
+                    part_target = max(256, int(target_faces_total * frac))
+                parts.append(
+                    _postprocess_label_mesh(
+                        part,
+                        target_faces=part_target,
+                        smooth_iters=smooth_iters,
+                    )
+                )
+            parts = [p for p in parts if len(p.faces) and len(p.vertices)]
+            if not parts:
+                print(
+                    "[labels] zmesh probe empty after cleanup; trying finer level "
+                    f"{_label_source_name(label_zarr_url)} level=s{plan.level}",
+                    flush=True,
+                )
+                continue
+            mesh = trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+            mesh = _cleanup_mesh_lossless(mesh)
+            vertices = len(mesh.vertices)
+            faces = len(mesh.faces)
+            print(
+                "[labels] zmesh probe result "
+                f"{_label_source_name(label_zarr_url)} level=s{plan.level} "
+                f"vertices={vertices} faces={faces} target_vertices={target_vertices}",
+                flush=True,
+            )
+
+            if target_vertices:
+                accept_limit = int(np.floor(int(target_vertices) * _PLAN_NEXT_LEVEL_TOLERANCE))
+            else:
+                accept_limit = 0
+            if target_vertices and vertices > accept_limit:
+                if best_mesh is not None:
+                    print(
+                        "[labels] zmesh probe exceeded budget; using previous coarser level "
+                        f"{_label_source_name(label_zarr_url)} level=s{plan.level} "
+                        f"vertices={vertices} target_vertices={target_vertices} "
+                        f"accept_limit={accept_limit} "
+                        f"chosen=s{best_plan.level if best_plan else '?'} "
+                        f"chosen_vertices={best_vertices}",
+                        flush=True,
+                    )
+                    break
+                print(
+                    "[labels] zmesh coarsest probe exceeds budget; using it anyway "
+                    f"{_label_source_name(label_zarr_url)} level=s{plan.level} "
+                    f"vertices={vertices} target_vertices={target_vertices} "
+                    f"accept_limit={accept_limit}",
+                    flush=True,
+                )
+                best_mesh = mesh
+                best_plan = plan
+                best_vertices = vertices
+                best_faces = faces
+                break
+            if target_vertices and vertices > int(target_vertices):
+                print(
+                    "[labels] zmesh probe accepted within tolerance "
+                    f"{_label_source_name(label_zarr_url)} level=s{plan.level} "
+                    f"vertices={vertices} target_vertices={target_vertices} "
+                    f"accept_limit={accept_limit} "
+                    f"tolerance={_PLAN_NEXT_LEVEL_TOLERANCE:g}",
+                    flush=True,
+                )
+
+            best_mesh = mesh
+            best_plan = plan
+            best_vertices = vertices
+            best_faces = faces
+
+            if target_vertices:
+                next_prediction = int(np.ceil(vertices * _PLAN_NEXT_LEVEL_VERTEX_FACTOR))
+                next_limit = int(np.floor(int(target_vertices) * _PLAN_NEXT_LEVEL_TOLERANCE))
+                if next_prediction > next_limit:
+                    print(
+                        "[labels] zmesh next finer level predicted over budget; not trying finer level "
+                        f"{_label_source_name(label_zarr_url)} level=s{plan.level} "
+                        f"vertices={vertices} target_vertices={target_vertices} "
+                        f"next_level_prediction={next_prediction} "
+                        f"next_level_factor={_PLAN_NEXT_LEVEL_VERTEX_FACTOR:g} "
+                        f"tolerance={_PLAN_NEXT_LEVEL_TOLERANCE:g}",
+                        flush=True,
+                    )
+                    break
+                print(
+                    "[labels] zmesh next finer level predicted within budget; trying finer level "
+                    f"{_label_source_name(label_zarr_url)} level=s{plan.level} "
+                    f"vertices={vertices} target_vertices={target_vertices} "
+                    f"next_level_prediction={next_prediction} "
+                    f"next_level_factor={_PLAN_NEXT_LEVEL_VERTEX_FACTOR:g} "
+                    f"tolerance={_PLAN_NEXT_LEVEL_TOLERANCE:g}",
+                    flush=True,
+                )
         except Exception as e:  # noqa: BLE001
             if not _is_memory_error(e):
                 raise
-            next_plan = _coarsen_plan(vol, plan)
-            if next_plan is None:
-                raise
+            last_error = e
+            if best_mesh is not None:
+                print(
+                    "[labels] zmesh probe memory fallback; using previous coarser level "
+                    f"{_label_source_name(label_zarr_url)} level=s{plan.level} failed ({e}); "
+                    f"chosen=s{best_plan.level if best_plan else '?'} "
+                    f"chosen_vertices={best_vertices}",
+                    flush=True,
+                )
+                break
             print(
-                "[labels] label mesh memory fallback: "
+                "[labels] zmesh probe memory fallback: "
                 f"level={plan.level} stride={plan.stride} failed ({e}); "
-                f"retrying level={next_plan.level} stride={next_plan.stride}"
+                "trying next candidate"
             )
-            plan = next_plan
 
-    target_faces_total = None
-    if target_vertices and simplify_budget_factor > 0:
-        target_faces_total = max(
-            1,
-            int(target_vertices * _FACES_PER_VERTEX_BUDGET * float(simplify_budget_factor)),
-        )
-    total_faces = sum(len(p.faces) for p in raw_parts)
-
-    parts = []
-    for part in raw_parts:
-        part_target = None
-        if target_faces_total is not None and total_faces > target_faces_total:
-            frac = len(part.faces) / max(1, total_faces)
-            part_target = max(256, int(target_faces_total * frac))
-        parts.append(
-            _postprocess_label_mesh(
-                part,
-                target_faces=part_target,
-                smooth_iters=smooth_iters,
-            )
-        )
-    if not parts:
+    if best_mesh is None:
+        if last_error is not None:
+            raise last_error
         raise ValueError("zmesh produced no geometry for the selected segments")
-    mesh = trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
-    return _cleanup_mesh_lossless(mesh)
+    print(
+        "[labels] zmesh selected "
+        f"{_label_source_name(label_zarr_url)} level=s{best_plan.level if best_plan else '?'} "
+        f"vertices={best_vertices} faces={best_faces} target_vertices={target_vertices}",
+        flush=True,
+    )
+    return best_mesh
 
 
 def _vertex_colors(verts_world_zyx, normals, sc, tr, arr, colorize=None) -> np.ndarray:

@@ -19,10 +19,20 @@ from typing import Callable
 from ..config import NM_PER_BU, PROJECTS_DIR
 from ..models import Manifest, Project, RenderJob
 from ..data.mesh_loader import MeshLoader
+from ..data.mesh_loader import _FETCH_WORKERS
 from ..data.slice_loader import EMVolume, get_volume
 from .interpolate import FrameAnnotation, FrameState, build_frames, state_at_time
 
 Progress = Callable[[float, str], None]
+# Slice reads already use TensorStore internally, which can parallelize chunk IO and
+# decompression for a single read. Keep CineMap's outer slice-read fanout serial by
+# default so oblique slices do not stack multiple large NumPy grids/subvolumes in RAM.
+_SLICE_FETCH_WORKERS = int(os.environ.get("CINEMAP_SLICE_FETCH_WORKERS") or 1)
+_OBLIQUE_BATCH_MAX_BYTES = int(os.environ.get("CINEMAP_OBLIQUE_BATCH_MAX_BYTES") or 768_000_000)
+_OBLIQUE_BATCH_MAX_SLICES = int(os.environ.get("CINEMAP_OBLIQUE_BATCH_MAX_SLICES") or 32)
+_OBLIQUE_BATCH_MAX_OVERREAD = float(os.environ.get("CINEMAP_OBLIQUE_BATCH_MAX_OVERREAD") or 1.25)
+_OBLIQUE_TILE_THRESHOLD_BYTES = int(os.environ.get("CINEMAP_OBLIQUE_TILE_THRESHOLD_BYTES") or 512_000_000)
+_OBLIQUE_TILE_PX = int(os.environ.get("CINEMAP_OBLIQUE_TILE_PX") or 192)
 
 
 class RenderCancelled(Exception):
@@ -33,23 +43,147 @@ def _bu(p, nm_per_bu):
     return [c / nm_per_bu for c in p]
 
 
+def _contrast_key(limits) -> tuple[float, float] | None:
+    if not limits or len(limits) != 2:
+        return None
+    try:
+        lo, hi = float(limits[0]), float(limits[1])
+    except (TypeError, ValueError):
+        return None
+    if hi <= lo:
+        return None
+    return (round(lo, 6), round(hi, 6))
+
+
+def _apply_contrast_window(image, limits):
+    import numpy as np
+
+    arr = np.asarray(image, dtype=np.float64)
+    key = _contrast_key(limits)
+    if key is None:
+        return arr
+    lo, hi = key
+    # Neuroglancer shader controls are often normalized 0..1. The EM render path
+    # currently works with uint8 slices, so map normalized windows onto 0..255.
+    if hi <= 1.0 and np.nanmax(arr) > 1.0:
+        lo *= 255.0
+        hi *= 255.0
+    return (arr - lo) * (255.0 / (hi - lo))
+
+
+def _director_settings_for_render(project, auto_direct: bool):
+    """Resolve the render look for a scene spec.
+
+    `auto_direct` controls optional camera smoothing and per-frame emphasis. It
+    must not suppress an explicitly selected Look preset; otherwise the Blender
+    side falls back to legacy lights/materials and bypasses NG/neuVid matching.
+    """
+    from . import director
+
+    look = getattr(project, "look", None) or {}
+    if look:
+        return director.make_settings(look)
+    if auto_direct:
+        return director.make_settings(None)
+    return director.make_settings({"preset": "ng"})
+
+
+def _ng_quantize_decode_normals(normals):
+    """Match Neuroglancer's mesh normal path.
+
+    Neuroglancer computes float vertex normals, encodes them to 2x snorm8
+    octahedral coordinates in the worker, then decodes them in the WebGL shader.
+    Store the decoded values in Blender so the NG preset uses the same quantized
+    normals for its headlight contrast.
+    """
+    import numpy as np
+
+    n = np.ascontiguousarray(normals, dtype=np.float32)
+    if n.size == 0:
+        return n.reshape((-1, 3))
+    x, y, z = n[:, 0], n[:, 1], n[:, 2]
+    l1 = np.abs(x) + np.abs(y) + np.abs(z)
+    inv = np.zeros_like(l1, dtype=np.float32)
+    ok = l1 > 0
+    inv[ok] = 1.0 / l1[ok]
+
+    def sign_not_zero(a):
+        return np.where(a < 0, -1.0, 1.0).astype(np.float32)
+
+    ex = x * inv
+    ey = y * inv
+    neg_z = z < 0
+    ex = np.where(neg_z, (1.0 - np.abs(y * inv)) * sign_not_zero(x), ex)
+    ey = np.where(neg_z, (1.0 - np.abs(x * inv)) * sign_not_zero(y), ey)
+
+    def snorm8(a):
+        # Port Neuroglancer's `Math.min(Math.max(-127, x * 127 + 0.5), 127) >>> 0`.
+        q = np.minimum(np.maximum(-127.0, a * 127.0 + 0.5), 127.0)
+        q = np.nan_to_num(q, nan=0.0).astype(np.int64)
+        return (q & 0xFF).astype(np.uint8)
+
+    encoded = np.stack([snorm8(ex), snorm8(ey)], axis=1)
+
+    signed = encoded.astype(np.int16)
+    signed = np.where(signed >= 128, signed - 256, signed).astype(np.float32)
+    e = np.maximum(-1.0, signed / 127.0)
+    out = np.empty((len(n), 3), dtype=np.float32)
+    out[:, 0] = e[:, 0]
+    out[:, 1] = e[:, 1]
+    out[:, 2] = 1.0 - np.abs(e[:, 0]) - np.abs(e[:, 1])
+    folded = out[:, 2] < 0.0
+    if np.any(folded):
+        ox = out[folded, 0].copy()
+        oy = out[folded, 1].copy()
+        out[folded, 0] = (1.0 - np.abs(oy)) * sign_not_zero(ox)
+        out[folded, 1] = (1.0 - np.abs(ox)) * sign_not_zero(oy)
+    lens = np.linalg.norm(out, axis=1)
+    ok = lens > 0
+    out[ok] /= lens[ok, None]
+    out[~ok] = (0.0, 0.0, 1.0)
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
 def _export_mesh_npz(mesh, out: Path) -> None:
     """Write a trimesh-like object as a compact `.npz` (vertices float32, faces
-    int32, optional uint8 vertex colors). Blender loads this ~5–10× faster than
-    going through `bpy.ops.wm.ply_import` (which routes through the operator
-    system + undo stack)."""
+    int32, Neuroglancer-style vertex normals, and optional uint8 vertex colors).
+    Blender loads this ~5–10× faster than going through `bpy.ops.wm.ply_import`
+    (which routes through the operator system + undo stack)."""
     import numpy as np
 
     v = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
     f = np.ascontiguousarray(mesh.faces, dtype=np.int32)
     arrs: dict = {"v": v, "f": f}
+    if len(v) and len(f):
+        face_normals = np.cross(v[f[:, 1]] - v[f[:, 0]], v[f[:, 2]] - v[f[:, 1]])
+        lens = np.linalg.norm(face_normals, axis=1)
+        ok = lens > 0
+        face_normals[ok] /= lens[ok, None]
+        face_normals[~ok] = 0.0
+        normals = np.zeros_like(v, dtype=np.float32)
+        np.add.at(normals, f[:, 0], face_normals)
+        np.add.at(normals, f[:, 1], face_normals)
+        np.add.at(normals, f[:, 2], face_normals)
+        lens = np.linalg.norm(normals, axis=1)
+        ok = lens > 0
+        normals[ok] /= lens[ok, None]
+        arrs["n"] = _ng_quantize_decode_normals(normals)
     vc = None
     try:
         vc = mesh.visual.vertex_colors      # Nx4 uint8 (trimesh)
     except Exception:  # noqa: BLE001
         vc = None
     if vc is not None and len(vc) == len(v):
-        arrs["c"] = np.ascontiguousarray(vc, dtype=np.uint8)
+        vc = np.ascontiguousarray(vc, dtype=np.uint8)
+        # Trimesh attaches a uniform [102,102,102,255] visual by default even when
+        # geometry is intentionally uncolored. Do not bake that into the cache; Blender
+        # should use the explicit material color from the scene spec instead.
+        default_gray = (
+            len(vc) > 0
+            and np.all(vc == np.array([102, 102, 102, 255], dtype=np.uint8))
+        )
+        if not default_gray:
+            arrs["c"] = vc
     # raw save (no compression) — load speed in Blender matters more than disk
     np.savez(str(out), **arrs)
 
@@ -230,6 +364,7 @@ class RenderWorker:
             round(float(half)),
             self._em_target_px,
             None if target_nm_per_px is None else round(float(target_nm_per_px), 3),
+            _contrast_key(getattr(sl, "contrast_limits", None)),
             tuple((u, tuple(sorted(int(i) for i in ids)), lc.cache_key())
                   for u, ids, lc in seg_overlays),
         )
@@ -269,39 +404,26 @@ class RenderWorker:
         with self._slice_cache_lock:
             self._slice_cache[key] = out
 
-    def _slice_png(self, sl, region, seg_overlays, slice_seg=None,
-                   target_nm_per_px: float | None = None) -> dict:
-        """Render a cross-section of the slice's chosen layer. For an EM/image layer:
-        the grayscale EM with `seg_overlays` [(label_zarr, ids, lc), …] colored on top
-        (like neuroglancer). For a SEGMENTATION layer (resolved via _vol_for): the
-        layer's labels rendered in color directly (`slice_seg=(ids, lc)`). Cached per
-        (slice, region, overlay)."""
+    def _slice_png_from_result(
+        self,
+        sl,
+        region,
+        seg_overlays,
+        slice_seg,
+        target_nm_per_px: float | None,
+        axis: str,
+        position_nm: float,
+        normal,
+        zurl: str | None,
+        is_label: bool,
+        key: tuple,
+        path: Path,
+        meta_path: Path,
+        res,
+    ) -> dict:
+        """Write a SliceResult to the exact PNG/meta cache entry _slice_png uses."""
         import numpy as np
         from PIL import Image
-
-        center, half = region
-        axis, position_nm, normal = self._slice_read_plane(sl)
-        zurl, is_label = self._vol_for(sl.em_name)
-        key = self._slice_cache_key(sl, region, seg_overlays, slice_seg=slice_seg,
-                                    target_nm_per_px=target_nm_per_px)
-        path, meta_path = self._slice_cache_paths(key, axis)
-        cached = self._slice_cache_get(key, path, meta_path)
-        if cached is not None:
-            return cached
-
-        vol = self._label_vol(zurl) if (is_label and zurl) else self._em_vol()
-        if normal:   # oblique plane: resample the tilted plane through the projected focus
-            n = np.asarray(normal, float); n = n / (np.linalg.norm(n) or 1.0)
-            c = np.asarray(center, float)
-            cproj = c + (position_nm - float(np.dot(c, n))) * n
-            target_px = self._em_target_px
-            if target_nm_per_px:
-                target_px = min(target_px, max(8, int(round(2 * half / target_nm_per_px))))
-            res = vol.read_oblique_slice(normal, cproj, half, target_px=target_px)
-        else:
-            res = vol.read_slice(axis, position_nm, level=sl.scale_level,
-                                 target_px=self._em_target_px, region=region,
-                                 target_nm_per_px=target_nm_per_px, raw=is_label)
 
         if is_label:   # segmentation layer: color the labels directly (no EM grayscale)
             lab = np.asarray(res.image)
@@ -320,7 +442,8 @@ class RenderWorker:
             self._slice_cache_put(key, out, meta_path)
             return out
 
-        rgb = np.repeat(res.image[:, :, None].astype(np.float64), 3, axis=2)  # grayscale EM
+        rgb = np.repeat(_apply_contrast_window(res.image, getattr(sl, "contrast_limits", None))[:, :, None],
+                        3, axis=2)  # grayscale EM
         H, W = rgb.shape[:2]
 
         for label_zarr, ids, lc in ([] if normal else seg_overlays):  # seg overlay: axis-aligned only
@@ -355,14 +478,260 @@ class RenderWorker:
         self._slice_cache_put(key, out, meta_path)
         return out
 
+    def _slice_png(self, sl, region, seg_overlays, slice_seg=None,
+                   target_nm_per_px: float | None = None) -> dict:
+        """Render a cross-section of the slice's chosen layer. For an EM/image layer:
+        the grayscale EM with `seg_overlays` [(label_zarr, ids, lc), …] colored on top
+        (like neuroglancer). For a SEGMENTATION layer (resolved via _vol_for): the
+        layer's labels rendered in color directly (`slice_seg=(ids, lc)`). Cached per
+        (slice, region, overlay)."""
+        import numpy as np
+
+        center, half = region
+        axis, position_nm, normal = self._slice_read_plane(sl)
+        zurl, is_label = self._vol_for(sl.em_name)
+        key = self._slice_cache_key(sl, region, seg_overlays, slice_seg=slice_seg,
+                                    target_nm_per_px=target_nm_per_px)
+        path, meta_path = self._slice_cache_paths(key, axis)
+        cached = self._slice_cache_get(key, path, meta_path)
+        if cached is not None:
+            return cached
+
+        vol = self._label_vol(zurl) if (is_label and zurl) else self._em_vol()
+        if normal:   # oblique plane: resample the tilted plane through the projected focus
+            n = np.asarray(normal, float); n = n / (np.linalg.norm(n) or 1.0)
+            c = np.asarray(center, float)
+            cproj = c + (position_nm - float(np.dot(c, n))) * n
+            target_px = self._em_target_px
+            if target_nm_per_px:
+                target_px = min(target_px, max(8, int(round(2 * half / target_nm_per_px))))
+            res = vol.read_oblique_slice(
+                normal,
+                cproj,
+                half,
+                target_px=target_px,
+                target_nm_per_px=target_nm_per_px,
+            )
+        else:
+            res = vol.read_slice(axis, position_nm, level=sl.scale_level,
+                                 target_px=self._em_target_px, region=region,
+                                 target_nm_per_px=target_nm_per_px, raw=is_label)
+        return self._slice_png_from_result(
+            sl,
+            region,
+            seg_overlays,
+            slice_seg,
+            target_nm_per_px,
+            axis,
+            position_nm,
+            normal,
+            zurl,
+            is_label,
+            key,
+            path,
+            meta_path,
+            res,
+        )
+
+    def _oblique_warm_context(self, job) -> dict | None:
+        """Prepared batch context for an oblique EM slice warm job, or None fallback."""
+        import numpy as np
+
+        sl, region, seg_overlays, slice_seg, target_nm_per_px = job
+        center, half = region
+        axis, position_nm, normal = self._slice_read_plane(sl)
+        if not normal:
+            return None
+        zurl, is_label = self._vol_for(sl.em_name)
+        if is_label or not zurl:
+            return None
+        key = self._slice_cache_key(sl, region, seg_overlays, slice_seg=slice_seg,
+                                    target_nm_per_px=target_nm_per_px)
+        path, meta_path = self._slice_cache_paths(key, axis)
+        cached = self._slice_cache_get(key, path, meta_path)
+        if cached is not None:
+            return {"cached": True, "job": job}
+
+        n = np.asarray(normal, float)
+        n = n / (np.linalg.norm(n) or 1.0)
+        c = np.asarray(center, float)
+        cproj = c + (position_nm - float(np.dot(c, n))) * n
+        target_px = self._em_target_px
+        if target_nm_per_px:
+            target_px = min(target_px, max(8, int(round(2 * half / target_nm_per_px))))
+        vol = get_volume(zurl)
+        spec = vol.oblique_slice_spec(
+            normal,
+            cproj,
+            half,
+            target_px=target_px,
+            target_nm_per_px=target_nm_per_px,
+        )
+        single_bytes = vol.estimate_box_bytes(spec.bbox_xyz_nm, spec.level)
+        return {
+            "cached": False,
+            "job": job,
+            "sl": sl,
+            "region": region,
+            "seg_overlays": seg_overlays,
+            "slice_seg": slice_seg,
+            "target_nm_per_px": target_nm_per_px,
+            "axis": axis,
+            "position_nm": position_nm,
+            "normal": normal,
+            "zurl": zurl,
+            "is_label": is_label,
+            "key": key,
+            "path": path,
+            "meta_path": meta_path,
+            "vol": vol,
+            "spec": spec,
+            "single_bytes": single_bytes,
+        }
+
+    def _warm_oblique_batches(self, warm_jobs, mark_done) -> list:
+        """Fill cache for compatible oblique EM jobs; return jobs needing fallback."""
+        fallback = []
+        groups: dict[tuple, list[dict]] = {}
+        for job in warm_jobs:
+            if self.cancel.is_set():
+                fallback.append(job)
+                continue
+            try:
+                ctx = self._oblique_warm_context(job)
+            except Exception:  # noqa: BLE001
+                ctx = None
+            if ctx is None:
+                fallback.append(job)
+                continue
+            if ctx.get("cached"):
+                mark_done()
+                continue
+            spec = ctx["spec"]
+            group_key = (
+                ctx["zurl"],
+                int(spec.level),
+                tuple(round(float(x), 6) for x in spec.n_xyz),
+            )
+            groups.setdefault(group_key, []).append(ctx)
+
+        def flush_batch(items: list[dict]) -> None:
+            if not items:
+                return
+            if self.cancel.is_set():
+                fallback.extend(ctx["job"] for ctx in items)
+                return
+            vol = items[0]["vol"]
+            specs = [ctx["spec"] for ctx in items]
+            try:
+                bbox = vol.union_bbox(specs)
+                level = int(specs[0].level)
+                est_bytes = vol.estimate_box_bytes(bbox, level)
+                if est_bytes > _OBLIQUE_TILE_THRESHOLD_BYTES:
+                    print(
+                        f"[worker] oblique batch tiled n={len(specs)} level={level} "
+                        f"tile_px={_OBLIQUE_TILE_PX} full_bbox_est={est_bytes / 1e9:.2f}GB",
+                        flush=True,
+                    )
+                    results = vol.read_oblique_specs_tiled(specs, tile_px=_OBLIQUE_TILE_PX)
+                else:
+                    print(
+                        f"[worker] oblique batch full n={len(specs)} level={level} "
+                        f"bbox_est={est_bytes / 1e9:.2f}GB",
+                        flush=True,
+                    )
+                    results = vol.read_oblique_specs(specs)
+                for ctx, res in zip(items, results):
+                    self._slice_png_from_result(
+                        ctx["sl"],
+                        ctx["region"],
+                        ctx["seg_overlays"],
+                        ctx["slice_seg"],
+                        ctx["target_nm_per_px"],
+                        ctx["axis"],
+                        ctx["position_nm"],
+                        ctx["normal"],
+                        ctx["zurl"],
+                        ctx["is_label"],
+                        ctx["key"],
+                        ctx["path"],
+                        ctx["meta_path"],
+                        res,
+                    )
+                    mark_done()
+            except Exception:  # noqa: BLE001
+                fallback.extend(ctx["job"] for ctx in items)
+
+        for items in groups.values():
+            cur: list[dict] = []
+            for ctx in items:
+                candidate = cur + [ctx]
+                too_many = len(candidate) > max(1, _OBLIQUE_BATCH_MAX_SLICES)
+                too_big = False
+                too_sparse = False
+                estimate_failed = False
+                if not too_many:
+                    specs = [x["spec"] for x in candidate]
+                    vol = ctx["vol"]
+                    try:
+                        bbox = vol.union_bbox(specs)
+                        level = int(specs[0].level)
+                        union_bytes = vol.estimate_box_bytes(bbox, level)
+                        single_bytes = sum(max(1, int(x.get("single_bytes", 1))) for x in candidate)
+                        largest_single = max(max(1, int(x.get("single_bytes", 1))) for x in candidate)
+                        byte_cap = max(
+                            _OBLIQUE_BATCH_MAX_BYTES,
+                            int(largest_single * _OBLIQUE_BATCH_MAX_OVERREAD),
+                        )
+                        too_big = union_bytes > byte_cap
+                        too_sparse = (
+                            len(candidate) > 1
+                            and union_bytes > single_bytes * _OBLIQUE_BATCH_MAX_OVERREAD
+                        )
+                    except Exception:  # noqa: BLE001
+                        too_big = True
+                        estimate_failed = True
+                if cur and (too_many or too_big or too_sparse):
+                    flush_batch(cur)
+                    single_too_big = False
+                    try:
+                        bbox = ctx["vol"].union_bbox([ctx["spec"]])
+                        level = int(ctx["spec"].level)
+                        single_too_big = (
+                            ctx["vol"].estimate_box_bytes(bbox, level)
+                            > max(
+                                _OBLIQUE_BATCH_MAX_BYTES,
+                                int(max(1, int(ctx.get("single_bytes", 1))) * _OBLIQUE_BATCH_MAX_OVERREAD),
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        single_too_big = True
+                    if single_too_big:
+                        fallback.append(ctx["job"])
+                        cur = []
+                    else:
+                        cur = [ctx]
+                    continue
+                if not cur and (too_big or estimate_failed):
+                    fallback.append(ctx["job"])
+                    continue
+                cur = candidate
+            flush_batch(cur)
+        return fallback
+
     def _lod_tag_for(self, nmpp) -> str:
         """Cache-key component for a mesh built at on-screen scale `nmpp` (nm/px):
         re-framing, draft, source, budget, or a different LOD bucket each rebuild."""
         source_tag = (
-            f"lab-zmesh-clean-v5-s{self._label_smooth_iters}-q{self._label_simplify_factor:.3g}"
+            f"lab-zmesh-clean-v11-s{self._label_smooth_iters}-q{self._label_simplify_factor:.3g}"
             if self._prefer_labels else "pre"
         )
         quality_tag = "draft" if self._draft else "full"
+        if self._prefer_labels:
+            # Label-derived meshes are selected by the per-layer vertex budget.
+            # Camera nm/px buckets are useful for precomputed NG LODs, but they
+            # only create redundant zmesh base assets for the same IDs/budget.
+            return f"{quality_tag}|{source_tag}|b{self._mesh_budget}|label-budget"
         return (
             f"npp{nmpp:.3g}|{quality_tag}|{source_tag}|b{self._mesh_budget}"
             if nmpp
@@ -392,15 +761,21 @@ class RenderWorker:
         return [band_finest[b] for b in bands]
 
     def _mesh_uid(self, mesh_name, ids, color_key=(), nmpp=None) -> str:
-        """Stable id per (layer, exact segment set, coloring, LOD scale) so a
-        different segment set, color, OR on-screen resolution becomes a distinct
-        cached asset."""
+        """Stable id per geometry asset.
+
+        Geometry normally depends on the layer, exact segment set, and chosen LOD scale.
+        Color/material are per-frame Blender state for fixed-color layers.  For NG
+        hash-colored multi-ID layers, however, the combined mesh needs baked per-segment
+        vertex colors, so the color resolver key is part of the geometry cache key.
+        """
         import hashlib
 
-        # `decode2` versions the mesh decoder: bump it to invalidate combined-layer assets
-        # cached from an older (buggy) decode so a re-render can't reuse stale geometry.
-        sig = (",".join(map(str, sorted(ids))) + "|" + str(color_key) + "|"
-               + self._lod_tag_for(nmpp) + "|decode4")
+        # `geom8` versions the mesh decoder/cache key: this generation stores
+        # Neuroglancer's octahedral-quantized/decoded vertex normals alongside base
+        # geometry without baked colors for fixed-color layers, but keeps a color-keyed
+        # variant when NG hash coloring must be baked per segment.
+        color_sig = str(color_key) if color_key else "solid"
+        sig = ",".join(map(str, sorted(ids))) + "|" + color_sig + "|" + self._lod_tag_for(nmpp) + "|geom8"
         return f"{mesh_name}_{hashlib.md5(sig.encode()).hexdigest()[:8]}"
 
     def _clip_from_sweeps(self, layer_name: str, t: float) -> dict | None:
@@ -459,13 +834,41 @@ class RenderWorker:
         )
 
     @staticmethod
+    def _mesh_material_color(m, lc) -> list[float]:
+        """Representative NG color for geometry cached without vertex colors.
+
+        Base geometry is intentionally independent of color/material.  For those
+        uncolored geometry assets, the Blender material should still come from the
+        neuroglancer color resolver rather than MeshInstance.color, which is a generic
+        fallback and is not necessarily the layer's NG color.
+        """
+        if getattr(lc, "default", None) is not None:
+            return list(lc.rgb(0))
+        ids = list(getattr(m, "segment_ids", None) or [])
+        if len(ids) == 1:
+            return list(lc.rgb(int(ids[0])))
+        return list(getattr(m, "color", None) or [0.91, 0.45, 0.23])
+
+    @staticmethod
+    def _mesh_needs_vertex_colors(m, lc) -> bool:
+        """True when one combined mesh must carry different colors per segment."""
+        ids = list(getattr(m, "segment_ids", None) or [])
+        if len(ids) <= 1:
+            return False
+        if getattr(lc, "default", None) is not None:
+            return False
+        return True
+
+    @staticmethod
     def _layer_visible(m) -> bool:
         return bool(getattr(m, "visible", True)) and float(getattr(m, "opacity", 1.0)) > 0.001
 
     def _mesh_render_alpha(self, m) -> float:
         if not self._layer_visible(m) or not getattr(m, "render_3d", True):
             return 0.0
-        return float(getattr(m, "opacity", 1.0)) * float(getattr(m, "object_alpha", 1.0))
+        layer_opacity = max(0.0, min(1.0, float(getattr(m, "opacity", 1.0))))
+        object_alpha = max(0.0, min(1.0, float(getattr(m, "object_alpha", 1.0))))
+        return layer_opacity * object_alpha
 
     # --- slice-read derivation (shared by the parallel warm pass and the build loop, so
     # the two can never drift) -------------------------------------------------------
@@ -512,10 +915,24 @@ class RenderWorker:
         Timeline plane-scan sweeps are EM-only unless the sweep explicitly targets a
         segmentation layer; otherwise an EM scan unexpectedly drags every visible label
         source through the slice cache and paints labels onto the scan.
+
+        A timeline sweep is an animation clip for a plane slot.  If it is active for the
+        same EM/axis slot as a keyframe slice, it replaces the keyframe slice for that
+        frame; otherwise the static keyframe plane hangs around as a second EM image while
+        the sweep passes through it.
         """
         out = []
-        slice_items = [(sl, True, None) for sl in list(fr.slices)]
-        slice_items.extend((sl, False, overlay_layers) for sl, overlay_layers in self._slices_from_sweeps(t_global))
+        keyframe_items = [(sl, True, None) for sl in list(fr.slices)]
+        sweep_items = [
+            (sl, False, overlay_layers)
+            for sl, overlay_layers in self._slices_from_sweeps(t_global)
+        ]
+        sweep_slots = {(sl.em_name, sl.axis) for sl, _, _ in sweep_items}
+        slice_items = [
+            item for item in keyframe_items
+            if (item[0].em_name, item[0].axis) not in sweep_slots
+        ]
+        slice_items.extend(sweep_items)
         for sl, allow_seg_overlays, overlay_layers in slice_items:
             if not getattr(sl, "visible", True):
                 continue
@@ -553,14 +970,15 @@ class RenderWorker:
         img.save(tmp, format="PNG")
         os.replace(tmp, path)
 
-    def _mesh_obj(self, mesh_name, segment_ids, lc, nmpp=None) -> str | None:
+    def _mesh_obj(self, mesh_name, segment_ids, lc, nmpp=None, colorize_segments: bool = False) -> str | None:
         src = next((m for m in self.manifest.meshes if m.name == mesh_name), None)
         if not src:
             return None
         ids = segment_ids or src.segment_ids
         if not ids:
             return None
-        uid = self._mesh_uid(mesh_name, ids, lc.cache_key(), nmpp)
+        color_key = lc.cache_key() if colorize_segments else ()
+        uid = self._mesh_uid(mesh_name, ids, color_key=color_key, nmpp=nmpp)
         # `.npz` (verts + faces + optional vertex colors) instead of `.ply`: Blender's
         # `bpy.ops.wm.ply_import` routes through the operator/undo system and is the
         # dominant cost of cold-starting a render; a numpy → `foreach_set` load is
@@ -578,7 +996,7 @@ class RenderWorker:
             else:
                 combined = MeshLoader(src.mesh_url, src.label_zarr,
                                       cache_dir=self._mesh_cache_dir).load_many(
-                    ids, colorize=lc.rgb,
+                    ids, colorize=lc.rgb if colorize_segments else None,
                     target_voxels_single=self._mesh_voxels_single,
                     target_voxels_union=self._mesh_voxels_union,
                     nm_per_px=nmpp, draft=self._draft,
@@ -702,7 +1120,7 @@ class RenderWorker:
         becomes a distinct asset."""
         import hashlib
 
-        sig = json.dumps([an.name, an.color, an.points, an.lines, an.boxes, an.ellipsoids,
+        sig = json.dumps(["ann-v2", an.name, an.color, an.points, an.lines, an.boxes, an.ellipsoids,
                           an.point_radius_nm, an.line_radius_nm], sort_keys=True)
         return f"ann_{hashlib.md5(sig.encode()).hexdigest()[:10]}"
 
@@ -871,7 +1289,8 @@ class RenderWorker:
                     continue
                 ld, seg_ids = layers[m.mesh_name]
                 lc = self._frame_colors(m)
-                ckey = str(lc.cache_key())
+                colorize_segments = self._mesh_needs_vertex_colors(m, lc)
+                ckey = str(lc.cache_key()) if colorize_segments else "solid"
                 fov = _m.radians(fr.fov_deg)
                 # select per-fragment LODs; raise tolerance until the frame fits budget
                 tol = 1.0
@@ -898,8 +1317,8 @@ class RenderWorker:
                 uid = f"{m.mesh_name}_{hashlib.md5((ckey + '|' + str(sig) + '|frag4').encode()).hexdigest()[:10]}"
                 per[m.mesh_name] = uid
                 if uid not in mesh_specs:
-                    def _one(s, _ld=ld, _lc=lc, _sel=seg_sel):
-                        return _ld.get_fragments(s, _sel[s], colorize=_lc.rgb)
+                    def _one(s, _ld=ld, _lc=lc, _sel=seg_sel, _colorize=colorize_segments):
+                        return _ld.get_fragments(s, _sel[s], colorize=_lc.rgb if _colorize else None)
 
                     with ThreadPoolExecutor(max_workers=min(_FETCH_WORKERS, len(seg_sel))) as ex:
                         parts = [p for p in ex.map(_one, list(seg_sel)) if p is not None]
@@ -910,7 +1329,11 @@ class RenderWorker:
                     out = self.assets_dir / f"mesh_{uid}.npz"
                     os.makedirs(out.parent, exist_ok=True)
                     _export_mesh_npz(combined, out)
-                    mesh_specs[uid] = {"id": uid, "obj_path": str(out), "color": m.color}
+                    mesh_specs[uid] = {
+                        "id": uid,
+                        "obj_path": str(out),
+                        "color": self._mesh_material_color(m, lc),
+                    }
             frame_layer_uid.append(per)
             self._progress(0.1 + 0.35 * (fi + 1) / len(frames),
                            f"chunk assets {fi + 1}/{len(frames)} ({len(mesh_specs)} built)")
@@ -971,11 +1394,20 @@ class RenderWorker:
                         continue
                     nmpp = _eff_nmpp(m.mesh_name, fi)
                     lc = self._frame_colors(m)
-                    uid = self._mesh_uid(m.mesh_name, m.segment_ids, lc.cache_key(), nmpp)
+                    colorize_segments = self._mesh_needs_vertex_colors(m, lc)
+                    color_key = lc.cache_key() if colorize_segments else ()
+                    uid = self._mesh_uid(m.mesh_name, m.segment_ids, color_key=color_key, nmpp=nmpp)
                     if uid not in mesh_specs:
-                        obj = self._mesh_obj(m.mesh_name, m.segment_ids, lc, nmpp)
+                        obj = self._mesh_obj(
+                            m.mesh_name, m.segment_ids, lc, nmpp,
+                            colorize_segments=colorize_segments,
+                        )
                         if obj:
-                            mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": m.color}
+                            mesh_specs[uid] = {
+                                "id": uid,
+                                "obj_path": obj,
+                                "color": self._mesh_material_color(m, lc),
+                            }
             # annotation layers -> geometry assets via the same import path
             for an in fr.annotations:
                 uid = self._ann_uid(an)
@@ -993,15 +1425,12 @@ class RenderWorker:
             from . import director
             emph_track = director.emphasis_track(getattr(self, "_kfs", self.project.keyframes),
                                                  self.job.settings.fps)
-        # Warm the slice-image cache in PARALLEL before the (serial) build loop. Slice
-        # reads are network-bound (zarr chunks over HTTP) and frames sweep through heavily
-        # overlapping regions, so fetching them one-at-a-time was the dominant pre-render
-        # cost (~50s per cold slice, ~40min total on big shots). Fan the reads out across
-        # threads (tensorstore releases the GIL during IO); the shared cache pool in
-        # slice_loader dedups the overlapping chunks. _slice_png memoizes into
-        # self._slice_cache, so the build loop below becomes pure-CPU cache hits.
+        # Warm the slice-image cache before the frame-spec build loop. TensorStore handles
+        # chunk-level IO/decompression concurrency inside each read; keep CineMap's outer
+        # slice-read fanout low so oblique slices do not stack large temporary subvolumes.
+        # _slice_png memoizes into self._slice_cache, so the build loop below becomes
+        # pure-CPU cache hits.
         from concurrent.futures import ThreadPoolExecutor
-        from ..data.mesh_loader import _FETCH_WORKERS
         warm_jobs = []
         warm_seen: set[tuple] = set()
         for fi, fr in enumerate(frames):
@@ -1032,13 +1461,24 @@ class RenderWorker:
 
         if warm_jobs and not self.cancel.is_set():
             self._progress(0.45, f"fetching {len(warm_jobs)} unique slice images")
-            with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
-                done = 0
-                for _ in ex.map(_warm, warm_jobs):
-                    done += 1
-                    if done % 8 == 0:
-                        self._progress(0.45 + 0.10 * done / len(warm_jobs),
-                                       f"fetching slice images {done}/{len(warm_jobs)}")
+            done = 0
+
+            def _mark_done():
+                nonlocal done
+                done += 1
+                if done % 8 == 0 or done == len(warm_jobs):
+                    self._progress(0.45 + 0.10 * done / len(warm_jobs),
+                                   f"fetching slice images {done}/{len(warm_jobs)}")
+
+            fallback_jobs = self._warm_oblique_batches(warm_jobs, _mark_done)
+            if fallback_jobs and not self.cancel.is_set():
+                workers = min(_SLICE_FETCH_WORKERS, len(fallback_jobs))
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    for _ in ex.map(_warm, fallback_jobs):
+                        _mark_done()
+            elif done < len(warm_jobs):
+                self._progress(0.45 + 0.10 * done / len(warm_jobs),
+                               f"fetching slice images {done}/{len(warm_jobs)}")
 
         frame_specs = []
         for fi, fr in enumerate(frames):
@@ -1076,12 +1516,18 @@ class RenderWorker:
                                "slot": f"{sl.em_name}:{sl.axis}"})
             overrides = {}
             for m in fr.meshes:
+                lc = self._frame_colors(m)
                 if frame_layer_uid is not None:           # chunk mode: per-frame selection
                     uid = frame_layer_uid[fi].get(m.mesh_name)
                 else:
-                    uid = self._mesh_uid(m.mesh_name, m.segment_ids,
-                                         self._frame_colors(m).cache_key(), _eff_nmpp(m.mesh_name, fi))
+                    colorize_segments = self._mesh_needs_vertex_colors(m, lc)
+                    color_key = lc.cache_key() if colorize_segments else ()
+                    uid = self._mesh_uid(
+                        m.mesh_name, m.segment_ids, color_key=color_key,
+                        nmpp=_eff_nmpp(m.mesh_name, fi),
+                    )
                 if uid and uid in mesh_specs:
+                    material_color = self._mesh_material_color(m, lc)
                     # effective 3D alpha = layer visibility * cinematic fade * NG "Opacity (3d)"
                     eff = self._mesh_render_alpha(m)
                     is_hero = (m.mesh_name == emph_hero)
@@ -1091,6 +1537,7 @@ class RenderWorker:
                         "opacity": eff,
                         "visible": eff > 0.001,
                         "silhouette": getattr(m, "silhouette", 0.0),
+                        "color": material_color,
                     }
                     if getattr(m, "metallic", None) is not None:    # per-frame material override
                         ov["metallic"] = m.metallic
@@ -1109,25 +1556,25 @@ class RenderWorker:
                             fast = self._fast_cutaway_assets(
                                 mesh_name=m.mesh_name,
                                 segment_ids=m.segment_ids,
-                                lc=self._frame_colors(m),
+                                lc=lc,
                                 base_uid=uid,
                                 base_path=mesh_specs[uid]["obj_path"],
                                 clip=cl,
-                                color=m.color,
+                                color=material_color,
                             )
                         if fast:
                             cut_uid, cap_uid = fast
                             mesh_specs[cut_uid] = {
                                 "id": cut_uid,
                                 "obj_path": str(self.assets_dir / f"mesh_{cut_uid}.npz"),
-                                "color": m.color,
+                                "color": material_color,
                                 "clip": False,
                                 "clip_cap": False,
                             }
                             mesh_specs[cap_uid] = {
                                 "id": cap_uid,
                                 "obj_path": str(self.assets_dir / f"mesh_{cap_uid}.npz"),
-                                "color": m.color,
+                                "color": material_color,
                                 "clip": False,
                                 "clip_cap": False,
                             }
@@ -1177,17 +1624,18 @@ class RenderWorker:
             "fps": self.job.settings.fps,
             "export_blend": str(self.blend_path) if self.job.settings.export_blend else None,
         }
-        if self._auto_direct:
-            # Non-destructive presentation directives (optional fields; absent => the
-            # plain neuroglancer-faithful look). DOF focuses on the framed subject —
-            # the camera's look-at, which is exactly what neuroglancer centered on.
-            from . import director
-            plan = director.plan(self.project.keyframes,
-                                 director.make_settings(getattr(self.project, "look", None)))
-            spec["direction"] = plan
-            if plan["dof"]["enabled"]:
-                for fr in spec["frames"]:
-                    fr["camera"]["dof"] = {"fstop": plan["dof"]["fstop"]}
+        # Material/light/view directives are always present. `auto_direct` only
+        # controls optional smoothing and emphasis; selected Look presets must still
+        # drive the Blender scene when those cinematic behaviors are disabled.
+        from . import director
+        plan = director.plan(
+            self.project.keyframes,
+            _director_settings_for_render(self.project, self._auto_direct),
+        )
+        spec["direction"] = plan
+        if plan["dof"]["enabled"]:
+            for fr in spec["frames"]:
+                fr["camera"]["dof"] = {"fstop": plan["dof"]["fstop"]}
         # Warm-scene cache: full-quality renders reuse a built .blend (skip re-import +
         # weld) keyed by the geometry+look signature. Previews/thumbnails (draft) skip it —
         # they're already fast and the multi-GB .blend save would only slow them. Cache
@@ -1203,13 +1651,16 @@ class RenderWorker:
             # so a stale cache can never be reused: per-mesh (id=geometry+color+LOD, clip=weld,
             # color=tint), the whole material profile (direction.material -> roughness/metallic/
             # ao/cavity/edge/ng_shader/flat_shading/backface_cull/…), engine, nm_per_bu scale,
-            # and auto_direct. Per-frame state (camera/opacity/metallic OVERRIDES/clip position/
-            # slices/lights) is re-driven on the cached geometry, so it correctly does NOT key.
+            # and auto_direct. Include an explicit material-graph version so shader-node fixes
+            # (for example the NG light vector) cannot reuse stale warm .blends. Per-frame
+            # state (camera/opacity/metallic OVERRIDES/clip position/slices/lights) is
+            # re-driven on the cached geometry, so it correctly does NOT key.
             geom = sorted((mm["id"], bool(mm.get("clip")),
                            bool(mm.get("clip_cap", mm.get("clip"))),
                            tuple(mm.get("color") or ()))
                           for mm in mesh_specs.values())
-            sig_src = json.dumps([geom, spec.get("direction", {}).get("material", {}),
+            sig_src = json.dumps(["blender-material-v4",
+                                  geom, spec.get("direction", {}).get("material", {}),
                                   self.job.settings.engine, round(self.nm_per_bu, 6),
                                   bool(self._auto_direct)],
                                  sort_keys=True, default=str)

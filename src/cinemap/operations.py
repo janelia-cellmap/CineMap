@@ -619,6 +619,7 @@ def plane_move(project: Project, axis: str = "z", mode: str = "slice",
     gid = _uid("grp")   # shared group so the timeline collapses the scan to one card
     glabel = f"{mode} scan {axis}{' (oblique)' if normal else ''} ×{n}"
     new = []
+    base_slice = next((s for s in base.slices if s.em_name == em_name), None)
     for i in range(n):
         t = i / max(1, n - 1)
         pt = point_at(t)
@@ -632,7 +633,8 @@ def plane_move(project: Project, axis: str = "z", mode: str = "slice",
                                     side=side, enabled=True)
             meshes.append(mc)
         slices = ([SlicePlane(em_name=em_name, axis=axis, position_nm=offset,
-                              normal=normal, visible=True)]
+                              normal=normal, visible=True,
+                              contrast_limits=(base_slice.contrast_limits if base_slice else None))]
                   if do_slice else [s.model_copy() for s in base.slices])
         # duration-driven: spread total_duration_s across the scan (first keyframe is the
         # instant lead-in to the start, the rest divide the span) so the whole scan takes

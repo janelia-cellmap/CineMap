@@ -26,15 +26,19 @@ class LayerColors:
     seed: int = 0
     default: list[float] | None = None          # segmentDefaultColor (rgb 0-1) or None
     overrides: dict[int, list[float]] = field(default_factory=dict)  # segmentColors
-    saturation: float = 1.0                     # layer `saturation` (0 = grayscale)
+    saturation: float = 1.0                     # layer `saturation` (0 = white, 1 = full color)
 
     def _desaturate(self, r, g, b) -> tuple[float, float, float]:
         if self.saturation >= 0.999:
             return (r, g, b)
-        # neuroglancer mixes the color toward its luminance by (1 - saturation)
-        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        # Neuroglancer's segmentation frontend mixes every channel toward white:
+        # color[i] = color[i] * saturation + (1 - saturation).
         s = self.saturation
-        return (lum + (r - lum) * s, lum + (g - lum) * s, lum + (b - lum) * s)
+        return (
+            r * s + (1.0 - s),
+            g * s + (1.0 - s),
+            b * s + (1.0 - s),
+        )
 
     def rgb(self, seg_id: int) -> tuple[float, float, float]:
         sid = int(seg_id)
