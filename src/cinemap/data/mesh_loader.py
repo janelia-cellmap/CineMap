@@ -610,7 +610,8 @@ class MeshLoader:
                   target_voxels_union: int = 20_000_000, nm_per_px: float | None = None,
                   draft: bool = False, prefer_labels: bool = False,
                   total_budget: int | None = None, label_smooth_iters: int = 0,
-                  label_simplify_factor: float = 0.0) -> trimesh.Trimesh:
+                  label_decimate_fraction: float = 0.0,
+                  label_blockwise: bool | str = "auto") -> trimesh.Trimesh:
         """One mesh for a set of segments. By default downloads the precomputed
         meshes (LOD picked from on-screen scale `nm_per_px`); with `prefer_labels`
         it regenerates meshes from the label volume with zmesh at the finest scale
@@ -630,7 +631,8 @@ class MeshLoader:
                 target_voxels=target_voxels,
                 target_vertices=int(total_budget) if total_budget else None,
                 smooth_iters=max(0, int(label_smooth_iters)),
-                simplify_budget_factor=max(0.0, float(label_simplify_factor)),
+                decimate_fraction=max(0.0, float(label_decimate_fraction)),
+                blockwise=label_blockwise,
                 colorize=colorize,
             )
         # default: precomputed meshes (LOD-adaptive, total vertex budget per layer so

@@ -121,6 +121,7 @@ class FrameState:
     meshes: list[FrameMesh] = field(default_factory=list)
     annotations: list[FrameAnnotation] = field(default_factory=list)
     fade_alpha: float = 0.0
+    background: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])  # NG 3D bg (linear)
 
 
 def _clip_dict(c) -> dict | None:
@@ -170,6 +171,11 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
               layer_transition_at: float = 1.0) -> FrameState:
     pos, look_at, up, fov = _interp_camera(a.camera, b.camera, t)
     fs = FrameState(position_nm=pos, look_at_nm=look_at, fov_deg=fov, up=up)
+    # Background crossfades between the two keyframes (camera transition `t`), so a
+    # white->black NG change blends across the move like every other appearance value.
+    ba = getattr(a.lighting, "background", None) or [0.0, 0.0, 0.0]
+    bb = getattr(b.lighting, "background", None) or [0.0, 0.0, 0.0]
+    fs.background = [float(ba[i]) * (1 - t) + float(bb[i]) * t for i in range(3)]
     lt = t if layer_t is None else max(0.0, min(1.0, float(layer_t)))
     target_layer = _target_layer_active(layer_transition, lt, layer_transition_at)
     # slices matched by (em_name, axis)

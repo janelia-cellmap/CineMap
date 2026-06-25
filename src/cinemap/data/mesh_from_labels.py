@@ -8,6 +8,7 @@ boundaries while choosing the finest label scale that fits the render budget.
 from __future__ import annotations
 
 import colorsys
+import os
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -30,13 +31,14 @@ _PLAN_NEXT_LEVEL_TOLERANCE = 1.10
 _ROI_REFINE_PAD_FRACTION = 0.50
 _ROI_FINAL_PAD_FRACTION = 0.15
 _ROI_EDGE_MARGIN_VOXELS = 2
-_FACES_PER_VERTEX_BUDGET = 2.1
 _LOSSLESS_VERTEX_DEDUP_LIMIT = 8_000_000
 _MIN_DECIMATE_FACES = 100_000
+# Smallest per-segment face target for an explicit decimate_fraction. Low enough that
+# the keep-fraction is honored even on many-small-segment layers (the old 256 floor
+# capped tiny segments and pushed the aggregate well above the requested fraction),
+# but above a degenerate sliver so each segment stays a valid closed-ish surface.
+_DECIMATE_MIN_FACES = 16
 _PYFQMR_MISSING = False
-_ZMESH_GENTLE_REDUCTION_FACTOR = 20
-_ZMESH_BUDGET_REDUCTION_FACTOR = 50
-_ZMESH_MAX_ERROR_VOXEL_FRACTION = 0.25
 
 
 def _layer_offset(layer: str) -> float:
@@ -433,17 +435,6 @@ def _mesh_to_trimesh(mesh, seg_id: int, origin_zyx_nm, colorize=None) -> trimesh
     return trimesh.Trimesh(vertices=verts_xyz, faces=faces, vertex_colors=vcolors, process=False)
 
 
-def _zmesh_simplify_params(simplify_budget_factor: float, scale_zyx_nm) -> tuple[int, float | None]:
-    """Map UI simplification policy to zmesh's physical-error simplifier."""
-    if simplify_budget_factor <= 0:
-        return 0, None
-    min_voxel_nm = min(float(s) for s in scale_zyx_nm)
-    max_error = _ZMESH_MAX_ERROR_VOXEL_FRACTION * min_voxel_nm
-    if simplify_budget_factor <= 1.25:
-        return _ZMESH_BUDGET_REDUCTION_FACTOR, max_error
-    return _ZMESH_GENTLE_REDUCTION_FACTOR, max_error
-
-
 def _cleanup_mesh_lossless(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     """Remove strictly redundant topology without moving the represented surface."""
     if len(mesh.faces) == 0:
@@ -487,15 +478,40 @@ def _cleanup_mesh_lossless(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     return mesh
 
 
+def _simplify_with_trimesh(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh | None:
+    """Quadric decimation via trimesh's native backend (fast_simplification).
+
+    The fallback when pyfqmr isn't installed. Re-tiles the part's single color onto
+    the decimated vertices (label-mesh parts are one color each), since the backend
+    drops vertex attributes."""
+    if len(mesh.faces) <= target_faces:
+        return mesh
+    try:
+        simplified = mesh.simplify_quadric_decimation(face_count=max(4, int(target_faces)))
+    except Exception:  # noqa: BLE001  (no backend installed, or degenerate input)
+        return None
+    if simplified is None or len(simplified.faces) == 0:
+        return None
+    try:
+        vc = np.asarray(mesh.visual.vertex_colors)
+        if len(vc):
+            simplified.visual.vertex_colors = np.tile(
+                vc[0], (len(simplified.vertices), 1)
+            ).astype(np.uint8)
+    except Exception:  # noqa: BLE001
+        pass
+    return simplified
+
+
 def _simplify_with_pyfqmr(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh | None:
     global _PYFQMR_MISSING
     if _PYFQMR_MISSING:
-        return None
+        return _simplify_with_trimesh(mesh, target_faces)
     try:
         import pyfqmr  # type: ignore
     except Exception:  # noqa: BLE001
         _PYFQMR_MISSING = True
-        return None
+        return _simplify_with_trimesh(mesh, target_faces)
     if len(mesh.faces) <= target_faces:
         return mesh
     try:
@@ -529,7 +545,7 @@ def _simplify_with_pyfqmr(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.T
         return trimesh.Trimesh(vertices=out_verts, faces=out_faces, vertex_colors=colors, process=False)
     except Exception as e:  # noqa: BLE001
         print(f"[labels] pyfqmr simplification skipped: {e}")
-        return None
+        return _simplify_with_trimesh(mesh, target_faces)
 
 
 def _postprocess_label_mesh(
@@ -537,16 +553,416 @@ def _postprocess_label_mesh(
     *,
     target_faces: int | None = None,
     smooth_iters: int = 0,
+    min_decimate_faces: int = _MIN_DECIMATE_FACES,
 ) -> trimesh.Trimesh:
     mesh = _cleanup_mesh_lossless(mesh)
     if smooth_iters:
         trimesh.smoothing.filter_taubin(mesh, iterations=smooth_iters)
         mesh = _cleanup_mesh_lossless(mesh)
-    if target_faces is not None and len(mesh.faces) > max(_MIN_DECIMATE_FACES, int(target_faces)):
+    if target_faces is not None and len(mesh.faces) > max(int(min_decimate_faces), int(target_faces)):
         simplified = _simplify_with_pyfqmr(mesh, int(target_faces))
         if simplified is not None:
             mesh = _cleanup_mesh_lossless(simplified)
     return mesh
+
+
+_BLOCK_MESH_WORKERS_ENV = "CINEMAP_BLOCK_MESH_WORKERS"
+
+
+def _resolve_max_workers(max_workers: int | None) -> int:
+    """Block-meshing thread count: explicit value, else env override, else ~CPUs.
+
+    Reads are I/O-bound (tensorstore over HTTP) and zmesh releases the GIL during
+    marching cubes, so threads parallelize both the fetch and the mesh well."""
+    if max_workers and int(max_workers) > 0:
+        return int(max_workers)
+    env = os.environ.get(_BLOCK_MESH_WORKERS_ENV)
+    if env and env.isdigit() and int(env) > 0:
+        return int(env)
+    return max(1, min(8, (os.cpu_count() or 4)))
+
+
+def _block_side(block_voxels: int) -> int:
+    """Cube side (voxels) for a target per-block voxel budget."""
+    return max(8, int(round(max(1, int(block_voxels)) ** (1.0 / 3.0))))
+
+
+# Above this single-read array size, mesh blockwise instead so a sparse-but-huge
+# bbox (e.g. thousands of scattered organelles at a fine scale) doesn't materialize
+# the whole box at once and OOM. Capped here and also at a fraction of free RAM.
+_BLOCKWISE_READ_BYTES_CAP = 4 * 1024 ** 3
+_BLOCKWISE_READ_RAM_FRACTION = 0.25
+
+
+def _meminfo_available_bytes() -> int | None:
+    """Machine-wide free memory (MemAvailable) — what's physically free right now."""
+    try:
+        for ln in open("/proc/meminfo"):
+            if ln.startswith("MemAvailable"):
+                return int(ln.split()[1]) * 1024
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _cgroup_mem_limit_bytes() -> tuple[int | None, int | None]:
+    """``(limit, used)`` bytes for THIS process's memory cgroup, or ``(None, None)``.
+
+    On a shared cluster node, a ``bsub -n 16`` job on a 48-core box is capped by the
+    cgroup LSF places it in — NOT the node's free RAM — so this is the limit that
+    actually matters. Handles cgroup v2 (``memory.max`` / ``memory.current``) and v1
+    (``memory.limit_in_bytes`` / ``memory.usage_in_bytes``), resolving the process's
+    own cgroup path from ``/proc/self/cgroup`` and falling back to the mount root."""
+    # cgroup v2 unified hierarchy: lines look like "0::/some/path"
+    try:
+        rel = ""
+        for ln in open("/proc/self/cgroup"):
+            f = ln.strip().split(":")
+            if len(f) == 3 and f[1] == "":
+                rel = f[2].lstrip("/")
+                break
+        for cdir in (os.path.join("/sys/fs/cgroup", rel), "/sys/fs/cgroup"):
+            mx = os.path.join(cdir, "memory.max")
+            if os.path.exists(mx):
+                raw = open(mx).read().strip()
+                if raw and raw != "max":
+                    cur_f = os.path.join(cdir, "memory.current")
+                    used = int(open(cur_f).read().strip()) if os.path.exists(cur_f) else 0
+                    return int(raw), used
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    # cgroup v1: "<id>:memory:/path"
+    try:
+        rel = ""
+        for ln in open("/proc/self/cgroup"):
+            f = ln.strip().split(":")
+            if len(f) >= 3 and "memory" in f[1].split(","):
+                rel = f[2].lstrip("/")
+                break
+        for cdir in (os.path.join("/sys/fs/cgroup/memory", rel), "/sys/fs/cgroup/memory"):
+            lf = os.path.join(cdir, "memory.limit_in_bytes")
+            if os.path.exists(lf):
+                limit = int(open(lf).read().strip())
+                if limit < (1 << 62):  # v1 "unlimited" is a huge sentinel value
+                    uf = os.path.join(cdir, "memory.usage_in_bytes")
+                    used = int(open(uf).read().strip()) if os.path.exists(uf) else 0
+                    return limit, used
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None
+
+
+def _rlimit_as_bytes() -> int | None:
+    """Address-space rlimit (RLIMIT_AS), if a finite one is set (some schedulers do)."""
+    try:
+        import resource
+        soft, _hard = resource.getrlimit(resource.RLIMIT_AS)
+        if soft not in (resource.RLIM_INFINITY, -1):
+            return int(soft)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _available_ram_bytes() -> int | None:
+    """Memory THIS process can actually use — the MIN of every cap we can detect:
+    machine free memory, the job's cgroup headroom (LSF/containers enforce here), and
+    the address-space rlimit. The min is the point: a memory-limited cluster job must
+    size its reads off its own allocation, not the node's free RAM, or it gets
+    OOM-killed at the cgroup limit long before the node runs out."""
+    candidates = []
+    mi = _meminfo_available_bytes()
+    if mi:
+        candidates.append(mi)
+    limit, used = _cgroup_mem_limit_bytes()
+    if limit:
+        candidates.append(max(0, limit - (used or 0)))
+    rl = _rlimit_as_bytes()
+    if rl:
+        candidates.append(rl)
+    candidates = [c for c in candidates if c and c > 0]
+    return min(candidates) if candidates else None
+
+
+def _blockwise_read_threshold_bytes() -> int:
+    avail = _available_ram_bytes()
+    if avail:
+        return int(min(_BLOCKWISE_READ_BYTES_CAP, _BLOCKWISE_READ_RAM_FRACTION * avail))
+    return _BLOCKWISE_READ_BYTES_CAP
+
+
+def _level_itemsize(vol, level: int) -> int:
+    dt = vol._open_level(level).dtype
+    return getattr(getattr(dt, "numpy_dtype", None), "itemsize", None) or np.dtype(str(dt)).itemsize
+
+
+def _planned_read_bytes(vol, plan) -> int:
+    """Bytes a single (non-blockwise) read of this plan would materialize.
+
+    Pure arithmetic from the bbox extent and the level's voxel size (the shape/scale
+    metadata is already cached) — no voxel data is read, so this is free to check
+    before committing to the read."""
+    box_voxels = _bbox_voxels_for_level(vol, plan.bbox_xyz_nm, plan.level, pad=3)
+    if plan.stride and int(plan.stride) > 1:
+        # A strided plan still reads the FULL box before subsampling, so peak memory
+        # tracks the unstrided box.
+        pass
+    return int(box_voxels) * _level_itemsize(vol, plan.level)
+
+
+def _resolve_blockwise(vol, plan, blockwise) -> bool:
+    """Decide blockwise vs single read for one plan.
+
+    ``True``/``False`` force the choice; ``"auto"`` (default) reads blockwise only
+    when the single read would exceed the memory threshold. Strided plans can't use
+    blockwise (striding breaks boundary welds), so they always read single."""
+    if blockwise is True or blockwise is False:
+        return bool(blockwise)
+    if plan.stride and int(plan.stride) > 1:
+        return False
+    try:
+        return _planned_read_bytes(vol, plan) > _blockwise_read_threshold_bytes()
+    except Exception:  # noqa: BLE001 — if we can't size it, prefer the memory-safe path
+        return True
+
+
+def _iter_block_ranges(box, side):
+    """Tile a voxel box ((z0,z1),(y0,y1),(x0,x1)) into cubic block core ranges."""
+    (z0, z1), (y0, y1), (x0, x1) = box
+    for bz0 in range(z0, z1, side):
+        bz1 = min(bz0 + side, z1)
+        for by0 in range(y0, y1, side):
+            by1 = min(by0 + side, y1)
+            for bx0 in range(x0, x1, side):
+                bx1 = min(bx0 + side, x1)
+                yield (bz0, bz1), (by0, by1), (bx0, bx1)
+
+
+def _block_read_axis(c0, c1, box_lo, box_hi, dim, halo):
+    """Per-axis (read_start, read_stop, pad_lo, pad_hi) for one block's meshing read.
+
+    Marching cubes needs a voxel of context beyond the geometry it meshes, so every
+    block is read with a halo:
+      * interior block boundaries get a +1-voxel overlap so the straddling cube is
+        meshed once (by the lower block) and both blocks emit identical vertices on
+        the shared plane — a later weld stitches them;
+      * at the ROI-box exterior we pull up to ``halo`` REAL neighbor voxels from the
+        volume when it extends past the box (true padding for meshing), and only seal
+        with a background voxel where the read reaches the actual volume edge.
+    Returns indices into the full level array plus the background pad to apply."""
+    if c0 <= box_lo:                       # block on the ROI-box low edge
+        read0 = max(0, c0 - halo)          # pad with real data toward the volume edge
+        pad_lo = 1 if read0 == 0 else 0    # only seal at the true volume boundary
+    else:
+        read0 = c0                         # interior: neighbor owns the straddling cube
+        pad_lo = 0
+    if c1 >= box_hi:                        # block on the ROI-box high edge
+        read1 = min(dim, c1 + halo)
+        pad_hi = 1 if read1 == dim else 0
+    else:
+        read1 = min(dim, c1 + 1)            # +1 overlap into the next block
+        pad_hi = 0
+    return read0, read1, pad_lo, pad_hi
+
+
+def _mesh_one_block(arr_handle, box, block, seg_ids, sc, tr, colorize, *, halo=1):
+    """Marching-cubes one block; return ``{seg_id: [trimesh, ...]}`` in world nm.
+
+    Reads a real-voxel halo around the block (see :func:`_block_read_axis`) so each
+    block's marching cubes has the neighbor context it needs, then runs zmesh with
+    ``close=False`` so interior boundary planes are left open for the cross-block
+    weld. Background padding is added only on faces that reach the true volume edge,
+    matching the single-read path's ``np.pad(labels, 1)`` seal."""
+    (Z0, Z1), (Y0, Y1), (X0, X1) = box
+    (bz0, bz1), (by0, by1), (bx0, bx1) = block
+    shape = arr_handle.shape
+    rz0, rz1, pz0, pz1 = _block_read_axis(bz0, bz1, Z0, Z1, shape[0], halo)
+    ry0, ry1, py0, py1 = _block_read_axis(by0, by1, Y0, Y1, shape[1], halo)
+    rx0, rx1, px0, px1 = _block_read_axis(bx0, bx1, X0, X1, shape[2], halo)
+    sub = np.asarray(arr_handle[rz0:rz1, ry0:ry1, rx0:rx1].read().result())
+    keep = np.isin(sub, seg_ids)
+    if not keep.any():
+        return {}
+    labels = np.where(keep, sub, 0).astype(np.uint32, copy=False)
+    labels = np.pad(labels, ((pz0, pz1), (py0, py1), (px0, px1)))
+    mesher = zmesh.Mesher(tuple(float(s) for s in sc))
+    mesher.mesh(labels, close=False)
+    origin_zyx_nm = (
+        (rz0 - pz0) * sc[0] + tr[0],
+        (ry0 - py0) * sc[1] + tr[1],
+        (rx0 - px0) * sc[2] + tr[2],
+    )
+    out: dict[int, list] = {}
+    available = set(int(s) for s in mesher.ids())
+    for seg_id in seg_ids:
+        if seg_id not in available:
+            continue
+        try:
+            raw = mesher.get(seg_id, reduction_factor=0, max_error=None, voxel_centered=False)
+        except TypeError:
+            raw = mesher.get(seg_id)
+        part = _mesh_to_trimesh(raw, seg_id, origin_zyx_nm, colorize=colorize)
+        if part is not None:
+            out.setdefault(seg_id, []).append(part)
+    return out
+
+
+def _blockwise_raw_parts(vol, plan, seg_ids, *, colorize, block_voxels, max_workers, block_halo=1):
+    """Block-by-block meshing of a plan's ROI; one welded trimesh per present seg.
+
+    Bounds peak memory to ~one block (vs. the single whole-ROI read), so a finer
+    pyramid level fits the same RAM — read more vertices, then optionally decimate.
+    Each block is meshed with a ``block_halo``-voxel real-data pad (see
+    :func:`_block_read_axis`). Returns ``None`` for strided plans (striding would
+    break boundary welds), so the caller falls back to the single-read path."""
+    if plan.stride and int(plan.stride) > 1:
+        return None
+    level = plan.level
+    arr_handle = vol._open_level(level)
+    sc = tuple(float(s) for s in vol.level_scale_nm[level])
+    tr = tuple(float(t) for t in vol.level_translation_nm[level])
+    if plan.bbox_xyz_nm is not None:
+        (z0, z1), (y0, y1), (x0, x1) = vol._box_voxel_bounds(plan.bbox_xyz_nm, level, pad=3)
+    else:
+        shp = vol.level_shape_zyx(level)
+        z0, z1, y0, y1, x0, x1 = 0, shp[0], 0, shp[1], 0, shp[2]
+    box = ((z0, z1), (y0, y1), (x0, x1))
+    blocks = list(_iter_block_ranges(box, _block_side(block_voxels)))
+    workers = _resolve_max_workers(max_workers)
+
+    def _run(block):
+        return _mesh_one_block(
+            arr_handle, box, block, seg_ids, sc, tr, colorize, halo=max(1, int(block_halo))
+        )
+
+    if workers > 1 and len(blocks) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(workers, len(blocks))) as ex:
+            results = list(ex.map(_run, blocks))
+    else:
+        results = [_run(b) for b in blocks]
+
+    per_seg: dict[int, list] = {}
+    for res in results:
+        for seg_id, parts in res.items():
+            per_seg.setdefault(seg_id, []).extend(parts)
+
+    raw_parts = []
+    for seg_id in seg_ids:
+        parts = per_seg.get(seg_id)
+        if not parts:
+            continue
+        if len(parts) == 1:
+            raw_parts.append(parts[0])
+            continue
+        welded = trimesh.util.concatenate(parts)
+        try:
+            welded.merge_vertices()  # weld coincident boundary vertices across blocks
+        except Exception:  # noqa: BLE001
+            pass
+        raw_parts.append(welded)
+    return raw_parts, sc
+
+
+def _raw_parts_for_plan(
+    vol,
+    plan,
+    seg_ids,
+    *,
+    colorize,
+    blockwise,
+    block_voxels,
+    block_halo,
+    max_workers,
+    label_name,
+    target_vertices,
+):
+    """Return ``(raw_parts, scale_zyx)`` for one plan: a welded trimesh per present
+    seg id in world (xyz nm) coords, before postprocessing. An empty list signals
+    the caller to try the next (coarser/finer) plan. Picks the blockwise reader when
+    enabled (and the plan isn't strided); otherwise reads the whole ROI at once."""
+    if blockwise:
+        blk = _blockwise_raw_parts(
+            vol, plan, seg_ids, colorize=colorize,
+            block_voxels=block_voxels, max_workers=max_workers, block_halo=block_halo,
+        )
+        if blk is not None:
+            raw_parts, sc = blk
+            print(
+                "[labels] zmesh probe (blockwise) "
+                f"{label_name} ids={len(seg_ids)} level=s{plan.level} "
+                f"scale_zyx_nm=({sc[0]:.3g},{sc[1]:.3g},{sc[2]:.3g}) "
+                f"block_voxels={int(block_voxels)} parts={len(raw_parts)} "
+                f"target_vertices={target_vertices}",
+                flush=True,
+            )
+            if not raw_parts:
+                print(
+                    "[labels] zmesh probe (blockwise) produced no geometry; trying next level "
+                    f"{label_name} level=s{plan.level}",
+                    flush=True,
+                )
+            return raw_parts, sc
+
+    arr, (z0, y0, x0), sc, tr = _read_plan_array(vol, plan, pad=3)
+    print(
+        "[labels] zmesh probe "
+        f"{label_name} ids={len(seg_ids)} "
+        f"level=s{plan.level} stride={plan.stride} "
+        f"scale_zyx_nm=({sc[0]:.3g},{sc[1]:.3g},{sc[2]:.3g}) "
+        f"target_vertices={target_vertices} "
+        f"surface_faces_estimate={plan.surface_faces_estimate} "
+        f"surface_budget={plan.surface_budget}",
+        flush=True,
+    )
+    keep = np.isin(arr, seg_ids)
+    if not keep.any():
+        print(
+            "[labels] zmesh probe empty; trying finer level "
+            f"{label_name} level=s{plan.level}",
+            flush=True,
+        )
+        return [], sc
+    labels = np.where(keep, arr, 0).astype(np.uint32, copy=False)
+    labels = np.pad(labels, 1)
+
+    mesher = zmesh.Mesher(tuple(float(s) for s in sc))
+    mesher.mesh(labels)
+    # Always mesh at full resolution (no in-mesher reduction); the optional
+    # decimate_fraction handles lossy reduction uniformly afterward, so the single-read
+    # and blockwise paths produce matching geometry.
+    origin_zyx_nm = (
+        (z0 - 1) * sc[0] + tr[0],
+        (y0 - 1) * sc[1] + tr[1],
+        (x0 - 1) * sc[2] + tr[2],
+    )
+    raw_parts = []
+    available = set(int(s) for s in mesher.ids())
+    for seg_id in seg_ids:
+        if seg_id not in available:
+            continue
+        try:
+            raw_mesh = mesher.get(
+                seg_id,
+                reduction_factor=0,
+                max_error=None,
+                voxel_centered=False,
+            )
+        except TypeError:
+            raw_mesh = mesher.get(seg_id)
+        part = _mesh_to_trimesh(raw_mesh, seg_id, origin_zyx_nm, colorize=colorize)
+        if part is not None:
+            raw_parts.append(part)
+    if not raw_parts:
+        print(
+            "[labels] zmesh probe produced no geometry; trying finer level "
+            f"{label_name} level=s{plan.level}",
+            flush=True,
+        )
+    return raw_parts, sc
 
 
 def generate_zmesh_auto(
@@ -557,7 +973,11 @@ def generate_zmesh_auto(
     target_voxels: int = 20_000_000,
     target_vertices: int | None = None,
     smooth_iters: int = 0,
-    simplify_budget_factor: float = 0.0,
+    decimate_fraction: float = 0.0,
+    blockwise: bool | str = "auto",
+    block_voxels: int = 16_000_000,
+    block_halo: int = 1,
+    max_workers: int | None = None,
     colorize=None,
 ) -> trimesh.Trimesh:
     """Generate selected IDs with zmesh at the finest scale that fits the budget.
@@ -566,7 +986,22 @@ def generate_zmesh_auto(
     absent, we scan a coarse label level to find a conservative ROI before selecting
     the final meshing scale. zmesh emits one mesh per label ID, so colors and object
     boundaries survive even when many IDs are meshed in one array read.
+
+    `blockwise` reads and meshes the chosen ROI one cubic block at a time
+    (`block_voxels` each, up to `max_workers` in parallel) and welds the per-block
+    surfaces, instead of one whole-ROI read. ``"auto"`` (default) does this only when
+    the single read would exceed a memory threshold (sparse-but-huge bboxes — e.g.
+    thousands of scattered organelles at a fine scale — that would otherwise OOM);
+    ``True``/``False`` force it. For a compact object whose read fits, the single read
+    is faster, so auto leaves it alone. `target_vertices` caps how many raw vertices we
+    LOAD (the planner picks the finest level whose raw count fits, never finer);
+    `decimate_fraction` (0<f<1) then reduces the result to ~that fraction of its faces,
+    so the final mesh lands BELOW the budget (e.g. load 15M, decimate 0.25 -> ~3.7M).
+    `smooth_iters` applies Taubin smoothing. Decimation/smoothing run per segment so
+    instance colors are preserved.
     """
+    decimate_fraction = float(decimate_fraction or 0.0)
+    decimate_active = 0.0 < decimate_fraction < 1.0
     seg_ids = [int(s) for s in seg_ids]
     if not seg_ids:
         raise ValueError("no segment ids")
@@ -589,80 +1024,51 @@ def generate_zmesh_auto(
 
     for plan in plans:
         try:
-            arr, (z0, y0, x0), sc, tr = _read_plan_array(vol, plan, pad=3)
-            print(
-                "[labels] zmesh probe "
-                f"{_label_source_name(label_zarr_url)} ids={len(seg_ids)} "
-                f"level=s{plan.level} stride={plan.stride} "
-                f"scale_zyx_nm=({sc[0]:.3g},{sc[1]:.3g},{sc[2]:.3g}) "
-                f"target_vertices={target_vertices} "
-                f"surface_faces_estimate={plan.surface_faces_estimate} "
-                f"surface_budget={plan.surface_budget}",
-                flush=True,
-            )
-            keep = np.isin(arr, seg_ids)
-            if not keep.any():
+            plan_blockwise = _resolve_blockwise(vol, plan, blockwise)
+            if blockwise == "auto":
                 print(
-                    "[labels] zmesh probe empty; trying finer level "
-                    f"{_label_source_name(label_zarr_url)} level=s{plan.level}",
+                    "[labels] zmesh blockwise=auto -> "
+                    f"{'blockwise' if plan_blockwise else 'single'} "
+                    f"{_label_source_name(label_zarr_url)} level=s{plan.level} "
+                    f"planned_read={_planned_read_bytes(vol, plan) / 1e9:.2f}GB "
+                    f"threshold={_blockwise_read_threshold_bytes() / 1e9:.2f}GB",
                     flush=True,
                 )
-                continue
-            labels = np.where(keep, arr, 0).astype(np.uint32, copy=False)
-            labels = np.pad(labels, 1)
-
-            mesher = zmesh.Mesher(tuple(float(s) for s in sc))
-            mesher.mesh(labels)
-            zmesh_reduction, zmesh_max_error = _zmesh_simplify_params(simplify_budget_factor, sc)
-            origin_zyx_nm = (
-                (z0 - 1) * sc[0] + tr[0],
-                (y0 - 1) * sc[1] + tr[1],
-                (x0 - 1) * sc[2] + tr[2],
+            raw_parts, sc = _raw_parts_for_plan(
+                vol,
+                plan,
+                seg_ids,
+                colorize=colorize,
+                blockwise=plan_blockwise,
+                block_voxels=block_voxels,
+                block_halo=block_halo,
+                max_workers=max_workers,
+                label_name=_label_source_name(label_zarr_url),
+                target_vertices=target_vertices,
             )
-            raw_parts = []
-            available = set(int(s) for s in mesher.ids())
-            for seg_id in seg_ids:
-                if seg_id not in available:
-                    continue
-                try:
-                    raw_mesh = mesher.get(
-                        seg_id,
-                        reduction_factor=zmesh_reduction,
-                        max_error=zmesh_max_error,
-                        voxel_centered=False,
-                    )
-                except TypeError:
-                    raw_mesh = mesher.get(seg_id)
-                part = _mesh_to_trimesh(raw_mesh, seg_id, origin_zyx_nm, colorize=colorize)
-                if part is not None:
-                    raw_parts.append(part)
             if not raw_parts:
-                print(
-                    "[labels] zmesh probe produced no geometry; trying finer level "
-                    f"{_label_source_name(label_zarr_url)} level=s{plan.level}",
-                    flush=True,
-                )
                 continue
-
-            target_faces_total = None
-            if target_vertices and simplify_budget_factor > 0:
-                target_faces_total = max(
-                    1,
-                    int(target_vertices * _FACES_PER_VERTEX_BUDGET * float(simplify_budget_factor)),
-                )
-            total_faces = sum(len(p.faces) for p in raw_parts)
+            # Vertices we LOADED (pre-decimation) — the budget/refinement gate when
+            # decimation is active, so target_vertices governs the read scale and the
+            # decimation step reduces the final mesh from there.
+            raw_vertices = sum(len(p.vertices) for p in raw_parts)
 
             parts = []
             for part in raw_parts:
                 part_target = None
-                if target_faces_total is not None and total_faces > target_faces_total:
-                    frac = len(part.faces) / max(1, total_faces)
-                    part_target = max(256, int(target_faces_total * frac))
+                min_decimate_faces = _MIN_DECIMATE_FACES
+                if decimate_active:
+                    # Decimate each segment to the keep-fraction (per segment so colors
+                    # are preserved), flooring only at a small viable face count so the
+                    # fraction holds even on many-small-segment layers.
+                    part_target = max(_DECIMATE_MIN_FACES, int(len(part.faces) * decimate_fraction))
+                    min_decimate_faces = _DECIMATE_MIN_FACES
                 parts.append(
                     _postprocess_label_mesh(
                         part,
                         target_faces=part_target,
                         smooth_iters=smooth_iters,
+                        min_decimate_faces=min_decimate_faces,
                     )
                 )
             parts = [p for p in parts if len(p.faces) and len(p.vertices)]
@@ -677,10 +1083,19 @@ def generate_zmesh_auto(
             mesh = _cleanup_mesh_lossless(mesh)
             vertices = len(mesh.vertices)
             faces = len(mesh.faces)
+            # Gate refinement on the RAW (pre-decimation) vertex count, so
+            # `target_vertices` caps what we LOAD — the planner never meshes a level
+            # finer than the budget, and decimation then reduces the result BELOW the
+            # limit. This is fast: it avoids meshing one level too fine just to discover
+            # it overshoots. (Gating on the decimated count instead would chase the
+            # budget by reading ~1/fraction more data — far slower for little gain.)
+            # `vertices` is the delivered (decimated) count, logged for insight.
+            gate_vertices = raw_vertices
             print(
                 "[labels] zmesh probe result "
                 f"{_label_source_name(label_zarr_url)} level=s{plan.level} "
-                f"vertices={vertices} faces={faces} target_vertices={target_vertices}",
+                f"vertices={vertices} raw_vertices={raw_vertices} faces={faces} "
+                f"target_vertices={target_vertices}",
                 flush=True,
             )
 
@@ -688,7 +1103,7 @@ def generate_zmesh_auto(
                 accept_limit = int(np.floor(int(target_vertices) * _PLAN_NEXT_LEVEL_TOLERANCE))
             else:
                 accept_limit = 0
-            if target_vertices and vertices > accept_limit:
+            if target_vertices and gate_vertices > accept_limit:
                 if best_mesh is not None:
                     print(
                         "[labels] zmesh probe exceeded budget; using previous coarser level "
@@ -712,7 +1127,7 @@ def generate_zmesh_auto(
                 best_vertices = vertices
                 best_faces = faces
                 break
-            if target_vertices and vertices > int(target_vertices):
+            if target_vertices and gate_vertices > int(target_vertices):
                 print(
                     "[labels] zmesh probe accepted within tolerance "
                     f"{_label_source_name(label_zarr_url)} level=s{plan.level} "
@@ -728,7 +1143,7 @@ def generate_zmesh_auto(
             best_faces = faces
 
             if target_vertices:
-                next_prediction = int(np.ceil(vertices * _PLAN_NEXT_LEVEL_VERTEX_FACTOR))
+                next_prediction = int(np.ceil(gate_vertices * _PLAN_NEXT_LEVEL_VERTEX_FACTOR))
                 next_limit = int(np.floor(int(target_vertices) * _PLAN_NEXT_LEVEL_TOLERANCE))
                 if next_prediction > next_limit:
                     print(

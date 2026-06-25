@@ -49,6 +49,15 @@
   .controls input:not([type=checkbox]) { width:64px; }
   .controls input[type=checkbox] { width:auto; margin:0 2px 0 0; vertical-align:middle; }
   .controls label.chk { color:var(--fg); }  /* toggle labels read as active controls */
+  /* group dividers + tiny group captions so the toolbars read as labeled clusters */
+  .sep { width:1px; align-self:stretch; min-height:16px; background:var(--line); margin:0 5px; display:inline-block; }
+  .grp { font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); opacity:.6; margin:0 1px; }
+  .meshgrp { display:inline-flex; align-items:center; gap:6px; transition:opacity .12s; }
+  .meshgrp.off { opacity:.38; }  /* greyed when "from labels" is off */
+  /* stack the render controls as labeled rows (movie / render / mesh / scene) */
+  .ctlstack { flex-direction:column; align-items:stretch; gap:5px; }
+  .ctlrow { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  .ctlrow .grp { width:52px; flex:0 0 52px; text-align:right; }  /* aligned row captions */
   #bar { height:6px; background:#222734; border-radius:3px; overflow:hidden; }
   #barFill { height:100%; width:0%; background:var(--accent); transition:width .2s; }
   footer { height:200px; border-top:1px solid var(--line); background:#12151c; display:flex; flex-direction:column; }
@@ -150,52 +159,76 @@
   <div class="col right">
     <div class="pane-title">⬡ Render preview</div>
     <div id="preview"><span class="msg">render output appears here</span></div>
-    <div class="controls">
-      <label title="output width in pixels">w</label><input id="w" value="1280" />
-      <label title="output height in pixels">h</label><input id="h" value="720" />
-      <label title="Frames per second of the output video (motion smoothness). Total frames rendered = total duration (sum of keyframe durations) × fps.">fps</label><input id="fps" value="30" />
-      <label title="Cycles render samples per pixel: higher = less grain/noise but slower to render. ~16–32 for previews, 48+ for final.">samples</label><input id="samples" value="48" />
-      <label class="chk" title="Fast mode: 32 samples + aggressive adaptive sampling (noise threshold 0.06) and let the AI denoiser (OpenImageDenoise) clean the rest. ~2x faster frames at near-identical quality. Overrides the samples box."><input id="fastSample" type="checkbox" checked /> ⚡ fast</label>
-      <label title="Render engine. Cycles = photoreal path tracing (true transparency/AO/soft shadows) but slow — seconds–minutes per frame. Eevee = real-time rasterizer, ~10–50× faster per frame; shadows/transparency are approximate. Use Eevee for fast previews and movie drafts, Cycles for finals.">engine
-        <select id="engine">
-          <option value="CYCLES" selected>Cycles (photoreal)</option>
-          <option value="BLENDER_EEVEE_NEXT">Eevee (⚡ fast)</option>
-        </select></label>
-      <label title="Mesh quality = the per-layer vertex budget. Higher = crisper but more GPU memory (auto-retries lower if it runs out).">quality
-        <select id="detail">
-          <option value="1">basic (~5M/layer)</option>
-          <option value="2">high (~10M/layer)</option>
-          <option value="3" selected>max (~15M/layer)</option>
-          <option value="6">ultra (~30M/layer)</option>
-          <option value="10">extreme (~50M/layer)</option>
-        </select></label>
-      <label class="chk" title="Generate render meshes from label voxels with zmesh instead of using precomputed Neuroglancer meshes."><input id="labelMeshes" type="checkbox" /> label meshes</label>
-      <label title="Taubin smoothing passes for label-derived meshes. Off by default; enable if the raw label mesh is too faceted.">smooth
-        <select id="labelSmooth">
-          <option value="0" selected>0</option>
-          <option value="1">1</option>
-          <option value="2">2</option>
-          <option value="4">4</option>
-        </select></label>
-      <label title="Label-mesh simplification. Lossless only removes redundant topology. Gentle/budget enable zmesh's physical-error-bounded simplifier before cleanup.">simplify
-        <select id="labelSimplify">
-          <option value="0" selected>lossless</option>
-          <option value="2">gentle</option>
-          <option value="1">budget</option>
-        </select></label>
-      <label class="chk" title="Director: optional camera smoothing and per-frame emphasis around the selected Look preset. If no Look preset is selected, uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
-      <label class="chk" title="Draw a thin wireframe box around each data source's extent (the EM volume and/or each rendered layer's label volume), like neuroglancer's bounding box. Falls back to a tight box around the rendered meshes when a layer has no volume source."><input id="showBbox" type="checkbox" /> bbox</label>
-      <input id="bboxColor" type="color" value="#9ea8bd" title="bounding-box wireframe color" style="width:24px;height:20px;padding:0;border:1px solid var(--line);background:none;cursor:pointer" />
-      <select id="bboxSource" title="Which layer the bounding box is drawn from (its data/mesh extent) — works even if that layer is hidden. Auto = the EM volume, or all visible meshes." style="max-width:120px"><option value="">bbox: auto</option></select>
-      <label title="Mesh level-of-detail strategy. For precomputed meshes, per-frame/per-chunk choose existing Neuroglancer LODs. For label meshes, zmesh chooses scale from the quality budget; per-chunk is disabled.">lod
-        <select id="lodMode">
-          <option value="frame" selected>adaptive</option>
-          <option value="single">single</option>
-          <option value="chunk">per-chunk (precomputed)</option>
-        </select></label>
-      <button id="previewBtn" onclick="startRender('preview')">▷ Preview</button>
-      <label title="preview renders at fps ÷ this">1/</label><input id="ratio" value="10" style="width:44px" />
-      <button id="cancelBtn" onclick="cancelRender()" style="display:none;background:#7d2e2e;border-color:transparent;color:#fff">■ Cancel</button>
+    <div class="controls ctlstack">
+      <!-- MOVIE: output frame size/rate + the preview action -->
+      <div class="ctlrow">
+        <span class="grp">movie</span>
+        <label title="output width in pixels">w</label><input id="w" value="1280" />
+        <label title="output height in pixels">h</label><input id="h" value="720" />
+        <label title="Frames per second of the output video (motion smoothness). Total frames rendered = total duration (sum of keyframe durations) × fps.">fps</label><input id="fps" value="30" />
+        <span class="grow"></span>
+        <button id="previewBtn" onclick="startRender('preview')">▷ Preview</button>
+        <label title="preview renders at fps ÷ this">1/</label><input id="ratio" value="10" style="width:44px" />
+        <button id="cancelBtn" onclick="cancelRender()" style="display:none;background:#7d2e2e;border-color:transparent;color:#fff">■ Cancel</button>
+      </div>
+
+      <!-- RENDER: engine + how clean each frame is rendered -->
+      <div class="ctlrow">
+        <span class="grp">render</span>
+        <label title="Render engine. Cycles = photoreal path tracing (true transparency/AO/soft shadows) but slow — seconds–minutes per frame. Eevee = real-time rasterizer, ~10–50× faster per frame; shadows/transparency are approximate. Use Eevee for fast previews and movie drafts, Cycles for finals.">engine
+          <select id="engine">
+            <option value="CYCLES" selected>Cycles (photoreal)</option>
+            <option value="BLENDER_EEVEE_NEXT">Eevee (⚡ fast)</option>
+          </select></label>
+        <label class="chk" title="Fast mode: 32 samples + aggressive adaptive sampling (noise threshold 0.06) and let the AI denoiser (OpenImageDenoise) clean the rest. ~2x faster frames at near-identical quality. Overrides the samples box."><input id="fastSample" type="checkbox" checked /> ⚡ fast</label>
+        <label title="Cycles render samples per pixel: higher = less grain/noise but slower to render. ~16–32 for previews, 48+ for final. This is RENDER cleanliness — not mesh resolution (that's 'detail').">samples</label><input id="samples" value="48" />
+      </div>
+
+      <!-- MESH: resolution budget, LOD strategy, and label-mesh build options -->
+      <div class="ctlrow">
+        <span class="grp">mesh</span>
+        <label title="Mesh detail = the per-layer vertex budget (how many vertices each layer's mesh may use). Higher = crisper geometry but more GPU memory; the worker auto-retries lower if it runs out. This is mesh RESOLUTION, not render quality (that's engine/samples).">detail
+          <select id="detail">
+            <option value="1">basic (~5M/layer)</option>
+            <option value="2">high (~10M/layer)</option>
+            <option value="3" selected>max (~15M/layer)</option>
+            <option value="6">ultra (~30M/layer)</option>
+            <option value="10">extreme (~50M/layer)</option>
+          </select></label>
+        <label title="Level-of-detail strategy — how the mesh scale is chosen ACROSS frames (detail sets the budget; lod decides how it's spent per frame). adaptive = coarser when a layer is far/small on screen, finer on close-ups (like neuroglancer); single = one fixed scale for the whole shot; per-chunk = mixed scales within one mesh (precomputed meshes only).">lod
+          <select id="lodMode">
+            <option value="frame" selected>adaptive</option>
+            <option value="single">single</option>
+            <option value="chunk">per-chunk (precomputed)</option>
+          </select></label>
+        <label class="chk" title="Build meshes from the label voxels with zmesh instead of downloading precomputed Neuroglancer meshes. Enables the smooth + decimate options to its right. (Reads blockwise automatically when the region is too large to load at once.)"><input id="labelMeshes" type="checkbox" /> from labels</label>
+        <span id="labelMeshOpts" class="meshgrp">
+          <label title="Taubin smoothing passes for label-derived meshes — rounds off the blocky voxel staircase. Off by default; 1–2 is usually enough.">smooth
+            <select id="labelSmooth">
+              <option value="0" selected>0</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="4">4</option>
+            </select></label>
+          <label title="Decimate label meshes after meshing — keep this fraction of the faces (lower = lighter mesh, less VRAM, slightly softer detail). Redundant-topology cleanup always runs regardless; this is the lossy reduction on top. e.g. 'medium' keeps ~half the faces.">decimate
+            <select id="labelDecimate">
+              <option value="0" selected>none</option>
+              <option value="0.75">light (keep 75%)</option>
+              <option value="0.5">medium (keep 50%)</option>
+              <option value="0.25">heavy (keep 25%)</option>
+              <option value="0.1">extreme (keep 10%)</option>
+            </select></label>
+        </span>
+      </div>
+
+      <!-- SCENE: presentation extras -->
+      <div class="ctlrow">
+        <span class="grp">scene</span>
+        <label class="chk" title="Director: optional camera smoothing and per-frame emphasis around the selected Look preset. If no Look preset is selected, uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
+        <label class="chk" title="Draw a thin wireframe box around each data source's extent (the EM volume and/or each rendered layer's label volume), like neuroglancer's bounding box. Falls back to a tight box around the rendered meshes when a layer has no volume source."><input id="showBbox" type="checkbox" /> bbox</label>
+        <input id="bboxColor" type="color" value="#9ea8bd" title="bounding-box wireframe color" style="width:24px;height:20px;padding:0;border:1px solid var(--line);background:none;cursor:pointer" />
+        <select id="bboxSource" title="Which layer the bounding box is drawn from (its data/mesh extent) — works even if that layer is hidden. Auto = the EM volume, or all visible meshes." style="max-width:120px"><option value="">bbox: auto</option></select>
+      </div>
     </div>
     <div class="controls" style="border-top:0"><div id="bar" class="grow"><div id="barFill"></div></div></div>
     <div class="controls" style="border-top:0"><span id="renderMsg" class="msg"></span></div>
@@ -222,15 +255,24 @@
 <footer>
   <div class="pane-title">Keyframe timeline — <span id="kfCount" class="msg">0 frames</span>
     <span class="grow"></span>
+    <!-- MOVE: add a camera/slice clip to the timeline -->
+    <span class="grp">move</span>
     <button onclick="openOrbitPanel()" title="Add an orbit move: the camera circles the current target. Choose the rotation axis, sweep degrees, duration, elevation, and sample count.">↻ Orbit</button>
     <button onclick="openPlanePanel()" title="Add a plane move: an EM slice sweep or a cutaway, as an independent clip on the timeline (start→stop over a duration).">▤ Plane scan</button>
-    <span style="width:12px"></span>
-    <label class="msg" title="Opacity of the 3D meshes on the SELECTED keyframe. Slide down to fade the meshes and reveal the EM cross-section behind them (0 = meshes hidden, only the EM slice shows).">3D mesh opacity</label>
+
+    <span class="sep"></span>
+    <!-- KEYFRAME: edit the currently-selected keyframe -->
+    <span class="grp">keyframe</span>
+    <label class="msg" title="Opacity of ALL 3D mesh layers on the SELECTED keyframe at once (a quick way to fade every mesh and reveal the EM cross-section behind them; 0 = meshes hidden, only the EM slice shows). For one layer only, use Propagate edit → opacity (3d).">mesh opacity</label>
     <input id="meshOp" type="range" min="0" max="1" step="0.05" value="1" style="width:90px"
-      onchange="setMeshOpacity()" title="Opacity of the 3D meshes on the selected keyframe (0 = hidden, reveals the EM slice; 1 = solid)." />
-    <button id="autoThumbBtn" onclick="toggleAutoThumbs()" title="Render a still thumbnail for every keyframe, one by one, so the timeline strip below fills in with previews. Thumbnails only — this is not the video (use Export for that).">⟳ Render all</button>
+      onchange="setMeshOpacity()" title="Opacity of ALL mesh layers on the selected keyframe (0 = hidden, reveals the EM slice; 1 = solid). Per-layer control is under Propagate edit → opacity (3d)." />
     <button onclick="openLookPanel()" title="Open the Look panel: try render styles (glow, roughness, material presets, tone-mapping) and preview them on the selected keyframe — non-destructive, doesn't change your data.">✨ Look</button>
     <button onclick="openPropPanel()" title="edit a layer setting on the selected keyframe and propagate it to later/earlier keyframes">✎ Propagate edit</button>
+
+    <span class="sep"></span>
+    <!-- OUTPUT: produce thumbnails / final deliverables -->
+    <span class="grp">output</span>
+    <button id="autoThumbBtn" onclick="toggleAutoThumbs()" title="Render a still thumbnail for every keyframe, one by one, so the timeline strip below fills in with previews. Thumbnails only — this is not the video (use Export for that).">⟳ Render all</button>
     <button id="exportBtn" class="primary" onclick="startRender('export')">⬇ Export video</button>
     <button id="blendBtn" onclick="startRender('blend')" title="bake the whole shot to a self-contained animated .blend (camera, meshes, EM slices; textures packed in)">⬇ Export .blend</button>
   </div>
@@ -979,7 +1021,7 @@ function draftRenderSettings() {
     mesh_from_labels: $('labelMeshes').checked,
     mesh_detail: +$('detail').value || 1,
     label_mesh_smooth_iters: +$('labelSmooth').value || 0,
-    label_mesh_simplify_factor: +$('labelSimplify').value || 0
+    label_mesh_decimate_fraction: +$('labelDecimate').value || 0
   };
 }
 async function renderThumbnail(id) {
@@ -1397,8 +1439,10 @@ function rgb01ToHex(rgb) {
 function syncMeshSourceControls() {
   const useLabels = $('labelMeshes').checked;
   const lod = $('lodMode');
+  // smooth/decimate only apply to label-derived meshes — grey the group when off
   $('labelSmooth').disabled = !useLabels;
-  $('labelSimplify').disabled = !useLabels;
+  $('labelDecimate').disabled = !useLabels;
+  $('labelMeshOpts').classList.toggle('off', !useLabels);
   const chunk = [...lod.options].find(o => o.value === 'chunk');
   if (chunk) chunk.disabled = useLabels;
   if (useLabels && lod.value === 'chunk') lod.value = 'frame';
@@ -1418,7 +1462,7 @@ function saveRenderPrefs() {
     samples: +$('samples').value, mesh_detail: +$('detail').value || 1,
     mesh_from_labels: $('labelMeshes').checked,
     label_mesh_smooth_iters: +$('labelSmooth').value || 0,
-    label_mesh_simplify_factor: +$('labelSimplify').value || 0,
+    label_mesh_decimate_fraction: +$('labelDecimate').value || 0,
     auto_direct: $('autoDirect').checked, lod_mode: selectedLodMode(),
     show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
     bbox_source: $('bboxSource').value, preview_ratio: +$('ratio').value || 10,
@@ -1433,7 +1477,7 @@ function applyRenderPrefs(p) {
   set('w', rp.width); set('h', rp.height); set('fps', rp.fps); set('samples', rp.samples);
   set('detail', rp.mesh_detail); set('lodMode', rp.lod_mode); set('ratio', rp.preview_ratio);
   set('labelSmooth', rp.label_mesh_smooth_iters);
-  set('labelSimplify', rp.label_mesh_simplify_factor);
+  set('labelDecimate', rp.label_mesh_decimate_fraction);
   if (rp.mesh_from_labels != null) $('labelMeshes').checked = !!rp.mesh_from_labels;
   if (rp.auto_direct != null) $('autoDirect').checked = !!rp.auto_direct;
   if (rp.show_bbox != null) $('showBbox').checked = !!rp.show_bbox;
@@ -1463,7 +1507,7 @@ async function startRender(mode) {
                  draft: mode === 'preview', mesh_detail: +$('detail').value || 1,
                  mesh_from_labels: $('labelMeshes').checked,
                  label_mesh_smooth_iters: +$('labelSmooth').value || 0,
-                 label_mesh_simplify_factor: +$('labelSimplify').value || 0,
+                 label_mesh_decimate_fraction: +$('labelDecimate').value || 0,
                  auto_direct: $('autoDirect').checked, lod_mode: selectedLodMode(),
                  show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
                  bbox_source: $('bboxSource').value };
@@ -1725,7 +1769,14 @@ const FIELD_LABELS = { segment_color: 'segment color', default_color: 'default c
   object_alpha: 'opacity (3d)', silhouette: 'silhouette (3d)', saturation: 'saturation',
   color_seed: 'color seed', visible: 'visible', color: 'color',
   metallic: 'metallic', roughness: 'roughness' };
+function rgbHex01(rgb) {
+  if (!Array.isArray(rgb)) return '?';
+  const h = v => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
+  return `#${h(rgb[0])}${h(rgb[1])}${h(rgb[2])}`;
+}
 function changeLabel(c) {
+  if (c.field === 'background')   // per-keyframe, no mesh_name
+    return `3D background: ${rgbHex01(c.old)} → ${rgbHex01(c.new)}`;
   let s = `${c.mesh_name} • ${FIELD_LABELS[c.field] || c.field}`;
   if (c.field === 'segment_color') s += ` (seg ${c.segment_id})`;
   if (['object_alpha', 'silhouette', 'saturation', 'color_seed', 'visible', 'metallic', 'roughness'].includes(c.field))
@@ -1744,9 +1795,14 @@ async function applyNgPropagate() {
   const changedIds = new Set();
   try {
     for (const c of NG_CHANGES) {
-      const r = await api('POST', `/api/projects/${PID}/keyframes/${NG_PROP_KID}/propagate`,
-        { mesh_name: c.mesh_name, field: c.field, value: c.new, segment_id: c.segment_id ?? null,
-          direction: dir, match_old: matchOnly, match_value: c.old, match_value_set: true });
+      const url = c.field === 'background'
+        ? `/api/projects/${PID}/keyframes/${NG_PROP_KID}/propagate_background`
+        : `/api/projects/${PID}/keyframes/${NG_PROP_KID}/propagate`;
+      const body = c.field === 'background'
+        ? { direction: dir, match_old: matchOnly, match_value: c.old, match_value_set: true }
+        : { mesh_name: c.mesh_name, field: c.field, value: c.new, segment_id: c.segment_id ?? null,
+            direction: dir, match_old: matchOnly, match_value: c.old, match_value_set: true };
+      const r = await api('POST', url, body);
       total += (r.count || 1) - 1;   // exclude the source keyframe itself
       (r.changed || []).forEach(id => changedIds.add(id));
     }
@@ -1872,7 +1928,7 @@ async function undoLook() {
 
 $('labelMeshes').addEventListener('change', () => { syncMeshSourceControls(); saveRenderPrefs(); });
 $('labelSmooth').addEventListener('change', saveRenderPrefs);
-$('labelSimplify').addEventListener('change', saveRenderPrefs);
+$('labelDecimate').addEventListener('change', saveRenderPrefs);
 $('lodMode').addEventListener('change', () => { syncMeshSourceControls(); saveRenderPrefs(); });
 syncMeshSourceControls();
 refreshProjects();

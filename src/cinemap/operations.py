@@ -285,6 +285,61 @@ def _patch_ng_state_field(ng_state: dict, mesh_name: str, field, value, segment_
         layer["saturation"] = float(value)
 
 
+def _linear_to_srgb(c: float) -> float:
+    c = max(0.0, min(1.0, float(c)))
+    return 12.92 * c if c <= 0.0031308 else 1.055 * (c ** (1 / 2.4)) - 0.055
+
+
+def _linear_rgb_to_hex(rgb) -> str:
+    """LINEAR [r,g,b] (how background is stored) -> sRGB '#rrggbb' (NG's color form)."""
+    return _rgb_to_hex([_linear_to_srgb(c) for c in rgb[:3]])
+
+
+def propagate_background(project: Project, from_keyframe_id: str,
+                         direction: str = "right", match_old: bool = True,
+                         match_value=_UNSET) -> dict:
+    """Copy one keyframe's 3D background (`lighting.background`) to other keyframes.
+
+    Background is a per-keyframe value (captured from neuroglancer); this pushes the
+    source keyframe's color to the chosen `direction` ("this" | "right" | "left" |
+    "all"). With `match_old`, only keyframes currently holding the OLD color are
+    changed (so deliberate per-frame backgrounds aren't clobbered) — `match_value`
+    supplies that old color when the source was already updated from the NG view."""
+    kfs = project.keyframes
+    idx = next((i for i, k in enumerate(kfs) if k.id == from_keyframe_id), None)
+    if idx is None:
+        raise ValueError("no such keyframe")
+    new_bg = [float(c) for c in (kfs[idx].lighting.background or [0.0, 0.0, 0.0])]
+    old_bg = [float(c) for c in match_value] if match_value is not _UNSET else None
+
+    if direction == "this":
+        targets = [idx]
+    elif direction == "left":
+        targets = list(range(0, idx + 1))
+    elif direction == "all":
+        targets = list(range(len(kfs)))
+    else:  # "right" (this + later)
+        targets = list(range(idx, len(kfs)))
+
+    new_hex = _linear_rgb_to_hex(new_bg)
+    changed: list[str] = []
+    for i in targets:
+        k = kfs[i]
+        if (i != idx and match_old and old_bg is not None
+                and not _colors_equal(k.lighting.background, old_bg)):
+            continue
+        new_light = k.lighting.model_copy(update={"background": list(new_bg)})
+        updated = k.model_copy(update={"lighting": new_light})
+        # Mirror into the stored NG state so the keyframe's link round-trips (clicking
+        # it shows the new bg, and re-capturing it won't revert).
+        if isinstance(updated.ng_state, dict):
+            updated.ng_state = {**updated.ng_state, "projectionBackgroundColor": new_hex}
+        kfs[i] = updated
+        changed.append(k.id)
+    store.save(project)
+    return {"changed": changed}
+
+
 def propagate_layer_field(project: Project, from_keyframe_id: str, mesh_name: str,
                           field: str, value, segment_id: int | None = None,
                           direction: str = "right", match_old: bool = True,

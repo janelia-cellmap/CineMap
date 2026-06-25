@@ -219,7 +219,7 @@ class RenderReq(BaseModel):
     mesh_detail: float = 1.0    # per-layer vertex-budget multiplier (hard-capped)
     mesh_from_labels: bool = False  # regenerate render meshes from labels with zmesh
     label_mesh_smooth_iters: int = 0      # Taubin smoothing passes for label meshes
-    label_mesh_simplify_factor: float = 0.0  # 0=lossless only; >0 enables error-bounded simplification
+    label_mesh_decimate_fraction: float = 0.0  # keep-fraction (0=off); reads finer, decimates to budget
     auto_direct: bool = True    # non-destructive presentation pass (lighting/material/DOF)
     lod_mode: str = "frame"     # mesh LOD: "single" | "frame" (per-frame adaptive) | "chunk"
     show_bbox: bool = False     # draw a wireframe box around each data source's extent
@@ -231,14 +231,14 @@ class ThumbnailReq(BaseModel):
     mesh_from_labels: bool = False  # keep thumbnails source-compatible with previews
     mesh_detail: float = 1.0
     label_mesh_smooth_iters: int = 0
-    label_mesh_simplify_factor: float = 0.0
+    label_mesh_decimate_fraction: float = 0.0
 
 
 class SnapshotReq(BaseModel):
     mesh_from_labels: bool = False
     mesh_detail: float = 1.0
     label_mesh_smooth_iters: int = 0
-    label_mesh_simplify_factor: float = 0.0
+    label_mesh_decimate_fraction: float = 0.0
 
 
 def _draft_render_settings(req: SnapshotReq | ThumbnailReq | None = None) -> RenderSettings:
@@ -252,7 +252,7 @@ def _draft_render_settings(req: SnapshotReq | ThumbnailReq | None = None) -> Ren
         mesh_detail=req.mesh_detail,
         mesh_from_labels=req.mesh_from_labels,
         label_mesh_smooth_iters=req.label_mesh_smooth_iters,
-        label_mesh_simplify_factor=req.label_mesh_simplify_factor,
+        label_mesh_decimate_fraction=req.label_mesh_decimate_fraction,
     )
 
 
@@ -511,7 +511,8 @@ def render_thumbnail(pid: str, kid: str, req: ThumbnailReq | None = None):
                               still=True, mesh_detail=req.mesh_detail,
                               mesh_from_labels=req.mesh_from_labels,
                               label_mesh_smooth_iters=req.label_mesh_smooth_iters,
-                              label_mesh_simplify_factor=req.label_mesh_simplify_factor)
+                              label_mesh_decimate_fraction=req.label_mesh_decimate_fraction)
+
     job_id = _start_render(pid, settings, kf_range=[idx, idx], thumbnail_for=kid)
     return {"job_id": job_id}
 
@@ -536,10 +537,16 @@ def update_from_ng(pid: str, kid: str):
     p = store.load(pid)
     kf_old = next((k for k in p.keyframes if k.id == kid), None)
     old_meshes = [m.model_copy(deep=True) for m in kf_old.meshes] if kf_old else []
+    old_bg = list(kf_old.lighting.background) if kf_old else None
     kf = scouting.update_keyframe_from_view(p, kid)
     if kf is None:
         raise HTTPException(404, "no such keyframe")
     changes = ops.diff_layer_settings(old_meshes, kf.meshes)
+    # Surface a 3D-background change too, so the UI can offer to propagate it (it's a
+    # per-keyframe value, not a layer field, so it carries no mesh_name).
+    if old_bg is not None and not ops._colors_equal(old_bg, kf.lighting.background):
+        changes.append({"field": "background", "old": old_bg,
+                        "new": list(kf.lighting.background)})
     return {**kf.model_dump(), "changes": changes}
 
 
@@ -616,6 +623,27 @@ def propagate_layer(pid: str, kid: str, req: PropagateReq):
         res = ops.propagate_layer_field(
             p, kid, req.mesh_name, req.field, req.value, segment_id=req.segment_id,
             direction=req.direction, match_old=req.match_old, **kw)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True, **res, "count": len(res["changed"])}
+
+
+class PropagateBgReq(BaseModel):
+    direction: str = "right"          # this | right (later) | left (earlier) | all
+    match_old: bool = True            # only change keyframes currently holding the OLD bg
+    match_value: list[float] | None = None  # the OLD bg to match (source already updated)
+    match_value_set: bool = False
+
+
+@app.post("/api/projects/{pid}/keyframes/{kid}/propagate_background")
+def propagate_background(pid: str, kid: str, req: PropagateBgReq):
+    """Copy this keyframe's 3D background to other keyframes (replace-where-matching by
+    default), so a background changed in neuroglancer carries to the rest of the shot."""
+    p = store.load(pid)
+    kw = {"match_value": req.match_value} if req.match_value_set else {}
+    try:
+        res = ops.propagate_background(
+            p, kid, direction=req.direction, match_old=req.match_old, **kw)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     return {"ok": True, **res, "count": len(res["changed"])}
@@ -772,7 +800,6 @@ class SweepReqNew(BaseModel):
     mesh_from_labels: bool = False
     mesh_detail: float = 1.0
     label_mesh_smooth_iters: int = 0
-    label_mesh_simplify_factor: float = 0.0
 
 
 @app.post("/api/projects/{pid}/sweeps")
@@ -1135,7 +1162,7 @@ def render(pid: str, req: RenderReq):
                               export_blend=req.export_blend, draft=req.draft,
                               mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels,
                               label_mesh_smooth_iters=req.label_mesh_smooth_iters,
-                              label_mesh_simplify_factor=req.label_mesh_simplify_factor,
+                              label_mesh_decimate_fraction=req.label_mesh_decimate_fraction,
                               auto_direct=req.auto_direct, lod_mode=lod_mode,
                               show_bbox=req.show_bbox,
                               bbox_color=req.bbox_color or [0.62, 0.66, 0.74],

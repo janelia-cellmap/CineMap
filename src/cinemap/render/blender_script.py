@@ -168,6 +168,8 @@ def _setup_render(scene_spec: dict) -> None:
     out = nt.nodes.new("ShaderNodeOutputWorld")
     bg_cam = nt.nodes.new("ShaderNodeBackground")
     bg_cam.inputs[0].default_value = (c[0], c[1], c[2], 1.0)
+    global _world_bg_cam   # the camera-ray background node, animated per frame
+    _world_bg_cam = bg_cam
     bg_amb = nt.nodes.new("ShaderNodeBackground")
     bg_amb.inputs[0].default_value = (amb * ac[0], amb * ac[1], amb * ac[2], 1.0)
     lp = nt.nodes.new("ShaderNodeLightPath")
@@ -184,6 +186,26 @@ def _setup_render(scene_spec: dict) -> None:
             pass
 
     _setup_freestyle(scene_spec)
+
+
+_world_bg_cam = None   # the world's camera-ray ShaderNodeBackground (set in _setup_render)
+
+
+def _set_world_bg(frame: dict, f: int | None = None) -> None:
+    """Apply this frame's NG 3D background color to the world's camera-ray node.
+
+    Mirrors `_set_fade_overlay`: the PNG path calls with ``f=None`` (set directly per
+    frame), the .blend export path passes the scene frame so the color is keyframed
+    onto an F-curve and the saved file animates the background. Colors are LINEAR (they
+    round-trip through the Standard view transform back to the NG color)."""
+    if _world_bg_cam is None:
+        return
+    bg = frame.get("background")
+    if not bg:
+        return
+    _world_bg_cam.inputs[0].default_value = (float(bg[0]), float(bg[1]), float(bg[2]), 1.0)
+    if f is not None:
+        _world_bg_cam.inputs[0].keyframe_insert("default_value", frame=f)
 
 
 def _setup_freestyle(scene_spec: dict) -> None:
@@ -1337,6 +1359,7 @@ def main(scene_path: str) -> None:
             meshes, frame.get("mesh_overrides", {}), base_emit, cast_shadows, color_space
         )
         _set_fade_overlay(frame)
+        _set_world_bg(frame)
         idx = frame.get("index", fi)  # global frame index (for split cluster jobs)
         scene.render.filepath = f"{out_dir}/frame_{idx:05d}.png"
         print(f"[blender] frame {fi + 1}/{len(spec['frames'])}", flush=True)
@@ -1486,6 +1509,7 @@ def export_blend(spec: dict) -> None:
             color_space,
         )
         _set_fade_overlay(frame, f)
+        _set_world_bg(frame, f)
         print(f"[blender] frame {fi + 1}/{n}", flush=True)
 
     scene.frame_set(1)

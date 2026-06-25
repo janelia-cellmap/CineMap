@@ -300,6 +300,10 @@ def bake_keyframe(project: Project, label: str = "scouted", st: dict | None = No
         meshes = [m.model_copy() for m in project.keyframes[-1].meshes]
     kf = Keyframe(id=ops._uid("kf"), label=label, camera=cam, slices=slices,
                   meshes=meshes, annotations=annotations, ng_state=st)
+    # Capture this view's NG 3D background per keyframe, so updating the background in
+    # neuroglancer and re-baking is reflected in the render (and can transition between
+    # frames). Falls back to black if the state has none.
+    kf.lighting.background = _bg_from_state(st) or [0.0, 0.0, 0.0]
     return ops.add_keyframe(project, kf)
 
 
@@ -400,8 +404,12 @@ def update_keyframe_from_view(project: Project, keyframe_id: str) -> Keyframe | 
         return None
     cam, slices, meshes, annotations, st = _scene_from_view(project)
     _merge_manifest(project, st)   # learn layers new to this view (e.g. an EM image just added)
+    # Re-capture the NG 3D background too, so editing it in neuroglancer and updating the
+    # keyframe is reflected in the render.
+    lighting = kf.lighting.model_copy(update={"background": _bg_from_state(st) or [0.0, 0.0, 0.0]})
     updated = kf.model_copy(update={"camera": cam, "slices": slices, "meshes": meshes,
-                                    "annotations": annotations, "ng_state": st})
+                                    "annotations": annotations, "ng_state": st,
+                                    "lighting": lighting})
     project.keyframes = [updated if k.id == keyframe_id else k for k in project.keyframes]
     ops.store.save(project)
     return updated

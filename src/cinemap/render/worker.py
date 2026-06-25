@@ -272,10 +272,18 @@ class RenderWorker:
             0,
             min(8, int(getattr(job.settings, "label_mesh_smooth_iters", 0) or 0)),
         )
-        self._label_simplify_factor = max(
+        # Decimation keep-fraction (0 disables): after loading up to the vertex budget,
+        # decimate each segment to ~this fraction of its faces, so the final mesh lands
+        # below the budget (e.g. 0.25 keeps ~a quarter). Quality knob, not a read driver.
+        self._label_decimate_fraction = max(
             0.0,
-            min(8.0, float(getattr(job.settings, "label_mesh_simplify_factor", 0.0) or 0.0)),
+            min(1.0, float(getattr(job.settings, "label_mesh_decimate_fraction", 0.0) or 0.0)),
         )
+        # Blockwise label meshing (read+mesh per cubic block, then weld) — bounds peak
+        # memory so sparse-but-huge bboxes don't OOM. "auto" (default) decides per layer
+        # from the planned read size; "on"/"off" force it.
+        _bw = str(getattr(job.settings, "label_mesh_blockwise", "auto") or "auto").lower()
+        self._label_blockwise = {"on": True, "off": False}.get(_bw, "auto")
         self._nm_per_px = None  # finest on-screen scale across frames (set per build)
         # mesh LOD strategy: "single" (one build), "frame" (per-frame adaptive, like
         # neuroglancer; free on orbits), or "chunk" (precomputed-mesh fragments).
@@ -723,7 +731,8 @@ class RenderWorker:
         """Cache-key component for a mesh built at on-screen scale `nmpp` (nm/px):
         re-framing, draft, source, budget, or a different LOD bucket each rebuild."""
         source_tag = (
-            f"lab-zmesh-clean-v11-s{self._label_smooth_iters}-q{self._label_simplify_factor:.3g}"
+            f"lab-zmesh-clean-v14-s{self._label_smooth_iters}"
+            f"-d{self._label_decimate_fraction:.3g}-b{self._label_blockwise}"
             if self._prefer_labels else "pre"
         )
         quality_tag = "draft" if self._draft else "full"
@@ -1002,7 +1011,8 @@ class RenderWorker:
                     nm_per_px=nmpp, draft=self._draft,
                     prefer_labels=self._prefer_labels, total_budget=self._mesh_budget,
                     label_smooth_iters=self._label_smooth_iters,
-                    label_simplify_factor=self._label_simplify_factor)
+                    label_decimate_fraction=self._label_decimate_fraction,
+                    label_blockwise=self._label_blockwise)
         except Exception as e:  # noqa: BLE001
             print(f"[worker] mesh {mesh_name} ({len(ids)} segs) failed: {e}")
             return None
@@ -1607,6 +1617,7 @@ class RenderWorker:
                 "slices": slices,
                 "mesh_overrides": overrides,
                 "fade_alpha": max(0.0, min(1.0, float(getattr(fr, "fade_alpha", 0.0) or 0.0))),
+                "background": list(getattr(fr, "background", None) or self.project.lighting.background),
                 "index": index_offset + fi,   # global frame index (split cluster jobs)
             })
             self._progress(0.45 + 0.15 * (fi + 1) / len(frames),
