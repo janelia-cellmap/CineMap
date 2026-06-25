@@ -739,6 +739,7 @@ function openTransEdit(e, id) {
     <label>easing <select id="teEase">
       ${['ease-in-out','linear','ease-in','ease-out'].map(o=>`<option value="${o}"${(k.easing||'ease-in-out')===o?' selected':''}>${o}</option>`).join('')}
     </select></label>` : ''}
+    <label class="chk" title="Fly through this keyframe instead of stopping at it: the camera keeps its speed through it (and any hold is ignored), so a run of waypoints reads as one continuous flow. Off = the camera eases to a stop here."><input id="teWaypoint" type="checkbox"${k.waypoint?' checked':''} /> waypoint (fly through, don't stop)</label>
     <label>hold after <input id="teHold" type="number" min="0" step="0.1" value="${fmtS(holdS(k))}" />s</label>
     <div class="te-row"><button onclick="gotoKf('${id}',null); closeTransEdit()">view</button>
       <button class="primary" onclick="applyTransEdit('${id}')">apply</button></div>
@@ -756,6 +757,7 @@ async function applyTransEdit(id){
   const fields = { hold_in_s: Math.max(0, parseFloat($('teHold').value)||0) };
   if ($('teDur')) fields.duration_in_s = Math.max(0, parseFloat($('teDur').value)||0);
   if ($('teEase')) fields.easing = $('teEase').value;
+  if ($('teWaypoint')) fields.waypoint = $('teWaypoint').checked;
   if ($('teTrans')) fields.transition = $('teTrans').value;
   if ($('teLayerTrans')) fields.layer_transition = $('teLayerTrans').value;
   if ($('teLayerAt')) fields.layer_transition_at = Math.max(0, Math.min(100, parseFloat($('teLayerAt').value)||0)) / 100;

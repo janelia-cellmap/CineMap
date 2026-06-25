@@ -701,6 +701,7 @@ class DurationReq(BaseModel):
     transition: str | None = None
     layer_transition: str | None = None
     layer_transition_at: float | None = None
+    waypoint: bool | None = None
 
 
 @app.put("/api/projects/{pid}/keyframes/{kid}/duration")
@@ -728,6 +729,8 @@ def set_keyframe_duration(pid: str, kid: str, req: DurationReq):
         fields["layer_transition"] = req.layer_transition
     if req.layer_transition_at is not None:
         fields["layer_transition_at"] = max(0.0, min(1.0, float(req.layer_transition_at)))
+    if req.waypoint is not None:
+        fields["waypoint"] = bool(req.waypoint)
     ops.update_keyframe(p, kid, **fields)
     return {"ok": True, **fields}
 

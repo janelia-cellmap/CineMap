@@ -286,6 +286,39 @@ def _transition_state(a: Keyframe, b: Keyframe, t: float, style: str,
                      layer_t=t, layer_transition_at=layer_transition_at)
 
 
+def _seg_ease(a: Keyframe, b: Keyframe, i: int, n_trans: int, smooth_ends: bool) -> str:
+    """Easing for the transition a->b, accounting for fly-through waypoints.
+
+    A keyframe is a STOP (camera rests there) unless flagged `waypoint`. The arriving
+    end decelerates (ease-out) only into a stop; the departing end accelerates
+    (ease-in) only out of a stop — so a waypoint is entered/left at speed, giving
+    continuous (non-stopping) motion through it:
+      stop->stop = ease-in-out, stop->wp = ease-in, wp->stop = ease-out, wp->wp = linear.
+    When neither endpoint is a waypoint, behavior is unchanged (the director's
+    smooth_ends curve, else the keyframe's own easing)."""
+    a_wp = bool(getattr(a, "waypoint", False))
+    b_wp = bool(getattr(b, "waypoint", False))
+    if a_wp or b_wp:
+        if not a_wp and not b_wp:
+            return "ease-in-out"
+        if not a_wp:
+            return "ease-in"
+        if not b_wp:
+            return "ease-out"
+        return "linear"
+    if smooth_ends:
+        return ("ease-in-out" if n_trans == 1 else
+                "ease-in" if i == 0 else "ease-out" if i == n_trans - 1 else "linear")
+    return b.easing
+
+
+def _kf_hold_s(kf: Keyframe) -> float:
+    """Dwell seconds on a keyframe — zero for a fly-through waypoint."""
+    if bool(getattr(kf, "waypoint", False)):
+        return 0.0
+    return max(0.0, float(getattr(kf, "hold_in_s", 0.0) or 0.0))
+
+
 def state_at_time(keyframes: list[Keyframe], t: float,
                   smooth_ends: bool = False) -> FrameState | None:
     """Evaluate the timeline at global time `t` seconds, including holds and transition
@@ -297,17 +330,13 @@ def state_at_time(keyframes: list[Keyframe], t: float,
     cum = 0.0
     for i in range(n_trans):
         a, b = keyframes[i], keyframes[i + 1]
-        hold = max(0.0, float(getattr(a, "hold_in_s", 0.0) or 0.0))
+        hold = _kf_hold_s(a)
         if t < cum + hold:
             return _state_at(a, a, 0.0)
         cum += hold
         dur = max(0.0, float(getattr(b, "duration_in_s", 0.0) or 0.0))
         if dur > 0.0 and t < cum + dur:
-            if smooth_ends:
-                ease = ("ease-in-out" if n_trans == 1 else
-                        "ease-in" if i == 0 else "ease-out" if i == n_trans - 1 else "linear")
-            else:
-                ease = b.easing
+            ease = _seg_ease(a, b, i, n_trans, smooth_ends)
             local = (t - cum) / dur
             return _transition_state(a, b, local, getattr(b, "transition", "glide"), ease,
                                      getattr(b, "layer_transition", "fade"),
@@ -337,15 +366,11 @@ def build_frames(keyframes: list[Keyframe], fps: int,
     n_trans = len(keyframes) - 1
     for i in range(n_trans):
         a, b = keyframes[i], keyframes[i + 1]
-        hold_n = int(round(max(0.0, float(getattr(a, "hold_in_s", 0.0) or 0.0)) * fps))
+        hold_n = int(round(_kf_hold_s(a) * fps))
         for _ in range(hold_n):
             frames.append(_state_at(a, a, 0.0))
         n = 0 if b.duration_in_s <= 0 else max(1, int(round(b.duration_in_s * fps)))
-        if smooth_ends:
-            ease = ("ease-in-out" if n_trans == 1 else
-                    "ease-in" if i == 0 else "ease-out" if i == n_trans - 1 else "linear")
-        else:
-            ease = b.easing
+        ease = _seg_ease(a, b, i, n_trans, smooth_ends)
         style = getattr(b, "transition", "glide")
         layer_transition = getattr(b, "layer_transition", "fade")
         layer_transition_at = getattr(b, "layer_transition_at", 1.0)
@@ -353,7 +378,7 @@ def build_frames(keyframes: list[Keyframe], fps: int,
             frames.append(_transition_state(a, b, k / n, style, ease, layer_transition,
                                             layer_transition_at))
     frames.append(_state_at(keyframes[-1], keyframes[-1], 0.0))  # final keyframe, 1 frame
-    final_hold_n = int(round(max(0.0, float(getattr(keyframes[-1], "hold_in_s", 0.0) or 0.0)) * fps))
+    final_hold_n = int(round(_kf_hold_s(keyframes[-1]) * fps))
     for _ in range(final_hold_n):
         frames.append(_state_at(keyframes[-1], keyframes[-1], 0.0))
     return frames

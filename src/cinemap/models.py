@@ -139,6 +139,10 @@ class Keyframe(BaseModel):
     duration_in_s: float = 2.0  # transition duration INTO this keyframe (the move)
     hold_in_s: float = 0.0      # rest/dwell ON this keyframe's pose before moving on
     easing: Literal["linear", "ease-in-out", "ease-in", "ease-out"] = "ease-in-out"
+    # Fly-through waypoint: the camera passes through this keyframe at speed instead of
+    # easing to a stop (and any hold is ignored), so a run of waypoints reads as one
+    # continuous flow. First/last keyframes are still treated as stops unless flagged.
+    waypoint: bool = False
     # Camera/edit transition into this keyframe. Layer appearance/style changes are controlled
     # separately by layer_transition below.
     transition: TransitionStyle = "glide"
