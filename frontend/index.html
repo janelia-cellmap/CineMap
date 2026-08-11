@@ -508,6 +508,17 @@ const api = async (m, url, body) => {
   return r.headers.get('content-type')?.includes('json') ? r.json() : r;
 };
 const setStatus = (s) => $('status').textContent = s;
+function ngCapturePayload() {
+  const el = $('ng');
+  const r = el.getBoundingClientRect();
+  return {
+    viewport: {
+      width_px: Math.max(1, Math.round(r.width)),
+      height_px: Math.max(1, Math.round(r.height)),
+      device_pixel_ratio: window.devicePixelRatio || 1
+    }
+  };
+}
 function clearFrameSelection() {
   ACTIVE_KF = null;
   KF_CLIPBOARD_ID = null;
@@ -1154,7 +1165,7 @@ async function updateFrame() {
   const id = ACTIVE_KF || LAST_KF_ID;
   if (!id) { setStatus('click a keyframe to select it first'); return; }
   try {
-    const kf = await api('POST', `/api/projects/${PID}/keyframes/${id}/update_from_ng`);
+    const kf = await api('POST', `/api/projects/${PID}/keyframes/${id}/update_from_ng`, ngCapturePayload());
     const n = kf.meshes.reduce((a, m) => a + (m.segment_ids?.length || 0), 0);
     setStatus(`updated frame from Neuroglancer (camera + ${n} segment(s)) — rendering…`);
     reload();
@@ -1166,7 +1177,7 @@ async function updateFrame() {
 async function bake() {
   if (!PID) { setStatus('create/open a project first'); return; }
   try {
-    const kf = await api('POST', `/api/projects/${PID}/bake`);
+    const kf = await api('POST', `/api/projects/${PID}/bake`, ngCapturePayload());
     ACTIVE_KF = kf.id; reload();
     setStatus('baked keyframe — rendering…');
     renderThumbnail(kf.id);

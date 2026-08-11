@@ -57,7 +57,13 @@ def _cam_basis(cam):
 
 
 def _interp_camera(a, b, t):
-    """Neuroglancer-style camera interpolation -> (position_nm, look_at_nm, up, fov)."""
+    """Neuroglancer-style camera interpolation.
+
+    Returns (position_nm, look_at_nm, up, fov, projection, ortho_scale_nm). 2D
+    cross-section keyframes use Blender's orthographic camera; when either endpoint
+    is orthographic the transition carries an interpolated orthographic scale so
+    2D-to-2D pans/zooms behave like Neuroglancer movie states.
+    """
     ca, ra, da = _cam_basis(a)
     cb, rb, db = _cam_basis(b)
     center = ca + (cb - ca) * t
@@ -67,7 +73,20 @@ def _interp_camera(a, b, t):
     fwd = rot.apply([0.0, 0.0, -1.0])
     up = rot.apply([0.0, 1.0, 0.0])
     eye = center - fwd * dist
-    return eye.tolist(), center.tolist(), up.tolist(), fov
+    aproj = getattr(a, "projection", "PERSP")
+    bproj = getattr(b, "projection", "PERSP")
+    projection = "ORTHO" if (aproj == "ORTHO" or bproj == "ORTHO") else "PERSP"
+    ortho = None
+    if projection == "ORTHO":
+        av = getattr(a, "ortho_scale_nm", None)
+        bv = getattr(b, "ortho_scale_nm", None)
+        if av is None:
+            av = 2.0 * da * np.tan(np.radians(a.fov_deg) / 2.0)
+        if bv is None:
+            bv = 2.0 * db * np.tan(np.radians(b.fov_deg) / 2.0)
+        av, bv = max(float(av), 1.0), max(float(bv), 1.0)
+        ortho = av * (bv / av) ** t
+    return eye.tolist(), center.tolist(), up.tolist(), fov, projection, ortho
 
 
 @dataclass
@@ -78,6 +97,7 @@ class FrameSlice:
     scale_level: int | None
     opacity: float
     normal: list[float] | None = None   # oblique plane normal (xyz); None = axis-aligned
+    contrast_limits: list[float] | None = None
 
 
 @dataclass
@@ -117,6 +137,8 @@ class FrameState:
     look_at_nm: list[float]
     fov_deg: float
     up: list[float]
+    projection: str = "PERSP"
+    ortho_scale_nm: float | None = None
     slices: list[FrameSlice] = field(default_factory=list)
     meshes: list[FrameMesh] = field(default_factory=list)
     annotations: list[FrameAnnotation] = field(default_factory=list)
@@ -169,8 +191,15 @@ def _appear_opacity(base: float, has_a: bool, t: float, layer_transition: str,
 def _state_at(a: Keyframe, b: Keyframe, t: float,
               layer_transition: str = "fade", layer_t: float | None = None,
               layer_transition_at: float = 1.0) -> FrameState:
-    pos, look_at, up, fov = _interp_camera(a.camera, b.camera, t)
-    fs = FrameState(position_nm=pos, look_at_nm=look_at, fov_deg=fov, up=up)
+    pos, look_at, up, fov, projection, ortho = _interp_camera(a.camera, b.camera, t)
+    fs = FrameState(
+        position_nm=pos,
+        look_at_nm=look_at,
+        fov_deg=fov,
+        up=up,
+        projection=projection,
+        ortho_scale_nm=ortho,
+    )
     # Background crossfades between the two keyframes (camera transition `t`), so a
     # white->black NG change blends across the move like every other appearance value.
     ba = getattr(a.lighting, "background", None) or [0.0, 0.0, 0.0]
@@ -196,12 +225,18 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
                              sb.opacity if sb.visible else 0.0, t, layer_transition,
                              lt, layer_transition_at),
                 normal=(sb.normal if (same_n or t >= 0.5 or target_layer) else sa.normal),
+                contrast_limits=(sb.contrast_limits if (t >= 0.5 or target_layer)
+                                 else sa.contrast_limits),
             ))
         else:  # appearing or disappearing
             s = sa or sb
             base = (s.opacity if s.visible else 0.0)
             op = _appear_opacity(base, bool(sa), t, layer_transition, lt, layer_transition_at)
-            fs.slices.append(FrameSlice(key[0], key[1], s.position_nm, s.scale_level, op, normal=s.normal))
+            fs.slices.append(FrameSlice(
+                key[0], key[1], s.position_nm, s.scale_level, op,
+                normal=s.normal,
+                contrast_limits=s.contrast_limits,
+            ))
     # Meshes are matched by (layer name + exact segment set). A different segment set
     # is different geometry; layer_transition decides whether that change cross-fades
     # or cuts hard at the destination keyframe.

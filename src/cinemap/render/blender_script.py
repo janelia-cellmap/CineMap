@@ -1120,7 +1120,7 @@ def _make_slice(sl: dict, name: str):
     op = float(sl.get("opacity", 1.0))
     if sl.get("occlude"):
         # opaque cross-section: the EM plane blocks geometry behind it (old behavior)
-        emit.inputs["Strength"].default_value = 0.9
+        emit.inputs["Strength"].default_value = 1.0
         mix = nt.nodes.new("ShaderNodeMixShader")
         mix.inputs[0].default_value = op
         nt.links.new(transp.outputs["BSDF"], mix.inputs[1])

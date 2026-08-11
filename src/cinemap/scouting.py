@@ -6,6 +6,7 @@ keyframe (camera target from the NG position; framing from the project defaults)
 """
 from __future__ import annotations
 
+import copy
 import os
 from collections.abc import Iterable
 
@@ -69,7 +70,7 @@ def _find_contrast_pair(obj) -> list[float] | None:
     represents the displayed black/white points rather than the control bounds.
     """
     if isinstance(obj, dict):
-        for key in ("window", "contrastLimits", "contrast_limits"):
+        for key in ("window", "contrastLimits", "contrast_limits", "range"):
             pair = _numeric_pair(obj.get(key))
             if pair is not None:
                 return pair
@@ -77,7 +78,7 @@ def _find_contrast_pair(obj) -> list[float] | None:
             pair = _find_contrast_pair(value)
             if pair is not None:
                 return pair
-        return _numeric_pair(obj.get("range"))
+        return None
     if isinstance(obj, list):
         for value in obj:
             pair = _find_contrast_pair(value)
@@ -217,23 +218,52 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
     return meshes
 
 
-def _scene_from_view(project: Project, st: dict | None = None):
+def _state_with_capture_metadata(st: dict, viewport: dict | None = None) -> dict:
+    if not viewport:
+        return st
+    out = copy.deepcopy(st)
+    clean = {}
+    for key in ("width_px", "height_px", "device_pixel_ratio"):
+        try:
+            clean[key] = float(viewport[key])
+        except (KeyError, TypeError, ValueError):
+            pass
+    if clean:
+        out["_cinemap_viewport"] = clean
+    return out
+
+
+def _scene_from_view(project: Project, st: dict | None = None, viewport: dict | None = None):
     """Capture a scene as (camera, slices, meshes, annotations, ng_state) from a
     neuroglancer state dict. `st` defaults to the live scouting viewer; importing
     passes the saved state directly so capture never races the viewer's async load."""
-    from .data.ng_camera import ng_to_camera
+    from .data.ng_camera import cross_section_plane, ng_to_camera, ng_to_cross_section_camera
 
     if st is None:
         st = get_viewer().state.to_json()  # serialize the live viewer ONCE; reuse below
-    cam = ng_to_camera(st, project.manifest.voxel_size_nm)
+    st = _state_with_capture_metadata(st, viewport)
+    layout = st.get("layout")
+    is_3d = layout == "3d"
+    cam = (
+        ng_to_camera(st, project.manifest.voxel_size_nm)
+        if is_3d else ng_to_cross_section_camera(st, project.manifest.voxel_size_nm)
+    )
     em_name = project.manifest.em.name if project.manifest.em else "em"
     layers = {l.get("name"): l for l in st.get("layers", [])}
     layer_vis = {name: l.get("visible", True) is not False for name, l in layers.items()}
     # a "3d" layout shows no cross-section in neuroglancer, so bake no EM slice
-    show_slice = layer_vis.get(em_name, True) and st.get("layout") != "3d"
-    slices = ([SlicePlane(em_name=em_name, axis="z", position_nm=cam.look_at_nm[2],
-                          contrast_limits=_image_contrast_from_layer(layers.get(em_name)))]
-              if show_slice else [])
+    show_slice = layer_vis.get(em_name, True) and not is_3d
+    if show_slice:
+        axis, pos_nm, normal = cross_section_plane(st, project.manifest.voxel_size_nm)
+        slices = [SlicePlane(
+            em_name=em_name,
+            axis=axis,
+            position_nm=pos_nm,
+            normal=normal,
+            contrast_limits=_image_contrast_from_layer(layers.get(em_name)),
+        )]
+    else:
+        slices = []
     prev = project.keyframes[-1].meshes if project.keyframes else None
     meshes = _meshes_from_visible(project, prev=prev, st=st)   # inherit material from last kf
     annotations = _annotations_from_view(project, st)
@@ -291,9 +321,14 @@ def _annotations_from_view(project: Project, st: dict) -> list[AnnotationInstanc
     return out
 
 
-def bake_keyframe(project: Project, label: str = "scouted", st: dict | None = None) -> Keyframe:
+def bake_keyframe(
+    project: Project,
+    label: str = "scouted",
+    st: dict | None = None,
+    viewport: dict | None = None,
+) -> Keyframe:
     """Build a NEW keyframe from a neuroglancer state (the live view by default)."""
-    cam, slices, meshes, annotations, st = _scene_from_view(project, st)
+    cam, slices, meshes, annotations, st = _scene_from_view(project, st, viewport=viewport)
     _merge_manifest(project, st)   # learn layers new to this view (e.g. an EM image just added)
     if (not meshes and not slices and project.keyframes
             and not _state_declares_render_layers(project, st)):
@@ -396,13 +431,17 @@ def import_states(project: Project, links: list[tuple]) -> tuple[list[Keyframe],
     return created, errors
 
 
-def update_keyframe_from_view(project: Project, keyframe_id: str) -> Keyframe | None:
+def update_keyframe_from_view(
+    project: Project,
+    keyframe_id: str,
+    viewport: dict | None = None,
+) -> Keyframe | None:
     """Overwrite an existing keyframe with the current Neuroglancer state (camera +
     layers + segments), keeping its timing (duration/easing) and label."""
     kf = next((k for k in project.keyframes if k.id == keyframe_id), None)
     if kf is None:
         return None
-    cam, slices, meshes, annotations, st = _scene_from_view(project)
+    cam, slices, meshes, annotations, st = _scene_from_view(project, viewport=viewport)
     _merge_manifest(project, st)   # learn layers new to this view (e.g. an EM image just added)
     # Re-capture the NG 3D background too, so editing it in neuroglancer and updating the
     # keyframe is reflected in the render.

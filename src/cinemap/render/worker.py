@@ -58,16 +58,22 @@ def _contrast_key(limits) -> tuple[float, float] | None:
 def _apply_contrast_window(image, limits):
     import numpy as np
 
-    arr = np.asarray(image, dtype=np.float64)
+    src = np.asarray(image)
+    arr = src.astype(np.float64, copy=False)
     key = _contrast_key(limits)
     if key is None:
         return arr
     lo, hi = key
-    # Neuroglancer shader controls are often normalized 0..1. The EM render path
-    # currently works with uint8 slices, so map normalized windows onto 0..255.
-    if hi <= 1.0 and np.nanmax(arr) > 1.0:
-        lo *= 255.0
-        hi *= 255.0
+    # Neuroglancer shader controls are often normalized 0..1. Scale from the source
+    # dtype instead of the crop's observed max so a dark/bright crop still uses the
+    # same display window as NG.
+    if hi <= 1.0:
+        if np.issubdtype(src.dtype, np.integer):
+            scale = float(np.iinfo(src.dtype).max)
+        else:
+            scale = 255.0 if arr.size and np.nanmax(arr) > 1.0 else 1.0
+        lo *= scale
+        hi *= scale
     return (arr - lo) * (255.0 / (hi - lo))
 
 
@@ -359,7 +365,7 @@ class RenderWorker:
         seg_key = (tuple(sorted(int(i) for i in slice_seg[0])), slice_seg[1].cache_key()) \
             if (is_label and slice_seg) else None
         return (
-            "slice-v3",
+            "slice-v4",
             sl.em_name,
             zurl,
             bool(is_label),
@@ -911,6 +917,11 @@ class RenderWorker:
     # the two can never drift) -------------------------------------------------------
     def _frame_region(self, fr):
         """EM crop around the camera target, sized to what's on screen this frame."""
+        if getattr(fr, "projection", "PERSP") == "ORTHO" and getattr(fr, "ortho_scale_nm", None):
+            aspect = max(1e-6, float(self.job.settings.width) / max(1, self.job.settings.height))
+            visible_half = 0.5 * float(fr.ortho_scale_nm) * max(1.0, aspect)
+            half = max(500.0, visible_half * 1.05)
+            return (tuple(fr.look_at_nm), half)
         dist = math.dist(fr.position_nm, fr.look_at_nm)
         half = max(500.0, dist * math.tan(math.radians(fr.fov_deg) / 2) * 1.25)
         return (tuple(fr.look_at_nm), half)
@@ -918,6 +929,8 @@ class RenderWorker:
     def _frame_nm_per_px(self, fr) -> float:
         """Physical size of one rendered screen pixel at the camera target."""
         height = max(1, self.job.settings.height)
+        if getattr(fr, "projection", "PERSP") == "ORTHO" and getattr(fr, "ortho_scale_nm", None):
+            return float(fr.ortho_scale_nm) / height
         dist = math.dist(fr.position_nm, fr.look_at_nm)
         return 2.0 * dist * math.tan(math.radians(fr.fov_deg) / 2) / height
 
@@ -1644,6 +1657,11 @@ class RenderWorker:
                     "fov_rad": math.radians(fr.fov_deg),
                     "up": fr.up,
                     "flip_handed": self._flip_handed,
+                    "type": "ORTHO" if getattr(fr, "projection", "PERSP") == "ORTHO" else "PERSP",
+                    "ortho_scale": (
+                        float(fr.ortho_scale_nm) / self.nm_per_bu
+                        if getattr(fr, "ortho_scale_nm", None) else 4.0
+                    ),
                 },
                 "slices": slices,
                 "mesh_overrides": overrides,
@@ -1790,10 +1808,45 @@ class RenderWorker:
             raise RuntimeError(f"blender exited {proc.returncode}")
         return oom
 
+    def _render_keyframes(self, kfs=None):
+        """Keyframes as they should be rendered, with old saved 2D NG states upgraded
+        to orthographic cameras without mutating/saving the project file."""
+        from ..data.ng_camera import cross_section_plane, ng_to_cross_section_camera
+        from ..models import SlicePlane
+        from ..scouting import _image_contrast_from_layer
+
+        out = []
+        em_name = self.manifest.em.name if self.manifest.em else "em"
+        for k in (kfs if kfs is not None else self.project.keyframes):
+            st = getattr(k, "ng_state", None) or {}
+            if st.get("layout") == "3d" or not st:
+                out.append(k)
+                continue
+            cam = ng_to_cross_section_camera(st, self.manifest.voxel_size_nm)
+            layers = {l.get("name"): l for l in st.get("layers", [])}
+            image_layer = layers.get(em_name)
+            visible = (image_layer or {}).get("visible", True) is not False
+            slices = []
+            if visible:
+                axis, pos_nm, normal = cross_section_plane(st, self.manifest.voxel_size_nm)
+                old = next((s for s in k.slices if s.em_name == em_name), None)
+                slices = [SlicePlane(
+                    em_name=em_name,
+                    axis=axis,
+                    position_nm=pos_nm,
+                    normal=normal,
+                    contrast_limits=(
+                        _image_contrast_from_layer(image_layer)
+                        or (old.contrast_limits if old else None)
+                    ),
+                )]
+            out.append(k.model_copy(update={"camera": cam, "slices": slices}))
+        return out
+
     def _state_at_time(self, t: float):
         """The interpolated FrameState (camera/slices/meshes) at a GLOBAL time t (seconds),
         for one-off snapshot frames. Holds the last keyframe past the end."""
-        kfs = self.project.keyframes
+        kfs = getattr(self, "_kfs", None) or self._render_keyframes()
         from . import director as _director
         smooth = self._auto_direct and _director.DirectorSettings().smooth_camera
         return state_at_time(kfs, t, smooth_ends=smooth)
@@ -1807,7 +1860,7 @@ class RenderWorker:
 
         from ..data.ng_camera import handedness_flipped
         self._cb = None
-        self._kfs = self.project.keyframes
+        self._kfs = self._render_keyframes()
         st0 = next((k.ng_state for k in self.project.keyframes if k.ng_state), None)
         self._flip_handed = bool(st0 and handedness_flipped(st0))
         frames = [self._state_at_time(t) for t in times]
@@ -1827,7 +1880,7 @@ class RenderWorker:
         for d in (self.frames_dir, self.assets_dir):
             d.mkdir(parents=True, exist_ok=True)
 
-        kfs = self.project.keyframes
+        kfs = self._render_keyframes()
         if self.job.kf_range:
             a, b = self.job.kf_range
             kfs = kfs[a : b + 1]

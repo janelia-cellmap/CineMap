@@ -241,6 +241,10 @@ class SnapshotReq(BaseModel):
     label_mesh_decimate_fraction: float = 0.0
 
 
+class NgCaptureReq(BaseModel):
+    viewport: dict[str, Any] | None = None
+
+
 def _draft_render_settings(req: SnapshotReq | ThumbnailReq | None = None) -> RenderSettings:
     req = req or SnapshotReq()
     return RenderSettings(
@@ -430,9 +434,9 @@ def ng_url(request: Request):
 
 
 @app.post("/api/projects/{pid}/bake")
-def bake(pid: str):
+def bake(pid: str, req: NgCaptureReq | None = None):
     p = store.load(pid)
-    kf = scouting.bake_keyframe(p)
+    kf = scouting.bake_keyframe(p, viewport=(req.viewport if req else None))
     return kf.model_dump()
 
 
@@ -529,7 +533,7 @@ def get_thumbnail(pid: str, kid: str):
 
 
 @app.post("/api/projects/{pid}/keyframes/{kid}/update_from_ng")
-def update_from_ng(pid: str, kid: str):
+def update_from_ng(pid: str, kid: str, req: NgCaptureReq | None = None):
     """Overwrite this keyframe with the current Neuroglancer state (camera + layers
     + segments), keeping its timing — i.e. 'update current frame'. Also returns the
     per-layer setting `changes` (color/opacity/etc.) vs the previous version, so the UI
@@ -538,7 +542,7 @@ def update_from_ng(pid: str, kid: str):
     kf_old = next((k for k in p.keyframes if k.id == kid), None)
     old_meshes = [m.model_copy(deep=True) for m in kf_old.meshes] if kf_old else []
     old_bg = list(kf_old.lighting.background) if kf_old else None
-    kf = scouting.update_keyframe_from_view(p, kid)
+    kf = scouting.update_keyframe_from_view(p, kid, viewport=(req.viewport if req else None))
     if kf is None:
         raise HTTPException(404, "no such keyframe")
     changes = ops.diff_layer_settings(old_meshes, kf.meshes)

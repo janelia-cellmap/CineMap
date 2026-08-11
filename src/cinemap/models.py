@@ -54,6 +54,10 @@ class Camera(BaseModel):
     look_at_nm: list[float]
     fov_deg: float = 40.0
     up: list[float] = Field(default_factory=lambda: [0.0, 0.0, 1.0])
+    # Neuroglancer 2D/cross-section panels are orthographic. Perspective remains the
+    # default for existing projects baked from the 3D panel.
+    projection: Literal["PERSP", "ORTHO"] = "PERSP"
+    ortho_scale_nm: Optional[float] = None
 
 
 class SlicePlane(BaseModel):
