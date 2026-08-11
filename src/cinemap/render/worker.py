@@ -769,6 +769,9 @@ class RenderWorker:
             band_finest[b] = min(band_finest.get(b, x), x)
         return [band_finest[b] for b in bands]
 
+    def _mesh_source(self, mesh_name):
+        return next((m for m in self.manifest.meshes if m.name == mesh_name), None)
+
     def _mesh_uid(self, mesh_name, ids, color_key=(), nmpp=None) -> str:
         """Stable id per geometry asset.
 
@@ -776,15 +779,30 @@ class RenderWorker:
         Color/material are per-frame Blender state for fixed-color layers.  For NG
         hash-colored multi-ID layers, however, the combined mesh needs baked per-segment
         vertex colors, so the color resolver key is part of the geometry cache key.
+        Skeleton shader colors are also baked into tube vertex colors, so shader text
+        must participate in the geometry key.
         """
         import hashlib
 
-        # `geom8` versions the mesh decoder/cache key: this generation stores
+        src = self._mesh_source(mesh_name)
+        shader_sig = ""
+        if src and src.skeleton_url and not src.mesh_url and not src.label_zarr:
+            shader_sig = hashlib.md5((src.skeleton_shader or "").encode()).hexdigest()[:8]
+        # `geom10` versions the mesh decoder/cache key: this generation stores
         # Neuroglancer's octahedral-quantized/decoded vertex normals alongside base
         # geometry without baked colors for fixed-color layers, but keeps a color-keyed
-        # variant when NG hash coloring must be baked per segment.
+        # variant when NG hash coloring or skeleton shader coloring must be baked.
         color_sig = str(color_key) if color_key else "solid"
-        sig = ",".join(map(str, sorted(ids))) + "|" + color_sig + "|" + self._lod_tag_for(nmpp) + "|geom8"
+        sig = (
+            ",".join(map(str, sorted(ids)))
+            + "|"
+            + color_sig
+            + "|"
+            + self._lod_tag_for(nmpp)
+            + "|"
+            + shader_sig
+            + "|geom10"
+        )
         return f"{mesh_name}_{hashlib.md5(sig.encode()).hexdigest()[:8]}"
 
     def _clip_from_sweeps(self, layer_name: str, t: float) -> dict | None:
@@ -867,6 +885,16 @@ class RenderWorker:
         if getattr(lc, "default", None) is not None:
             return False
         return True
+
+    def _mesh_uses_shader_vertex_colors(self, mesh_name: str) -> bool:
+        src = self._mesh_source(mesh_name)
+        return bool(
+            src
+            and src.skeleton_url
+            and not src.mesh_url
+            and not src.label_zarr
+            and src.skeleton_shader
+        )
 
     @staticmethod
     def _layer_visible(m) -> bool:
@@ -1299,7 +1327,10 @@ class RenderWorker:
                     continue
                 ld, seg_ids = layers[m.mesh_name]
                 lc = self._frame_colors(m)
-                colorize_segments = self._mesh_needs_vertex_colors(m, lc)
+                colorize_segments = (
+                    self._mesh_needs_vertex_colors(m, lc)
+                    or self._mesh_uses_shader_vertex_colors(m.mesh_name)
+                )
                 ckey = str(lc.cache_key()) if colorize_segments else "solid"
                 fov = _m.radians(fr.fov_deg)
                 # select per-fragment LODs; raise tolerance until the frame fits budget

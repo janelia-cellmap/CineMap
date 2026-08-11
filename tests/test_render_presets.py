@@ -248,7 +248,7 @@ def test_mesh_npz_export_writes_neuroglancer_style_vertex_normals(tmp_path):
 def test_mesh_and_warm_cache_versions_include_ng_normal_generation():
     source = Path("src/cinemap/render/worker.py").read_text()
 
-    assert "|geom8" in source
+    assert "|geom10" in source
     assert "blender-material-v4" in source
 
 
