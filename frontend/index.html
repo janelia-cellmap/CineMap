@@ -49,6 +49,15 @@
   .controls input:not([type=checkbox]) { width:64px; }
   .controls input[type=checkbox] { width:auto; margin:0 2px 0 0; vertical-align:middle; }
   .controls label.chk { color:var(--fg); }  /* toggle labels read as active controls */
+  /* group dividers + tiny group captions so the toolbars read as labeled clusters */
+  .sep { width:1px; align-self:stretch; min-height:16px; background:var(--line); margin:0 5px; display:inline-block; }
+  .grp { font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); opacity:.6; margin:0 1px; }
+  .meshgrp { display:inline-flex; align-items:center; gap:6px; transition:opacity .12s; }
+  .meshgrp.off { opacity:.38; }  /* greyed when "from labels" is off */
+  /* stack the render controls as labeled rows (movie / render / mesh / scene) */
+  .ctlstack { flex-direction:column; align-items:stretch; gap:5px; }
+  .ctlrow { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  .ctlrow .grp { width:52px; flex:0 0 52px; text-align:right; }  /* aligned row captions */
   #bar { height:6px; background:#222734; border-radius:3px; overflow:hidden; }
   #barFill { height:100%; width:0%; background:var(--accent); transition:width .2s; }
   footer { height:200px; border-top:1px solid var(--line); background:#12151c; display:flex; flex-direction:column; }
@@ -150,36 +159,76 @@
   <div class="col right">
     <div class="pane-title">⬡ Render preview</div>
     <div id="preview"><span class="msg">render output appears here</span></div>
-    <div class="controls">
-      <label title="output width in pixels">w</label><input id="w" value="1280" />
-      <label title="output height in pixels">h</label><input id="h" value="720" />
-      <label title="Frames per second of the output video (motion smoothness). Total frames rendered = total duration (sum of keyframe durations) × fps.">fps</label><input id="fps" value="30" />
-      <label title="Cycles render samples per pixel: higher = less grain/noise but slower to render. ~16–32 for previews, 48+ for final.">samples</label><input id="samples" value="48" />
-      <label class="chk" title="Fast mode: 32 samples + aggressive adaptive sampling (noise threshold 0.06) and let the AI denoiser (OpenImageDenoise) clean the rest. ~2x faster frames at near-identical quality. Overrides the samples box."><input id="fastSample" type="checkbox" checked /> ⚡ fast</label>
-      <label title="Render engine. Cycles = photoreal path tracing (true transparency/AO/soft shadows) but slow — seconds–minutes per frame. Eevee = real-time rasterizer, ~10–50× faster per frame; shadows/transparency are approximate. Use Eevee for fast previews and movie drafts, Cycles for finals.">engine
-        <select id="engine">
-          <option value="CYCLES" selected>Cycles (photoreal)</option>
-          <option value="BLENDER_EEVEE_NEXT">Eevee (⚡ fast)</option>
-        </select></label>
-      <label title="Mesh quality = the per-layer vertex budget. Higher = crisper but more GPU memory (auto-retries lower if it runs out).">quality
-        <select id="detail">
-          <option value="1" selected>basic (~5M/layer)</option>
-          <option value="2">high (~10M/layer)</option>
-          <option value="3">max (~15M/layer)</option>
-        </select></label>
-      <label class="chk" title="Director: a non-destructive presentation pass that enhances the look WITHOUT changing your neuroglancer data — camera-relative key/fill/rim lighting, publication-quality materials, and subtle depth-of-field on the framed subject. Uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
-      <label class="chk" title="Draw a thin wireframe box around each data source's extent (the EM volume and/or each rendered layer's label volume), like neuroglancer's bounding box. Falls back to a tight box around the rendered meshes when a layer has no volume source."><input id="showBbox" type="checkbox" /> bbox</label>
-      <input id="bboxColor" type="color" value="#9ea8bd" title="bounding-box wireframe color" style="width:24px;height:20px;padding:0;border:1px solid var(--line);background:none;cursor:pointer" />
-      <select id="bboxSource" title="Which layer the bounding box is drawn from (its data/mesh extent) — works even if that layer is hidden. Auto = the EM volume, or all visible meshes." style="max-width:120px"><option value="">bbox: auto</option></select>
-      <label title="Mesh level-of-detail strategy (how fine the meshes are): Single = one resolution for the whole shot (used automatically when cutting away). Per-frame = coarser when a layer is far/small, finer on close-ups, like neuroglancer (free on orbits). Per-chunk = different detail within one mesh by on-screen size (experimental).">lod
-        <select id="lodMode">
-          <option value="frame" selected>per-frame</option>
-          <option value="single">single</option>
-          <option value="chunk">per-chunk (exp)</option>
-        </select></label>
-      <button id="previewBtn" onclick="startRender('preview')">▷ Preview</button>
-      <label title="preview renders at fps ÷ this">1/</label><input id="ratio" value="10" style="width:44px" />
-      <button id="cancelBtn" onclick="cancelRender()" style="display:none;background:#7d2e2e;border-color:transparent;color:#fff">■ Cancel</button>
+    <div class="controls ctlstack">
+      <!-- MOVIE: output frame size/rate + the preview action -->
+      <div class="ctlrow">
+        <span class="grp">movie</span>
+        <label title="output width in pixels">w</label><input id="w" value="1280" />
+        <label title="output height in pixels">h</label><input id="h" value="720" />
+        <label title="Frames per second of the output video (motion smoothness). Total frames rendered = total duration (sum of keyframe durations) × fps.">fps</label><input id="fps" value="30" />
+        <span class="grow"></span>
+        <button id="previewBtn" onclick="startRender('preview')">▷ Preview</button>
+        <label title="preview renders at fps ÷ this">1/</label><input id="ratio" value="10" style="width:44px" />
+        <button id="cancelBtn" onclick="cancelRender()" style="display:none;background:#7d2e2e;border-color:transparent;color:#fff">■ Cancel</button>
+      </div>
+
+      <!-- RENDER: engine + how clean each frame is rendered -->
+      <div class="ctlrow">
+        <span class="grp">render</span>
+        <label title="Render engine. Cycles = photoreal path tracing (true transparency/AO/soft shadows) but slow — seconds–minutes per frame. Eevee = real-time rasterizer, ~10–50× faster per frame; shadows/transparency are approximate. Use Eevee for fast previews and movie drafts, Cycles for finals.">engine
+          <select id="engine">
+            <option value="CYCLES" selected>Cycles (photoreal)</option>
+            <option value="BLENDER_EEVEE_NEXT">Eevee (⚡ fast)</option>
+          </select></label>
+        <label class="chk" title="Fast mode: 32 samples + aggressive adaptive sampling (noise threshold 0.06) and let the AI denoiser (OpenImageDenoise) clean the rest. ~2x faster frames at near-identical quality. Overrides the samples box."><input id="fastSample" type="checkbox" checked /> ⚡ fast</label>
+        <label title="Cycles render samples per pixel: higher = less grain/noise but slower to render. ~16–32 for previews, 48+ for final. This is RENDER cleanliness — not mesh resolution (that's 'detail').">samples</label><input id="samples" value="48" />
+      </div>
+
+      <!-- MESH: resolution budget, LOD strategy, and label-mesh build options -->
+      <div class="ctlrow">
+        <span class="grp">mesh</span>
+        <label title="Mesh detail = the per-layer vertex budget (how many vertices each layer's mesh may use). Higher = crisper geometry but more GPU memory; the worker auto-retries lower if it runs out. This is mesh RESOLUTION, not render quality (that's engine/samples).">detail
+          <select id="detail">
+            <option value="1">basic (~5M/layer)</option>
+            <option value="2">high (~10M/layer)</option>
+            <option value="3" selected>max (~15M/layer)</option>
+            <option value="6">ultra (~30M/layer)</option>
+            <option value="10">extreme (~50M/layer)</option>
+          </select></label>
+        <label title="Level-of-detail strategy — how the mesh scale is chosen ACROSS frames (detail sets the budget; lod decides how it's spent per frame). adaptive = coarser when a layer is far/small on screen, finer on close-ups (like neuroglancer); single = one fixed scale for the whole shot; per-chunk = mixed scales within one mesh (precomputed meshes only).">lod
+          <select id="lodMode">
+            <option value="frame" selected>adaptive</option>
+            <option value="single">single</option>
+            <option value="chunk">per-chunk (precomputed)</option>
+          </select></label>
+        <label class="chk" title="Build meshes from the label voxels with zmesh instead of downloading precomputed Neuroglancer meshes. Enables the smooth + decimate options to its right. (Reads blockwise automatically when the region is too large to load at once.)"><input id="labelMeshes" type="checkbox" /> from labels</label>
+        <span id="labelMeshOpts" class="meshgrp">
+          <label title="Taubin smoothing passes for label-derived meshes — rounds off the blocky voxel staircase. Off by default; 1–2 is usually enough.">smooth
+            <select id="labelSmooth">
+              <option value="0" selected>0</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="4">4</option>
+            </select></label>
+          <label title="Decimate label meshes after meshing — keep this fraction of the faces (lower = lighter mesh, less VRAM, slightly softer detail). Redundant-topology cleanup always runs regardless; this is the lossy reduction on top. e.g. 'medium' keeps ~half the faces.">decimate
+            <select id="labelDecimate">
+              <option value="0" selected>none</option>
+              <option value="0.75">light (keep 75%)</option>
+              <option value="0.5">medium (keep 50%)</option>
+              <option value="0.25">heavy (keep 25%)</option>
+              <option value="0.1">extreme (keep 10%)</option>
+            </select></label>
+        </span>
+      </div>
+
+      <!-- SCENE: presentation extras -->
+      <div class="ctlrow">
+        <span class="grp">scene</span>
+        <label class="chk" title="Director: optional camera smoothing and per-frame emphasis around the selected Look preset. If no Look preset is selected, uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
+        <label class="chk" title="Draw a thin wireframe box around each data source's extent (the EM volume and/or each rendered layer's label volume), like neuroglancer's bounding box. Falls back to a tight box around the rendered meshes when a layer has no volume source."><input id="showBbox" type="checkbox" /> bbox</label>
+        <input id="bboxColor" type="color" value="#9ea8bd" title="bounding-box wireframe color" style="width:24px;height:20px;padding:0;border:1px solid var(--line);background:none;cursor:pointer" />
+        <select id="bboxSource" title="Which layer the bounding box is drawn from (its data/mesh extent) — works even if that layer is hidden. Auto = the EM volume, or all visible meshes." style="max-width:120px"><option value="">bbox: auto</option></select>
+      </div>
     </div>
     <div class="controls" style="border-top:0"><div id="bar" class="grow"><div id="barFill"></div></div></div>
     <div class="controls" style="border-top:0"><span id="renderMsg" class="msg"></span></div>
@@ -206,15 +255,24 @@
 <footer>
   <div class="pane-title">Keyframe timeline — <span id="kfCount" class="msg">0 frames</span>
     <span class="grow"></span>
+    <!-- MOVE: add a camera/slice clip to the timeline -->
+    <span class="grp">move</span>
     <button onclick="openOrbitPanel()" title="Add an orbit move: the camera circles the current target. Choose the rotation axis, sweep degrees, duration, elevation, and sample count.">↻ Orbit</button>
     <button onclick="openPlanePanel()" title="Add a plane move: an EM slice sweep or a cutaway, as an independent clip on the timeline (start→stop over a duration).">▤ Plane scan</button>
-    <span style="width:12px"></span>
-    <label class="msg" title="Opacity of the 3D meshes on the SELECTED keyframe. Slide down to fade the meshes and reveal the EM cross-section behind them (0 = meshes hidden, only the EM slice shows).">3D mesh opacity</label>
+
+    <span class="sep"></span>
+    <!-- KEYFRAME: edit the currently-selected keyframe -->
+    <span class="grp">keyframe</span>
+    <label class="msg" title="Opacity of ALL 3D mesh layers on the SELECTED keyframe at once (a quick way to fade every mesh and reveal the EM cross-section behind them; 0 = meshes hidden, only the EM slice shows). For one layer only, use Propagate edit → opacity (3d).">mesh opacity</label>
     <input id="meshOp" type="range" min="0" max="1" step="0.05" value="1" style="width:90px"
-      onchange="setMeshOpacity()" title="Opacity of the 3D meshes on the selected keyframe (0 = hidden, reveals the EM slice; 1 = solid)." />
-    <button id="autoThumbBtn" onclick="toggleAutoThumbs()" title="Render a still thumbnail for every keyframe, one by one, so the timeline strip below fills in with previews. Thumbnails only — this is not the video (use Export for that).">⟳ Render all</button>
+      onchange="setMeshOpacity()" title="Opacity of ALL mesh layers on the selected keyframe (0 = hidden, reveals the EM slice; 1 = solid). Per-layer control is under Propagate edit → opacity (3d)." />
     <button onclick="openLookPanel()" title="Open the Look panel: try render styles (glow, roughness, material presets, tone-mapping) and preview them on the selected keyframe — non-destructive, doesn't change your data.">✨ Look</button>
     <button onclick="openPropPanel()" title="edit a layer setting on the selected keyframe and propagate it to later/earlier keyframes">✎ Propagate edit</button>
+
+    <span class="sep"></span>
+    <!-- OUTPUT: produce thumbnails / final deliverables -->
+    <span class="grp">output</span>
+    <button id="autoThumbBtn" onclick="toggleAutoThumbs()" title="Render a still thumbnail for every keyframe, one by one, so the timeline strip below fills in with previews. Thumbnails only — this is not the video (use Export for that).">⟳ Render all</button>
     <button id="exportBtn" class="primary" onclick="startRender('export')">⬇ Export video</button>
     <button id="blendBtn" onclick="startRender('blend')" title="bake the whole shot to a self-contained animated .blend (camera, meshes, EM slices; textures packed in)">⬇ Export .blend</button>
   </div>
@@ -273,7 +331,7 @@
   <label class="msg">Preset</label>
   <select id="lookPreset" onchange="lookPresetChanged()" style="width:100%">
     <option value="neuvid">neuVid — glossy 3-point (default)</option>
-    <option value="ng">neuroglancer — flat headlight</option>
+    <option value="ng">neuroglancer — WebGL shader</option>
     <option value="rake">raking — matte directional</option>
     <option value="drama">drama — deep shadows</option>
   </select>
@@ -321,8 +379,8 @@
     <option value="both">both</option>
   </select>
   <div id="planeSliceWrap">
-    <label class="msg" title="Which layer to show on the slice plane — an EM/image volume (grayscale) or a segmentation layer (its labels in color). No longer assumes a layer called 'em'/'raw'.">Slice layer</label>
-    <select id="planeSliceLayer" style="width:100%"></select>
+    <label class="msg" title="Layers to show on the scan plane. Select EM plus any segmentation overlays, or select one segmentation layer by itself for a label-only scan.">Scan layers</label>
+    <select id="planeSliceLayer" multiple size="5" style="width:100%"></select>
   </div>
   <label class="msg">Axis</label>
   <select id="planeAxis" style="width:100%" onchange="updateSideLabels()">
@@ -450,6 +508,17 @@ const api = async (m, url, body) => {
   return r.headers.get('content-type')?.includes('json') ? r.json() : r;
 };
 const setStatus = (s) => $('status').textContent = s;
+function ngCapturePayload() {
+  const el = $('ng');
+  const r = el.getBoundingClientRect();
+  return {
+    viewport: {
+      width_px: Math.max(1, Math.round(r.width)),
+      height_px: Math.max(1, Math.round(r.height)),
+      device_pixel_ratio: window.devicePixelRatio || 1
+    }
+  };
+}
 function clearFrameSelection() {
   ACTIVE_KF = null;
   KF_CLIPBOARD_ID = null;
@@ -681,6 +750,7 @@ function openTransEdit(e, id) {
     <label>easing <select id="teEase">
       ${['ease-in-out','linear','ease-in','ease-out'].map(o=>`<option value="${o}"${(k.easing||'ease-in-out')===o?' selected':''}>${o}</option>`).join('')}
     </select></label>` : ''}
+    <label class="chk" title="Fly through this keyframe instead of stopping at it: the camera keeps its speed through it (and any hold is ignored), so a run of waypoints reads as one continuous flow. Off = the camera eases to a stop here."><input id="teWaypoint" type="checkbox"${k.waypoint?' checked':''} /> waypoint (fly through, don't stop)</label>
     <label>hold after <input id="teHold" type="number" min="0" step="0.1" value="${fmtS(holdS(k))}" />s</label>
     <div class="te-row"><button onclick="gotoKf('${id}',null); closeTransEdit()">view</button>
       <button class="primary" onclick="applyTransEdit('${id}')">apply</button></div>
@@ -698,6 +768,7 @@ async function applyTransEdit(id){
   const fields = { hold_in_s: Math.max(0, parseFloat($('teHold').value)||0) };
   if ($('teDur')) fields.duration_in_s = Math.max(0, parseFloat($('teDur').value)||0);
   if ($('teEase')) fields.easing = $('teEase').value;
+  if ($('teWaypoint')) fields.waypoint = $('teWaypoint').checked;
   if ($('teTrans')) fields.transition = $('teTrans').value;
   if ($('teLayerTrans')) fields.layer_transition = $('teLayerTrans').value;
   if ($('teLayerAt')) fields.layer_transition_at = Math.max(0, Math.min(100, parseFloat($('teLayerAt').value)||0)) / 100;
@@ -723,7 +794,7 @@ function renderSweeps(p) {
     const isSlice = s.kind === 'slice';
     const disabled = s.enabled === false;
     const openCut = !isSlice && s.cap === false;
-    const name = isSlice ? (s.em_name || 'EM slice') : s.layer;
+    const name = isSlice ? sweepSliceName(s) : s.layer;
     const icon = isSlice ? '▦' : '▤';
     const grad = isSlice ? 'linear-gradient(90deg,#2f8f8f,#46c2c2)' : 'linear-gradient(90deg,#5a5fcf,#8a8fff)';
     const v = SNAP_VER[s.id] ? `?v=${SNAP_VER[s.id]}` : '';
@@ -737,6 +808,10 @@ function renderSweeps(p) {
       <span class="grip" onmousedown="event.stopPropagation(); startSweepDrag(event,'${s.id}','resize')"></span>
     </div>`;
   }).join('');
+}
+function sweepSliceName(s) {
+  const names = [s.em_name || 'EM'].concat(s.overlay_layers || []).filter(Boolean);
+  return names.length ? names.join(' + ') : 'EM slice';
 }
 let SWEEP_SNAPS = [];
 // drag a sweep along the lane (move = change start; resize = change duration), snapping the
@@ -787,7 +862,7 @@ function openSweepEdit(id) {
   EDIT_SWEEP_ID = id;
   const isSlice = s.kind === 'slice';
   document.querySelector('#sweepPanel b').textContent = isSlice ? '▦ Edit EM slice sweep' : '▤ Edit cutaway sweep';
-  $('sweepWhich').textContent = `${isSlice ? (s.em_name||'EM') : s.layer} · ${s.normal ? 'oblique' : s.axis} axis`;
+  $('sweepWhich').textContent = `${isSlice ? sweepSliceName(s) : s.layer} · ${s.normal ? 'oblique' : s.axis} axis`;
   $('swSideRow').style.display = isSlice ? 'none' : 'block';   // 'side' only meaningful for a cut
   $('swCapRow').style.display = isSlice ? 'none' : 'block';
   // label the side by the cut's actual orientation (oblique => direction, not "+z")
@@ -808,7 +883,7 @@ async function renderSweepSnapshots() {
   const id = EDIT_SWEEP_ID;
   $('swMsg').textContent = 'rendering preview frames… (runs in the background)';
   try {
-    await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`);
+    await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`, draftRenderSettings());
   } catch (e) { $('swMsg').textContent = 'failed to start: ' + (e.message||e); return; }
   const poll = async () => {
     let st; try { st = await api('GET', `/api/projects/${PID}/sweeps/${id}/snapshots/status`); }
@@ -954,11 +1029,19 @@ function showKeyframeThumb(id) {
 
 // render the single keyframe to a still; show it live and keep it as the frame thumbnail
 let THUMB_JOB = null;
+function draftRenderSettings() {
+  return {
+    mesh_from_labels: $('labelMeshes').checked,
+    mesh_detail: +$('detail').value || 1,
+    label_mesh_smooth_iters: +$('labelSmooth').value || 0,
+    label_mesh_decimate_fraction: +$('labelDecimate').value || 0
+  };
+}
 async function renderThumbnail(id) {
   AUTO_THUMBS = false;   // a manual single-thumbnail render stops the auto sweep
   if (THUMB_JOB) { api('POST', `/api/renders/${THUMB_JOB}/cancel`).catch(() => {}); }  // don't pile up
   try {
-    const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`);
+    const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`, draftRenderSettings());
     THUMB_JOB = job_id;
     attachRender(job_id, () => {
       if (THUMB_JOB === job_id) THUMB_JOB = null;
@@ -974,7 +1057,7 @@ let AUTO_THUMBS = false;
 function renderThumbAwait(id) {
   return new Promise(async (resolve) => {
     try {
-      const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`);
+      const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`, draftRenderSettings());
       THUMB_JOB = job_id;
       attachRender(job_id, () => { if (THUMB_JOB === job_id) THUMB_JOB = null; THUMB_VER[id] = Date.now(); resolve(); }, true);
     } catch (e) { resolve(); }   // one failure shouldn't stall the rest
@@ -1020,7 +1103,7 @@ function orderedSweepIds() {
 let SNAP_JOB = null;   // id of the in-flight sweep-snapshot render, so Stop can cancel it
 function bakeSweepSnapAwait(id) {
   return new Promise(async (resolve) => {
-    try { const r = await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`); SNAP_JOB = r.job_id || `snap_${id}`; }
+    try { const r = await api('POST', `/api/projects/${PID}/sweeps/${id}/snapshots`, draftRenderSettings()); SNAP_JOB = r.job_id || `snap_${id}`; }
     catch { return resolve(); }
     const poll = async () => {
       if (!AUTO_THUMBS) { SNAP_JOB = null; return resolve(); }   // stopped
@@ -1082,7 +1165,7 @@ async function updateFrame() {
   const id = ACTIVE_KF || LAST_KF_ID;
   if (!id) { setStatus('click a keyframe to select it first'); return; }
   try {
-    const kf = await api('POST', `/api/projects/${PID}/keyframes/${id}/update_from_ng`);
+    const kf = await api('POST', `/api/projects/${PID}/keyframes/${id}/update_from_ng`, ngCapturePayload());
     const n = kf.meshes.reduce((a, m) => a + (m.segment_ids?.length || 0), 0);
     setStatus(`updated frame from Neuroglancer (camera + ${n} segment(s)) — rendering…`);
     reload();
@@ -1094,7 +1177,7 @@ async function updateFrame() {
 async function bake() {
   if (!PID) { setStatus('create/open a project first'); return; }
   try {
-    const kf = await api('POST', `/api/projects/${PID}/bake`);
+    const kf = await api('POST', `/api/projects/${PID}/bake`, ngCapturePayload());
     ACTIVE_KF = kf.id; reload();
     setStatus('baked keyframe — rendering…');
     renderThumbnail(kf.id);
@@ -1154,12 +1237,25 @@ async function openPlanePanel() {
   $('planeSliceLayer').innerHTML = sl.length
     ? sl.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')
     : '<option value="">(default EM)</option>';
+  const emName = (man.em && man.em.name) ? man.em.name : '';
+  Array.from($('planeSliceLayer').options).forEach(o => {
+    o.selected = o.value === emName || (!emName && o.value === '');
+  });
   if ($('planeStart')) $('planeStart').value = fmtS(activeKfTime());
   planeModeChanged(); updateSideLabels();
   PREVIEW_READY = false; if ($('planeSnaps')) $('planeSnaps').innerHTML = '';
   $('planeMsg').textContent = ''; $('planePanel').style.display='block';
 }
 let LAST_CUT_LAYER = '';
+function selectedScanLayers() {
+  const select = $('planeSliceLayer');
+  const sel = Array.from((select && select.selectedOptions) || []).map(o => o.value).filter(v => v !== '');
+  if (!sel.length) return { em_name: '', overlay_layers: [] };
+  const emOpt = Array.from((select && select.options) || []).find(o => /— EM$/.test(o.textContent || ''));
+  const emName = emOpt ? emOpt.value : '';
+  const primary = (emName && sel.includes(emName)) ? emName : sel[0];
+  return { em_name: primary, overlay_layers: sel.filter(v => v !== primary) };
+}
 // drag the divider between the scouting (NG) and preview panes to expand either one.
 // Adjusts only the left/right flex (the Claude column is untouched); the iframe gets
 // pointer-events:none mid-drag so the mouse can cross it.
@@ -1221,8 +1317,9 @@ async function previewPlaneScan() {
   if (kind === 'cutaway' && !layer) { $('planeMsg').textContent = 'pick a layer to cut'; return; }
   // Use the selected global start time so preview and saved clips agree on placement.
   const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: start, mirror: $('planeMirror').checked };
+  Object.assign(body, draftRenderSettings());
   if (kind === 'cutaway') { body.layer = layer; body.cap = $('planeCap').checked; }
-  else body.em_name = $('planeSliceLayer').value;   // which layer the slice shows (EM or seg)
+  else Object.assign(body, selectedScanLayers());
   if (fn.length) body.from_ng = fn;
   if (tn.length) body.to_ng = tn;
   $('planeMsg').textContent = 'rendering preview…';
@@ -1278,7 +1375,7 @@ async function applyPlaneScan() {
   const mk = async (kind) => {
     const body = { kind, axis, side, easing: 'linear', duration_s: dur, start_s: start, mirror: $('planeMirror').checked };
     if (kind === 'cutaway') { body.layer = layer; body.cap = $('planeCap').checked; LAST_CUT_LAYER = layer; }
-    else body.em_name = $('planeSliceLayer').value;   // which layer the slice shows (EM or seg)
+    else Object.assign(body, selectedScanLayers());
     if (fn.length) body.from_ng = fn;
     if (tn.length) body.to_ng = tn;
     return await api('POST', `/api/projects/${PID}/sweeps`, body);   // returns the new sweep
@@ -1352,12 +1449,34 @@ function rgb01ToHex(rgb) {
   const h = v => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
   return Array.isArray(rgb) && rgb.length >= 3 ? `#${h(rgb[0])}${h(rgb[1])}${h(rgb[2])}` : '#9ea8bd';
 }
+function syncMeshSourceControls() {
+  const useLabels = $('labelMeshes').checked;
+  const lod = $('lodMode');
+  // smooth/decimate only apply to label-derived meshes — grey the group when off
+  $('labelSmooth').disabled = !useLabels;
+  $('labelDecimate').disabled = !useLabels;
+  $('labelMeshOpts').classList.toggle('off', !useLabels);
+  const chunk = [...lod.options].find(o => o.value === 'chunk');
+  if (chunk) chunk.disabled = useLabels;
+  if (useLabels && lod.value === 'chunk') lod.value = 'frame';
+  lod.title = useLabels
+    ? 'Label meshes use zmesh scale selection from quality/ROI budgets; per-chunk Neuroglancer LOD is unavailable.'
+    : 'Precomputed meshes can use single, adaptive per-frame, or experimental per-chunk Neuroglancer LOD.';
+}
+function selectedLodMode() {
+  syncMeshSourceControls();
+  return $('lodMode').value;
+}
 // persist the render controls on the project so they survive reload + travel with export
 function saveRenderPrefs() {
   if (!PID) return;
+  syncMeshSourceControls();
   const prefs = { width: +$('w').value, height: +$('h').value, fps: +$('fps').value,
     samples: +$('samples').value, mesh_detail: +$('detail').value || 1,
-    auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
+    mesh_from_labels: $('labelMeshes').checked,
+    label_mesh_smooth_iters: +$('labelSmooth').value || 0,
+    label_mesh_decimate_fraction: +$('labelDecimate').value || 0,
+    auto_direct: $('autoDirect').checked, lod_mode: selectedLodMode(),
     show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
     bbox_source: $('bboxSource').value, preview_ratio: +$('ratio').value || 10,
     fast_sample: $('fastSample').checked };
@@ -1370,11 +1489,15 @@ function applyRenderPrefs(p) {
   const set = (id, v) => { const el = $(id); if (el != null && v != null) el.value = v; };
   set('w', rp.width); set('h', rp.height); set('fps', rp.fps); set('samples', rp.samples);
   set('detail', rp.mesh_detail); set('lodMode', rp.lod_mode); set('ratio', rp.preview_ratio);
+  set('labelSmooth', rp.label_mesh_smooth_iters);
+  set('labelDecimate', rp.label_mesh_decimate_fraction);
+  if (rp.mesh_from_labels != null) $('labelMeshes').checked = !!rp.mesh_from_labels;
   if (rp.auto_direct != null) $('autoDirect').checked = !!rp.auto_direct;
   if (rp.show_bbox != null) $('showBbox').checked = !!rp.show_bbox;
   if (rp.bbox_color) $('bboxColor').value = rgb01ToHex(rp.bbox_color);
   if (rp.bbox_source != null) $('bboxSource').value = rp.bbox_source;
   if (rp.fast_sample != null) $('fastSample').checked = !!rp.fast_sample;
+  syncMeshSourceControls();
 }
 async function startRender(mode) {
   AUTO_THUMBS = false;   // stop any thumbnail auto-sweep before a full render
@@ -1395,7 +1518,10 @@ async function startRender(mode) {
                  noise_threshold: fast ? 0.06 : 0.01,
                  engine: $('engine').value,
                  draft: mode === 'preview', mesh_detail: +$('detail').value || 1,
-                 auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
+                 mesh_from_labels: $('labelMeshes').checked,
+                 label_mesh_smooth_iters: +$('labelSmooth').value || 0,
+                 label_mesh_decimate_fraction: +$('labelDecimate').value || 0,
+                 auto_direct: $('autoDirect').checked, lod_mode: selectedLodMode(),
                  show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
                  bbox_source: $('bboxSource').value };
   if (mode === 'blend') body.export_blend = true;   // bake an animated .blend, no video
@@ -1656,7 +1782,14 @@ const FIELD_LABELS = { segment_color: 'segment color', default_color: 'default c
   object_alpha: 'opacity (3d)', silhouette: 'silhouette (3d)', saturation: 'saturation',
   color_seed: 'color seed', visible: 'visible', color: 'color',
   metallic: 'metallic', roughness: 'roughness' };
+function rgbHex01(rgb) {
+  if (!Array.isArray(rgb)) return '?';
+  const h = v => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
+  return `#${h(rgb[0])}${h(rgb[1])}${h(rgb[2])}`;
+}
 function changeLabel(c) {
+  if (c.field === 'background')   // per-keyframe, no mesh_name
+    return `3D background: ${rgbHex01(c.old)} → ${rgbHex01(c.new)}`;
   let s = `${c.mesh_name} • ${FIELD_LABELS[c.field] || c.field}`;
   if (c.field === 'segment_color') s += ` (seg ${c.segment_id})`;
   if (['object_alpha', 'silhouette', 'saturation', 'color_seed', 'visible', 'metallic', 'roughness'].includes(c.field))
@@ -1675,9 +1808,14 @@ async function applyNgPropagate() {
   const changedIds = new Set();
   try {
     for (const c of NG_CHANGES) {
-      const r = await api('POST', `/api/projects/${PID}/keyframes/${NG_PROP_KID}/propagate`,
-        { mesh_name: c.mesh_name, field: c.field, value: c.new, segment_id: c.segment_id ?? null,
-          direction: dir, match_old: matchOnly, match_value: c.old, match_value_set: true });
+      const url = c.field === 'background'
+        ? `/api/projects/${PID}/keyframes/${NG_PROP_KID}/propagate_background`
+        : `/api/projects/${PID}/keyframes/${NG_PROP_KID}/propagate`;
+      const body = c.field === 'background'
+        ? { direction: dir, match_old: matchOnly, match_value: c.old, match_value_set: true }
+        : { mesh_name: c.mesh_name, field: c.field, value: c.new, segment_id: c.segment_id ?? null,
+            direction: dir, match_old: matchOnly, match_value: c.old, match_value_set: true };
+      const r = await api('POST', url, body);
       total += (r.count || 1) - 1;   // exclude the source keyframe itself
       (r.changed || []).forEach(id => changedIds.add(id));
     }
@@ -1694,16 +1832,16 @@ let PREV_LOOK = null, PREV_IMG = null;
 // material "type" presets — set the Principled knobs (the look panel exposes glow/
 // roughness/specular sliders; metallic/transmission/sheen come from the type).
 const MAT_STYLES = {
-  glossy:     { roughness: 0.25, specular: 0.5, glow: 0.02 },
-  matte:      { roughness: 0.9,  specular: 0.1, glow: 0.02 },
-  plastic:    { roughness: 0.4,  specular: 0.6, glow: 0.02 },
-  metallic:   { roughness: 0.3,  specular: 0.5, metallic: 1.0, glow: 0.02 },
-  chrome:     { roughness: 0.05, specular: 0.5, metallic: 1.0, glow: 0.02 },
-  ceramic:    { roughness: 0.25, specular: 0.5, coat: 1.0, glow: 0.02 },
-  waxy:       { roughness: 0.5,  specular: 0.3, sheen: 1.0, glow: 0.02 },
-  subsurface: { roughness: 0.45, specular: 0.4, subsurface: 1.0, glow: 0.02 },
-  glassy:     { roughness: 0.0,  specular: 0.5, transmission: 1.0, glow: 0.02 },
-  frosted:    { roughness: 0.4,  specular: 0.5, transmission: 0.7, glow: 0.02 },
+  glossy:     { roughness: 0.25, specular: 0.5, glow: 0.0 },
+  matte:      { roughness: 0.9,  specular: 0.1, glow: 0.0 },
+  plastic:    { roughness: 0.4,  specular: 0.6, glow: 0.0 },
+  metallic:   { roughness: 0.3,  specular: 0.5, metallic: 1.0, glow: 0.0 },
+  chrome:     { roughness: 0.05, specular: 0.5, metallic: 1.0, glow: 0.0 },
+  ceramic:    { roughness: 0.25, specular: 0.5, coat: 1.0, glow: 0.0 },
+  waxy:       { roughness: 0.5,  specular: 0.3, sheen: 1.0, glow: 0.0 },
+  subsurface: { roughness: 0.45, specular: 0.4, subsurface: 1.0, glow: 0.0 },
+  glassy:     { roughness: 0.0,  specular: 0.5, transmission: 1.0, glow: 0.0 },
+  frosted:    { roughness: 0.4,  specular: 0.5, transmission: 0.7, glow: 0.0 },
   glow:       { roughness: 0.4,  specular: 0.4, glow: 0.4 },
 };
 function syncLookVals() {
@@ -1718,7 +1856,7 @@ function setLookControls(L) {
   L = L || {};
   $('lookPreset').value = L.preset || 'neuvid';
   $('lookMat').value = L.material || 'glossy';
-  $('lookGlow').value = L.glow != null ? L.glow : 0.02;
+  $('lookGlow').value = L.glow != null ? L.glow : 0.0;
   $('lookRough').value = L.roughness != null ? L.roughness : 0.25;
   $('lookSpec').value = L.specular != null ? L.specular : 0.5;
   syncLookVals();
@@ -1801,6 +1939,11 @@ async function undoLook() {
   } catch (e) { $('lookMsg').textContent = 'error: ' + e.message; }
 }
 
+$('labelMeshes').addEventListener('change', () => { syncMeshSourceControls(); saveRenderPrefs(); });
+$('labelSmooth').addEventListener('change', saveRenderPrefs);
+$('labelDecimate').addEventListener('change', saveRenderPrefs);
+$('lodMode').addEventListener('change', () => { syncMeshSourceControls(); saveRenderPrefs(); });
+syncMeshSourceControls();
 refreshProjects();
 checkConfig();
 </script>

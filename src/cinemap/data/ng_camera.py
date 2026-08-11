@@ -81,6 +81,83 @@ def handedness_flipped(state: dict) -> bool:
     return swaps % 2 == 1
 
 
+def _capture_viewport_px(state: dict, default_height: int = 720) -> tuple[int | None, int]:
+    """Best estimate of the active Neuroglancer data-panel viewport in CSS pixels.
+
+    Neuroglancer's JSON state stores the navigation zoom, but not the browser panel
+    rectangle. CineMap's frontend adds `_cinemap_viewport` during bake/update.  When
+    a layer side panel is open, NG serializes its pixel `size` under `selectedLayer`;
+    subtracting that avoids treating a narrow slice panel as if it occupied the whole
+    iframe.
+    """
+    meta = state.get("_cinemap_viewport") or {}
+    try:
+        width = int(round(float(meta.get("width_px"))))
+    except (TypeError, ValueError):
+        width = None
+    try:
+        height = int(round(float(meta.get("height_px"))))
+    except (TypeError, ValueError):
+        height = int(default_height)
+    height = max(1, height)
+
+    selected = state.get("selectedLayer") or {}
+    if width is not None and selected.get("visible", False) is not False:
+        try:
+            width -= int(round(float(selected.get("size", 0))))
+        except (TypeError, ValueError):
+            pass
+    settings = state.get("settingsPanel") or {}
+    if width is not None and settings.get("visible", False) is not False:
+        try:
+            width -= int(round(float(settings.get("size", 0))))
+        except (TypeError, ValueError):
+            pass
+    return (max(1, width) if width is not None else None), height
+
+
+def _layout_axes(state: dict) -> str | None:
+    layout = str(state.get("layout") or "")
+    for axes in ("xy", "xz", "yz"):
+        if layout == axes or layout == f"{axes}-3d":
+            return axes
+    return None
+
+
+def _cross_section_rotation(state: dict) -> Rotation:
+    """Neuroglancer orientation for the active cross-section panel.
+
+    Named layouts are relative to `crossSectionOrientation` in NG:
+    xy = base, xz = base*Rx(90deg), yz = base*Ry(90deg).
+    """
+    q = state.get("crossSectionOrientation") or [0.0, 0.0, 0.0, 1.0]
+    rot = Rotation.from_quat(q)
+    axes = _layout_axes(state)
+    if axes == "xz":
+        rot = rot * Rotation.from_euler("x", 90.0, degrees=True)
+    elif axes == "yz":
+        rot = rot * Rotation.from_euler("y", 90.0, degrees=True)
+    return rot
+
+
+def _named_layout_vectors(state: dict) -> tuple[np.ndarray, np.ndarray] | None:
+    """Direct xyz view vectors for explicit single named slice layouts.
+
+    NG stores quaternions in display-dimension order.  For states whose dimensions are
+    serialized as z,y,x, deriving a named `xy`/`xz`/`yz` panel from the quaternion can
+    select the wrong world-normal.  When the layout explicitly names the panel, honor
+    that name directly.
+    """
+    axes = _layout_axes(state)
+    if axes == "xy":
+        return np.array([0.0, 0.0, 1.0]), np.array([0.0, -1.0, 0.0])
+    if axes == "xz":
+        return np.array([0.0, -1.0, 0.0]), np.array([0.0, 0.0, -1.0])
+    if axes == "yz":
+        return np.array([1.0, 0.0, 0.0]), np.array([0.0, -1.0, 0.0])
+    return None
+
+
 def ng_to_camera(state: dict, voxel_nm, fov_deg: float = NG_FOV_DEG) -> Camera:
     perm = _xyz_perm(state)
     voxel_nm = _voxel_nm_from_state(state, voxel_nm)
@@ -107,6 +184,71 @@ def ng_to_camera(state: dict, voxel_nm, fov_deg: float = NG_FOV_DEG) -> Camera:
     cam_pos = look_at - fwd * dist
     return Camera(position_nm=cam_pos.tolist(), look_at_nm=look_at.tolist(),
                   fov_deg=fov_deg, up=up.tolist())
+
+
+def ng_to_cross_section_camera(
+    state: dict,
+    voxel_nm,
+    viewport_height_px: int | None = None,
+) -> Camera:
+    """Convert Neuroglancer's 2D/cross-section navigation state to an orthographic
+    Blender camera.
+
+    `crossSectionScale` is Neuroglancer's cross-section zoom factor in display units
+    per screen pixel. The state's `position` is in the same display units, so after
+    applying the per-dimension scale we get nm/pixel and therefore the vertical
+    orthographic extent for a movie frame.
+    """
+    perm = _xyz_perm(state)
+    voxel_nm = _voxel_nm_from_state(state, voxel_nm)
+    pos_vox = np.array(state.get("position") or [0, 0, 0], dtype=float)
+    look_at = (pos_vox * _vox(voxel_nm))[perm]
+    named = _named_layout_vectors(state)
+    if named is None:
+        rot = _cross_section_rotation(state)
+        fwd = rot.apply([0.0, 0.0, 1.0])[perm]
+        up = rot.apply([0.0, -1.0, 0.0])[perm]
+    else:
+        fwd, up = named
+    fwd = fwd / (np.linalg.norm(fwd) or 1.0)
+    up = up - np.dot(up, fwd) * fwd
+    up = up / (np.linalg.norm(up) or 1.0)
+
+    if viewport_height_px is None:
+        _, viewport_height_px = _capture_viewport_px(state)
+    scale_units_per_px = float(state.get("crossSectionScale", 1.0) or 1.0)
+    nm_per_px = scale_units_per_px * float(np.mean(_vox(voxel_nm)))
+    ortho_scale_nm = max(1.0, nm_per_px * max(1, int(viewport_height_px)))
+    # Orthographic cameras do not use distance for framing, but Blender still needs
+    # a location and direction. Keep it comfortably in front of the slice plane.
+    dist = max(ortho_scale_nm, 1000.0)
+    cam_pos = look_at - fwd * dist
+    return Camera(
+        position_nm=cam_pos.tolist(),
+        look_at_nm=look_at.tolist(),
+        fov_deg=NG_FOV_DEG,
+        up=up.tolist(),
+        projection="ORTHO",
+        ortho_scale_nm=ortho_scale_nm,
+    )
+
+
+def cross_section_plane(state: dict, voxel_nm) -> tuple[str, float, list[float] | None]:
+    """Return (dominant_axis, plane_offset_nm, normal_xyz) for the active 2D panel."""
+    cam = ng_to_cross_section_camera(state, voxel_nm)
+    look_at = np.asarray(cam.look_at_nm, dtype=float)
+    fwd = np.asarray(cam.look_at_nm, dtype=float) - np.asarray(cam.position_nm, dtype=float)
+    fwd = fwd / (np.linalg.norm(fwd) or 1.0)
+    ai = int(np.argmax(np.abs(fwd)))
+    axis = ("x", "y", "z")[ai]
+    normal = [float(x) for x in fwd]
+    if abs(abs(normal[ai]) - 1.0) < 1e-6:
+        normal_out = None
+        pos = float(look_at[ai])
+    else:
+        normal_out = normal
+        pos = float(np.dot(look_at, fwd))
+    return axis, pos, normal_out
 
 
 def camera_to_ng(camera: Camera, voxel_nm, base_state: dict | None = None) -> dict:

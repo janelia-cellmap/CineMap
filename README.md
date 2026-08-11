@@ -44,6 +44,9 @@ Baking (or updating) a keyframe records the full state of your view:
 - **Visible segments** — for mesh layers, which segment IDs are on
 - **Segment colors** — the exact colors from Neuroglancer
 - **3D mesh opacity & silhouette** — the mesh rendering style
+- **3D background** — Neuroglancer's projection-view background color (per keyframe,
+  so it can change through a shot); when you change it in Neuroglancer and
+  `⟳ Update current frame`, CineMap offers to propagate it to the other keyframes
 - **Camera** — position, zoom, and rotation, taken from the **3D preview** panel
 
 To frame a shot, use the **3D preview** (right pane): zoom in, zoom out, and rotate
@@ -63,6 +66,28 @@ there — that camera is what gets baked.
   but out of preview/export renders.
 - **Import / Export project** — save and reload a whole project with `⭱ Import` /
   `⭳ Export`.
+
+## Render controls
+
+The toolbar above the preview is grouped into labeled rows:
+
+- **movie** — output `w`/`h`/`fps` and the `▷ Preview` action.
+- **render** — `engine` (Cycles photoreal vs. Eevee fast), `⚡ fast`, and `samples`
+  (render cleanliness — *not* mesh resolution).
+- **mesh** — `detail` (per-layer vertex budget — mesh *resolution*), `lod`
+  (adaptive / single / per-chunk), and **`from labels`**: build meshes from the
+  label voxels with zmesh instead of downloading precomputed Neuroglancer meshes.
+  When `from labels` is on, two extra knobs apply:
+    - **smooth** — Taubin smoothing passes (rounds off the voxel staircase).
+    - **decimate** — keep this fraction of the faces after meshing (e.g. *medium* ≈
+      50%, *extreme* ≈ 10%), so the delivered mesh sits below the detail budget with
+      less VRAM. Decimation is per segment, so instance colors are preserved.
+
+  Label meshing loads up to the `detail` budget, then decimates below it. Large,
+  sparsely-occupied regions (e.g. thousands of scattered organelles) are read and
+  meshed **blockwise** automatically — bounded per-block memory so a fine scale that
+  wouldn't fit in one read still works.
+- **scene** — `director`, the bounding-box wireframe (`bbox` + color + source).
 
 ## Exporting
 
@@ -84,6 +109,9 @@ conda run -n mv_env pip install -e .     # installs all deps incl. bpy (Blender/
 
 Requires an NVIDIA GPU (OPTIX / Cycles) and network access to the data host (data
 is read over https; `/nrs` need not be mounted).
+
+Projects and render assets are stored under `./projects/` by default. Set
+`CINEMAP_PROJECTS_DIR` to use shared storage or another project root.
 
 **Choosing a GPU.** By default the renderer uses every available NVIDIA GPU. On a
 multi-GPU machine, set `CINEMAP_GPU` to pick one (or several) by index — the

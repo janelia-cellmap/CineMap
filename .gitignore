@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .ruff_cache/
 .pytest_cache/
+.vscode/
 
 # mvideo runtime data (projects, renders, frames, assets)
 projects/
@@ -11,6 +12,7 @@ projects/
 # spike outputs
 spikes/out/
 spikes/*.log
+spikes/er_comparison/
 projects/
 cluster/
 cluster_render/

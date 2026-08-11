@@ -27,7 +27,7 @@ def _image_response(path: str, media: str = "image/png", cacheable: bool = False
     cc = "public, max-age=31536000, immutable" if cacheable else "no-store"
     return Response(content=data, media_type=media, headers={"Cache-Control": cc})
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import config, operations as ops
 from . import scouting, store
@@ -49,6 +49,49 @@ _render_state: dict[str, dict] = {}
 # live workers (so a render can be cancelled): job_id -> RenderWorker (thumbnails)
 # OR _SubprocHandle (full video renders). Both expose .terminate().
 _workers: dict[str, Any] = {}
+
+
+def _returncode_message(returncode: int | None) -> str:
+    if returncode is None:
+        return "render process exited without a final status"
+    if returncode < 0:
+        import signal as _signal
+        sig = -returncode
+        try:
+            name = _signal.Signals(sig).name
+        except ValueError:
+            name = f"signal {sig}"
+        return f"render process was killed by {name}"
+    return f"render process exited {returncode}"
+
+
+def _persist_render_status(
+    pid: str,
+    job_id: str,
+    status: str,
+    message: str,
+    progress: float,
+    output: str | None = None,
+) -> None:
+    """Mirror terminal subprocess state into project.json for later UI reloads.
+
+    Full renders run in a child process, so the server's project cache can be stale.
+    Always invalidate before writing the terminal status.
+    """
+    try:
+        store.invalidate(pid)
+        p = store.load(pid)
+        job = next((j for j in p.renders if j.id == job_id), None)
+        if job is None:
+            return
+        job.status = status
+        job.message = message
+        job.progress = progress
+        if output:
+            job.output_path = output
+        store.save(p)
+    except Exception as e:  # noqa: BLE001
+        print(f"[run_job {job_id}] failed to persist render status: {e}", flush=True)
 
 
 class _SubprocHandle:
@@ -174,12 +217,56 @@ class RenderReq(BaseModel):
     export_blend: bool = False  # produce a self-contained .blend instead of a video
     draft: bool = False         # fast low-res preview (coarse EM + low-voxel meshes)
     mesh_detail: float = 1.0    # per-layer vertex-budget multiplier (hard-capped)
-    mesh_from_labels: bool = False  # regenerate watertight meshes from labels vs precomputed
+    mesh_from_labels: bool = False  # regenerate render meshes from labels with zmesh
+    label_mesh_smooth_iters: int = 0      # Taubin smoothing passes for label meshes
+    label_mesh_decimate_fraction: float = 0.0  # keep-fraction (0=off); reads finer, decimates to budget
     auto_direct: bool = True    # non-destructive presentation pass (lighting/material/DOF)
     lod_mode: str = "frame"     # mesh LOD: "single" | "frame" (per-frame adaptive) | "chunk"
     show_bbox: bool = False     # draw a wireframe box around each data source's extent
     bbox_color: list[float] | None = None   # wireframe rgb (0–1); None = default gray
     bbox_source: str = ""       # layer name to box (even if hidden); "" = auto
+
+
+class ThumbnailReq(BaseModel):
+    mesh_from_labels: bool = False  # keep thumbnails source-compatible with previews
+    mesh_detail: float = 1.0
+    label_mesh_smooth_iters: int = 0
+    label_mesh_decimate_fraction: float = 0.0
+
+
+class SnapshotReq(BaseModel):
+    mesh_from_labels: bool = False
+    mesh_detail: float = 1.0
+    label_mesh_smooth_iters: int = 0
+    label_mesh_decimate_fraction: float = 0.0
+
+
+class NgCaptureReq(BaseModel):
+    viewport: dict[str, Any] | None = None
+
+
+def _draft_render_settings(req: SnapshotReq | ThumbnailReq | None = None) -> RenderSettings:
+    req = req or SnapshotReq()
+    return RenderSettings(
+        width=240,
+        height=160,
+        samples=12,
+        fps=2,
+        draft=True,
+        mesh_detail=req.mesh_detail,
+        mesh_from_labels=req.mesh_from_labels,
+        label_mesh_smooth_iters=req.label_mesh_smooth_iters,
+        label_mesh_decimate_fraction=req.label_mesh_decimate_fraction,
+    )
+
+
+def _effective_lod_mode(mesh_from_labels: bool, lod_mode: str) -> str:
+    lod = lod_mode if lod_mode in {"single", "frame", "chunk"} else "frame"
+    # Chunk LOD is a precomputed-mesh fragment path. Label meshes are generated from
+    # zmesh at a budget-selected scale, so keep them on the combined adaptive path.
+    if mesh_from_labels and lod == "chunk":
+        return "frame"
+    return lod
 
 
 class ChatReq(BaseModel):
@@ -275,6 +362,8 @@ def import_project(body: dict):
     p.renders = []              # drop render history (output files won't exist)
     for kf in p.keyframes:      # thumbnails live in the OLD project dir -> stale paths; regenerate
         kf.thumbnail_path = None
+        if kf.ng_state:
+            scouting._merge_manifest(p, kf.ng_state)
     store.save(p)
     try:
         scouting.load_dataset(p.data_path)
@@ -321,7 +410,13 @@ def _ng_url_for(request: Request) -> str:
 @app.post("/api/projects/{pid}/open")
 def open_project(pid: str, request: Request):
     p = store.load(pid)
-    scouting.load_dataset(p.data_path)
+    try:
+        scouting.load_dataset(p.data_path)
+    except Exception as e:  # noqa: BLE001
+        # Imported projects keep the exact source URL used to create them. Those
+        # external state links can disappear; the per-keyframe sidecars are the
+        # durable project state, so still let opening jump to the first keyframe.
+        print(f"[open] load_dataset failed for {pid}: {e}", flush=True)
     # Drive the viewer to the first keyframe so opening a project shows something
     # immediately — otherwise the iframe is blank/default until the user clicks a row.
     if p.keyframes:
@@ -339,9 +434,9 @@ def ng_url(request: Request):
 
 
 @app.post("/api/projects/{pid}/bake")
-def bake(pid: str):
+def bake(pid: str, req: NgCaptureReq | None = None):
     p = store.load(pid)
-    kf = scouting.bake_keyframe(p)
+    kf = scouting.bake_keyframe(p, viewport=(req.viewport if req else None))
     return kf.model_dump()
 
 
@@ -409,13 +504,19 @@ def goto_keyframe(pid: str, kid: str):
 
 
 @app.post("/api/projects/{pid}/keyframes/{kid}/thumbnail")
-def render_thumbnail(pid: str, kid: str):
+def render_thumbnail(pid: str, kid: str, req: ThumbnailReq | None = None):
     """Render this single keyframe to a still and keep it as the frame's thumbnail."""
     p = store.load(pid)
     idx = next((i for i, k in enumerate(p.keyframes) if k.id == kid), None)
     if idx is None:
         raise HTTPException(404, "no such keyframe")
-    settings = RenderSettings(width=640, height=480, samples=24, fps=1, draft=True, still=True)
+    req = req or ThumbnailReq()
+    settings = RenderSettings(width=640, height=480, samples=24, fps=1, draft=True,
+                              still=True, mesh_detail=req.mesh_detail,
+                              mesh_from_labels=req.mesh_from_labels,
+                              label_mesh_smooth_iters=req.label_mesh_smooth_iters,
+                              label_mesh_decimate_fraction=req.label_mesh_decimate_fraction)
+
     job_id = _start_render(pid, settings, kf_range=[idx, idx], thumbnail_for=kid)
     return {"job_id": job_id}
 
@@ -432,7 +533,7 @@ def get_thumbnail(pid: str, kid: str):
 
 
 @app.post("/api/projects/{pid}/keyframes/{kid}/update_from_ng")
-def update_from_ng(pid: str, kid: str):
+def update_from_ng(pid: str, kid: str, req: NgCaptureReq | None = None):
     """Overwrite this keyframe with the current Neuroglancer state (camera + layers
     + segments), keeping its timing — i.e. 'update current frame'. Also returns the
     per-layer setting `changes` (color/opacity/etc.) vs the previous version, so the UI
@@ -440,10 +541,16 @@ def update_from_ng(pid: str, kid: str):
     p = store.load(pid)
     kf_old = next((k for k in p.keyframes if k.id == kid), None)
     old_meshes = [m.model_copy(deep=True) for m in kf_old.meshes] if kf_old else []
-    kf = scouting.update_keyframe_from_view(p, kid)
+    old_bg = list(kf_old.lighting.background) if kf_old else None
+    kf = scouting.update_keyframe_from_view(p, kid, viewport=(req.viewport if req else None))
     if kf is None:
         raise HTTPException(404, "no such keyframe")
     changes = ops.diff_layer_settings(old_meshes, kf.meshes)
+    # Surface a 3D-background change too, so the UI can offer to propagate it (it's a
+    # per-keyframe value, not a layer field, so it carries no mesh_name).
+    if old_bg is not None and not ops._colors_equal(old_bg, kf.lighting.background):
+        changes.append({"field": "background", "old": old_bg,
+                        "new": list(kf.lighting.background)})
     return {**kf.model_dump(), "changes": changes}
 
 
@@ -525,6 +632,27 @@ def propagate_layer(pid: str, kid: str, req: PropagateReq):
     return {"ok": True, **res, "count": len(res["changed"])}
 
 
+class PropagateBgReq(BaseModel):
+    direction: str = "right"          # this | right (later) | left (earlier) | all
+    match_old: bool = True            # only change keyframes currently holding the OLD bg
+    match_value: list[float] | None = None  # the OLD bg to match (source already updated)
+    match_value_set: bool = False
+
+
+@app.post("/api/projects/{pid}/keyframes/{kid}/propagate_background")
+def propagate_background(pid: str, kid: str, req: PropagateBgReq):
+    """Copy this keyframe's 3D background to other keyframes (replace-where-matching by
+    default), so a background changed in neuroglancer carries to the rest of the shot."""
+    p = store.load(pid)
+    kw = {"match_value": req.match_value} if req.match_value_set else {}
+    try:
+        res = ops.propagate_background(
+            p, kid, direction=req.direction, match_old=req.match_old, **kw)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True, **res, "count": len(res["changed"])}
+
+
 class LookReq(BaseModel):
     look: dict[str, Any] = {}
 
@@ -577,6 +705,7 @@ class DurationReq(BaseModel):
     transition: str | None = None
     layer_transition: str | None = None
     layer_transition_at: float | None = None
+    waypoint: bool | None = None
 
 
 @app.put("/api/projects/{pid}/keyframes/{kid}/duration")
@@ -604,6 +733,8 @@ def set_keyframe_duration(pid: str, kid: str, req: DurationReq):
         fields["layer_transition"] = req.layer_transition
     if req.layer_transition_at is not None:
         fields["layer_transition_at"] = max(0.0, min(1.0, float(req.layer_transition_at)))
+    if req.waypoint is not None:
+        fields["waypoint"] = bool(req.waypoint)
     ops.update_keyframe(p, kid, **fields)
     return {"ok": True, **fields}
 
@@ -660,7 +791,8 @@ def plane_move(pid: str, req: PlaneMoveReq):
 class SweepReqNew(BaseModel):
     kind: str = "cutaway"                # 'cutaway' (clip a mesh layer) or 'slice' (EM plane)
     layer: str = ""                      # mesh layer (cutaway)
-    em_name: str = ""                    # EM layer (slice)
+    em_name: str = ""                    # primary slice layer
+    overlay_layers: list[str] = Field(default_factory=list)  # extra segmentation layers on slice scans
     axis: str = "z"
     side: int = 1
     from_ng: list[float] | None = None   # NG coords: triple => oblique A->B, single => depth
@@ -672,6 +804,9 @@ class SweepReqNew(BaseModel):
     easing: str = "linear"
     mirror: bool = False
     cap: bool = True
+    mesh_from_labels: bool = False
+    mesh_detail: float = 1.0
+    label_mesh_smooth_iters: int = 0
 
 
 @app.post("/api/projects/{pid}/sweeps")
@@ -680,6 +815,7 @@ def add_sweep(pid: str, req: SweepReqNew):
     decoupled from the camera keyframes."""
     p = store.load(pid)
     sw = ops.add_sweep(p, kind=req.kind, layer=req.layer, em_name=req.em_name,
+                       overlay_layers=req.overlay_layers,
                        axis=req.axis, side=req.side,
                        from_ng=req.from_ng, to_ng=req.to_ng,
                        from_nm=req.from_nm, to_nm=req.to_nm,
@@ -699,6 +835,8 @@ class SweepPatch(BaseModel):
     mirror: bool | None = None
     cap: bool | None = None
     enabled: bool | None = None
+    em_name: str | None = None
+    overlay_layers: list[str] | None = None
 
 
 @app.put("/api/projects/{pid}/sweeps/{sid}")
@@ -732,7 +870,7 @@ def _snapshot_times(sw) -> list[float]:
 
 
 @app.post("/api/projects/{pid}/sweeps/{sid}/snapshots")
-def render_sweep_snapshots(pid: str, sid: str):
+def render_sweep_snapshots(pid: str, sid: str, req: SnapshotReq | None = None):
     """Kick off (in the background) a few small preview stills of a clip so the timeline
     bar can show what the sweep looks like. A MIRROR sweep gets 5 evenly-spaced frames
     (0/25/50/75/100%) since start & end look identical; others get 3 (start/mid/end).
@@ -751,7 +889,7 @@ def render_sweep_snapshots(pid: str, sid: str):
     job_id = f"snap_{sid}"
 
     def _run():
-        settings = RenderSettings(width=240, height=160, samples=12, fps=2, draft=True)
+        settings = _draft_render_settings(req)
         worker = RenderWorker(p, RenderJob(id=job_id, settings=settings))
         _workers[job_id] = worker   # registered so Stop/cancel + shutdown can kill it
         try:
@@ -797,7 +935,8 @@ def preview_sweep(pid: str, req: SweepReqNew):
     import shutil
     p = store.load(pid)
     pc = p.model_copy(deep=True)               # work on a COPY; never saved
-    sw = ops.add_sweep(pc, kind=req.kind, layer=req.layer, em_name=req.em_name, axis=req.axis,
+    sw = ops.add_sweep(pc, kind=req.kind, layer=req.layer, em_name=req.em_name,
+                       overlay_layers=req.overlay_layers, axis=req.axis,
                        side=req.side, from_ng=req.from_ng, to_ng=req.to_ng,
                        from_nm=req.from_nm, to_nm=req.to_nm, start_s=req.start_s,
                        duration_s=req.duration_s, easing=req.easing, mirror=req.mirror,
@@ -811,7 +950,7 @@ def preview_sweep(pid: str, req: SweepReqNew):
     def _run():
         try:
             shutil.rmtree(out, ignore_errors=True)
-            settings = RenderSettings(width=240, height=160, samples=12, fps=2, draft=True)
+            settings = _draft_render_settings(req)
             worker = RenderWorker(pc, RenderJob(id="snap_preview", settings=settings))
             paths = worker.render_snapshots(times, out)
             _snap_state[key] = {"status": "done", "count": len(paths)}
@@ -958,27 +1097,55 @@ def _drain_render_subprocess(pid: str, job_id: str, proc) -> None:
     finally:
         proc.wait()
         # Cancel/normal exit: translate the final marker (or exit code) into a status.
+        status: str
+        message: str
+        progress: float
+        output: str | None = None
         if final and final.get("final") == "done":
-            _render_state[job_id] = {"progress": 1.0, "message": "done",
-                                     "status": "done", "output": final.get("output")}
+            status = "done"
+            message = "done"
+            progress = 1.0
+            output = final.get("output")
+            _render_state[job_id] = {"progress": progress, "message": message,
+                                     "status": status, "output": output}
         elif final and final.get("final") == "cancelled":
-            _render_state[job_id] = {"progress": 0.0, "message": "cancelled",
-                                     "status": "cancelled"}
+            cur = _render_state.get(job_id, {}).get("status")
+            if cur == "cancelling":
+                status = "cancelled"
+                message = "cancelled"
+            else:
+                status = "error"
+                message = "render process reported cancellation without a cancel request"
+            progress = 0.0
+            _render_state[job_id] = {"progress": progress, "message": message,
+                                     "status": status}
         elif final and final.get("final") == "error":
-            _render_state[job_id] = {"progress": 0.0,
-                                     "message": str(final.get("message", "render failed")),
-                                     "status": "error"}
+            status = "error"
+            message = str(final.get("message", "render failed"))
+            progress = 0.0
+            _render_state[job_id] = {"progress": progress, "message": message,
+                                     "status": status}
         else:
             # process died without emitting a final marker (e.g. SIGKILL'd) — infer
             # from the status that was set when cancel was requested, else error.
             cur = _render_state.get(job_id, {}).get("status")
-            if cur == "cancelling" or proc.returncode in (-9, 143):  # SIGKILL / SIGTERM
-                _render_state[job_id] = {"progress": 0.0, "message": "cancelled",
-                                         "status": "cancelled"}
+            progress = 0.0
+            if cur == "cancelling":
+                status = "cancelled"
+                message = "cancelled"
+                _render_state[job_id] = {"progress": progress, "message": message,
+                                         "status": status}
             else:
-                _render_state[job_id] = {"progress": 0.0,
-                                         "message": f"render exited {proc.returncode}",
-                                         "status": "error"}
+                status = "error"
+                message = _returncode_message(proc.returncode)
+                _render_state[job_id] = {"progress": progress, "message": message,
+                                         "status": status}
+        print(
+            f"[run_job {job_id}] finished status={status} returncode={proc.returncode} "
+            f"message={message!r}",
+            flush=True,
+        )
+        _persist_render_status(pid, job_id, status, message, progress, output)
         _workers.pop(job_id, None)
 
 
@@ -995,12 +1162,15 @@ def _evict_finished_states(keep: int = 200) -> None:
 
 @app.post("/api/projects/{pid}/render")
 def render(pid: str, req: RenderReq):
+    lod_mode = _effective_lod_mode(req.mesh_from_labels, req.lod_mode)
     settings = RenderSettings(width=req.width, height=req.height, fps=req.fps,
                               samples=req.samples, noise_threshold=req.noise_threshold,
                               engine=req.engine,
                               export_blend=req.export_blend, draft=req.draft,
                               mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels,
-                              auto_direct=req.auto_direct, lod_mode=req.lod_mode,
+                              label_mesh_smooth_iters=req.label_mesh_smooth_iters,
+                              label_mesh_decimate_fraction=req.label_mesh_decimate_fraction,
+                              auto_direct=req.auto_direct, lod_mode=lod_mode,
                               show_bbox=req.show_bbox,
                               bbox_color=req.bbox_color or [0.62, 0.66, 0.74],
                               bbox_source=req.bbox_source or "")

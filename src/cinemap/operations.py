@@ -285,6 +285,61 @@ def _patch_ng_state_field(ng_state: dict, mesh_name: str, field, value, segment_
         layer["saturation"] = float(value)
 
 
+def _linear_to_srgb(c: float) -> float:
+    c = max(0.0, min(1.0, float(c)))
+    return 12.92 * c if c <= 0.0031308 else 1.055 * (c ** (1 / 2.4)) - 0.055
+
+
+def _linear_rgb_to_hex(rgb) -> str:
+    """LINEAR [r,g,b] (how background is stored) -> sRGB '#rrggbb' (NG's color form)."""
+    return _rgb_to_hex([_linear_to_srgb(c) for c in rgb[:3]])
+
+
+def propagate_background(project: Project, from_keyframe_id: str,
+                         direction: str = "right", match_old: bool = True,
+                         match_value=_UNSET) -> dict:
+    """Copy one keyframe's 3D background (`lighting.background`) to other keyframes.
+
+    Background is a per-keyframe value (captured from neuroglancer); this pushes the
+    source keyframe's color to the chosen `direction` ("this" | "right" | "left" |
+    "all"). With `match_old`, only keyframes currently holding the OLD color are
+    changed (so deliberate per-frame backgrounds aren't clobbered) — `match_value`
+    supplies that old color when the source was already updated from the NG view."""
+    kfs = project.keyframes
+    idx = next((i for i, k in enumerate(kfs) if k.id == from_keyframe_id), None)
+    if idx is None:
+        raise ValueError("no such keyframe")
+    new_bg = [float(c) for c in (kfs[idx].lighting.background or [0.0, 0.0, 0.0])]
+    old_bg = [float(c) for c in match_value] if match_value is not _UNSET else None
+
+    if direction == "this":
+        targets = [idx]
+    elif direction == "left":
+        targets = list(range(0, idx + 1))
+    elif direction == "all":
+        targets = list(range(len(kfs)))
+    else:  # "right" (this + later)
+        targets = list(range(idx, len(kfs)))
+
+    new_hex = _linear_rgb_to_hex(new_bg)
+    changed: list[str] = []
+    for i in targets:
+        k = kfs[i]
+        if (i != idx and match_old and old_bg is not None
+                and not _colors_equal(k.lighting.background, old_bg)):
+            continue
+        new_light = k.lighting.model_copy(update={"background": list(new_bg)})
+        updated = k.model_copy(update={"lighting": new_light})
+        # Mirror into the stored NG state so the keyframe's link round-trips (clicking
+        # it shows the new bg, and re-capturing it won't revert).
+        if isinstance(updated.ng_state, dict):
+            updated.ng_state = {**updated.ng_state, "projectionBackgroundColor": new_hex}
+        kfs[i] = updated
+        changed.append(k.id)
+    store.save(project)
+    return {"changed": changed}
+
+
 def propagate_layer_field(project: Project, from_keyframe_id: str, mesh_name: str,
                           field: str, value, segment_id: int | None = None,
                           direction: str = "right", match_old: bool = True,
@@ -442,7 +497,7 @@ def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, s
               from_nm=None, to_nm=None, start_s=None, duration_s=None,
               from_ng=None, to_ng=None, easing: str = "linear",
               kind: str = "cutaway", em_name: str = "", mirror: bool = False,
-              cap: bool = True,
+              cap: bool = True, overlay_layers: list[str] | None = None,
               commit: bool = True) -> Sweep:
     """Add an independent plane sweep on its OWN timeline (decoupled from the camera).
     kind='cutaway' slides a mesh layer's clip plane; kind='slice' sweeps an EM cross-section.
@@ -489,7 +544,8 @@ def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, s
         from_nm, to_nm = (hi_off, lo_off) if side >= 0 else (lo_off, hi_off)
     # (slice keeps from->to literal: the EM plane travels from the start position to the stop)
     total = sum(k.duration_in_s for k in project.keyframes) or 4.0
-    sw = Sweep(id=_uid("sw"), kind=kind, layer=layer, em_name=em_name, axis=axis,
+    sw = Sweep(id=_uid("sw"), kind=kind, layer=layer, em_name=em_name,
+               overlay_layers=list(overlay_layers or []), axis=axis,
                normal=(normal if oblique else None),
                side=int(side), from_nm=float(from_nm), to_nm=float(to_nm),
                start_s=float(start_s if start_s is not None else 0.0),
@@ -618,6 +674,7 @@ def plane_move(project: Project, axis: str = "z", mode: str = "slice",
     gid = _uid("grp")   # shared group so the timeline collapses the scan to one card
     glabel = f"{mode} scan {axis}{' (oblique)' if normal else ''} ×{n}"
     new = []
+    base_slice = next((s for s in base.slices if s.em_name == em_name), None)
     for i in range(n):
         t = i / max(1, n - 1)
         pt = point_at(t)
@@ -631,7 +688,8 @@ def plane_move(project: Project, axis: str = "z", mode: str = "slice",
                                     side=side, enabled=True)
             meshes.append(mc)
         slices = ([SlicePlane(em_name=em_name, axis=axis, position_nm=offset,
-                              normal=normal, visible=True)]
+                              normal=normal, visible=True,
+                              contrast_limits=(base_slice.contrast_limits if base_slice else None))]
                   if do_slice else [s.model_copy() for s in base.slices])
         # duration-driven: spread total_duration_s across the scan (first keyframe is the
         # instant lead-in to the start, the rest divide the span) so the whole scan takes

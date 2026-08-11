@@ -6,7 +6,9 @@ keyframe (camera target from the NG position; framing from the project defaults)
 """
 from __future__ import annotations
 
+import copy
 import os
+from collections.abc import Iterable
 
 import neuroglancer
 
@@ -43,6 +45,52 @@ def load_dataset(data_path: str) -> None:
 
 def current_state() -> dict:
     return get_viewer().state.to_json()
+
+
+def _numeric_pair(value) -> list[float] | None:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        return None
+    vals = list(value)
+    if len(vals) != 2:
+        return None
+    try:
+        lo, hi = float(vals[0]), float(vals[1])
+    except (TypeError, ValueError):
+        return None
+    if hi <= lo:
+        return None
+    return [lo, hi]
+
+
+def _find_contrast_pair(obj) -> list[float] | None:
+    """Extract a Neuroglancer image-layer intensity window from nested controls.
+
+    NG states commonly store this under shaderControls.<control>.window, but older
+    or hand-written states may use a simple range pair. Prefer window because it
+    represents the displayed black/white points rather than the control bounds.
+    """
+    if isinstance(obj, dict):
+        for key in ("window", "contrastLimits", "contrast_limits", "range"):
+            pair = _numeric_pair(obj.get(key))
+            if pair is not None:
+                return pair
+        for value in obj.values():
+            pair = _find_contrast_pair(value)
+            if pair is not None:
+                return pair
+        return None
+    if isinstance(obj, list):
+        for value in obj:
+            pair = _find_contrast_pair(value)
+            if pair is not None:
+                return pair
+    return None
+
+
+def _image_contrast_from_layer(layer: dict | None) -> list[float] | None:
+    if not layer or layer.get("type") != "image":
+        return None
+    return _find_contrast_pair(layer.get("shaderControls") or layer)
 
 
 def current_layer_visibility(project: Project) -> dict[str, bool]:
@@ -95,8 +143,23 @@ def current_layer_colors(project: Project, st: dict | None = None) -> dict:
 
     if st is None:
         st = get_viewer().state.to_json()
-    return {l.get("name"): _colors.from_layer_dict(l)
-            for l in st.get("layers", []) if l.get("type") == "segmentation"}
+    layers = {
+        l.get("name"): l for l in st.get("layers", [])
+        if l.get("type") == "segmentation" and l.get("name")
+    }
+
+    def color_source(layer: dict) -> dict:
+        # Neuroglancer's linkedSegmentationColorGroup defaults to
+        # linkedSegmentationGroup when omitted, but an explicit false keeps colors local.
+        if layer.get("linkedSegmentationColorGroup") is False:
+            return layer
+        source_name = layer.get("linkedSegmentationColorGroup")
+        if source_name is None:
+            source_name = layer.get("linkedSegmentationGroup")
+        return layers.get(source_name, layer) if source_name else layer
+
+    return {name: _colors.from_layer_dict(color_source(layer))
+            for name, layer in layers.items()}
 
 
 def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = None,
@@ -155,22 +218,52 @@ def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = Non
     return meshes
 
 
-def _scene_from_view(project: Project, st: dict | None = None):
+def _state_with_capture_metadata(st: dict, viewport: dict | None = None) -> dict:
+    if not viewport:
+        return st
+    out = copy.deepcopy(st)
+    clean = {}
+    for key in ("width_px", "height_px", "device_pixel_ratio"):
+        try:
+            clean[key] = float(viewport[key])
+        except (KeyError, TypeError, ValueError):
+            pass
+    if clean:
+        out["_cinemap_viewport"] = clean
+    return out
+
+
+def _scene_from_view(project: Project, st: dict | None = None, viewport: dict | None = None):
     """Capture a scene as (camera, slices, meshes, annotations, ng_state) from a
     neuroglancer state dict. `st` defaults to the live scouting viewer; importing
     passes the saved state directly so capture never races the viewer's async load."""
-    from .data.ng_camera import ng_to_camera
+    from .data.ng_camera import cross_section_plane, ng_to_camera, ng_to_cross_section_camera
 
     if st is None:
         st = get_viewer().state.to_json()  # serialize the live viewer ONCE; reuse below
-    cam = ng_to_camera(st, project.manifest.voxel_size_nm)
+    st = _state_with_capture_metadata(st, viewport)
+    layout = st.get("layout")
+    is_3d = layout == "3d"
+    cam = (
+        ng_to_camera(st, project.manifest.voxel_size_nm)
+        if is_3d else ng_to_cross_section_camera(st, project.manifest.voxel_size_nm)
+    )
     em_name = project.manifest.em.name if project.manifest.em else "em"
-    layer_vis = {l.get("name"): l.get("visible", True) is not False
-                 for l in st.get("layers", [])}
+    layers = {l.get("name"): l for l in st.get("layers", [])}
+    layer_vis = {name: l.get("visible", True) is not False for name, l in layers.items()}
     # a "3d" layout shows no cross-section in neuroglancer, so bake no EM slice
-    show_slice = layer_vis.get(em_name, True) and st.get("layout") != "3d"
-    slices = ([SlicePlane(em_name=em_name, axis="z", position_nm=cam.look_at_nm[2])]
-              if show_slice else [])
+    show_slice = layer_vis.get(em_name, True) and not is_3d
+    if show_slice:
+        axis, pos_nm, normal = cross_section_plane(st, project.manifest.voxel_size_nm)
+        slices = [SlicePlane(
+            em_name=em_name,
+            axis=axis,
+            position_nm=pos_nm,
+            normal=normal,
+            contrast_limits=_image_contrast_from_layer(layers.get(em_name)),
+        )]
+    else:
+        slices = []
     prev = project.keyframes[-1].meshes if project.keyframes else None
     meshes = _meshes_from_visible(project, prev=prev, st=st)   # inherit material from last kf
     annotations = _annotations_from_view(project, st)
@@ -228,15 +321,24 @@ def _annotations_from_view(project: Project, st: dict) -> list[AnnotationInstanc
     return out
 
 
-def bake_keyframe(project: Project, label: str = "scouted", st: dict | None = None) -> Keyframe:
+def bake_keyframe(
+    project: Project,
+    label: str = "scouted",
+    st: dict | None = None,
+    viewport: dict | None = None,
+) -> Keyframe:
     """Build a NEW keyframe from a neuroglancer state (the live view by default)."""
-    cam, slices, meshes, annotations, st = _scene_from_view(project, st)
+    cam, slices, meshes, annotations, st = _scene_from_view(project, st, viewport=viewport)
     _merge_manifest(project, st)   # learn layers new to this view (e.g. an EM image just added)
     if (not meshes and not slices and project.keyframes
             and not _state_declares_render_layers(project, st)):
         meshes = [m.model_copy() for m in project.keyframes[-1].meshes]
     kf = Keyframe(id=ops._uid("kf"), label=label, camera=cam, slices=slices,
                   meshes=meshes, annotations=annotations, ng_state=st)
+    # Capture this view's NG 3D background per keyframe, so updating the background in
+    # neuroglancer and re-baking is reflected in the render (and can transition between
+    # frames). Falls back to black if the state has none.
+    kf.lighting.background = _bg_from_state(st) or [0.0, 0.0, 0.0]
     return ops.add_keyframe(project, kf)
 
 
@@ -255,15 +357,28 @@ def bake_keyframe_from_state(project: Project, state: dict, label: str = "import
 def _merge_manifest(project: Project, state: dict) -> None:
     """Union one imported state's mesh/EM sources into the project manifest, so a
     layer that appears only in a later state (e.g. a skeleton layer not present in
-    state 1) is known to the renderer. Matches by layer name; first one wins."""
+    state 1) is known to the renderer. Matches by layer name; fills in source fields
+    discovered later, such as a label volume paired with an existing mesh layer."""
     from .data.manifest import analyze_state_dict
 
     m = analyze_state_dict(state)
-    have = {x.name for x in project.manifest.meshes}
+    by_name = {x.name: x for x in project.manifest.meshes}
     for ms in m.meshes:
-        if ms.name not in have:
+        cur = by_name.get(ms.name)
+        if cur is None:
             project.manifest.meshes.append(ms)
-            have.add(ms.name)
+            by_name[ms.name] = ms
+            continue
+        if not cur.mesh_url and ms.mesh_url:
+            cur.mesh_url = ms.mesh_url
+        if not cur.label_zarr and ms.label_zarr:
+            cur.label_zarr = ms.label_zarr
+        if not cur.skeleton_url and ms.skeleton_url:
+            cur.skeleton_url = ms.skeleton_url
+        if not cur.skeleton_shader and ms.skeleton_shader:
+            cur.skeleton_shader = ms.skeleton_shader
+        if not cur.segment_ids and ms.segment_ids:
+            cur.segment_ids = ms.segment_ids
     if project.manifest.em is None and m.em is not None:
         project.manifest.em = m.em
 
@@ -316,16 +431,24 @@ def import_states(project: Project, links: list[tuple]) -> tuple[list[Keyframe],
     return created, errors
 
 
-def update_keyframe_from_view(project: Project, keyframe_id: str) -> Keyframe | None:
+def update_keyframe_from_view(
+    project: Project,
+    keyframe_id: str,
+    viewport: dict | None = None,
+) -> Keyframe | None:
     """Overwrite an existing keyframe with the current Neuroglancer state (camera +
     layers + segments), keeping its timing (duration/easing) and label."""
     kf = next((k for k in project.keyframes if k.id == keyframe_id), None)
     if kf is None:
         return None
-    cam, slices, meshes, annotations, st = _scene_from_view(project)
+    cam, slices, meshes, annotations, st = _scene_from_view(project, viewport=viewport)
     _merge_manifest(project, st)   # learn layers new to this view (e.g. an EM image just added)
+    # Re-capture the NG 3D background too, so editing it in neuroglancer and updating the
+    # keyframe is reflected in the render.
+    lighting = kf.lighting.model_copy(update={"background": _bg_from_state(st) or [0.0, 0.0, 0.0]})
     updated = kf.model_copy(update={"camera": cam, "slices": slices, "meshes": meshes,
-                                    "annotations": annotations, "ng_state": st})
+                                    "annotations": annotations, "ng_state": st,
+                                    "lighting": lighting})
     project.keyframes = [updated if k.id == keyframe_id else k for k in project.keyframes]
     ops.store.save(project)
     return updated
@@ -351,13 +474,21 @@ def sync_segments(project: Project, keyframe_id: str) -> Keyframe | None:
     st = get_viewer().state.to_json()  # serialize once; reuse for meshes
     vis = current_layer_visibility(project)
     meshes = _meshes_from_visible(project, kf.meshes, st=st)
+    layers = {l.get("name"): l for l in st.get("layers", [])}
 
     # slice on/off follows the EM image layer; keep its axis/position
     em_name = project.manifest.em.name if project.manifest.em else "em"
     if kf.slices:
-        slices = [s.model_copy(update={"visible": vis.get(s.em_name, True)}) for s in kf.slices]
+        slices = [
+            s.model_copy(update={
+                "visible": vis.get(s.em_name, True),
+                "contrast_limits": _image_contrast_from_layer(layers.get(s.em_name)),
+            })
+            for s in kf.slices
+        ]
     elif vis.get(em_name, True):  # EM turned on but keyframe had no slice -> add one
-        slices = [SlicePlane(em_name=em_name, axis="z", position_nm=kf.camera.look_at_nm[2])]
+        slices = [SlicePlane(em_name=em_name, axis="z", position_nm=kf.camera.look_at_nm[2],
+                             contrast_limits=_image_contrast_from_layer(layers.get(em_name)))]
     else:
         slices = []
 
@@ -394,9 +525,14 @@ def _state_from_keyframe(project: Project, kf: Keyframe, base: dict) -> dict:
             layer["colorSeed"] = int(getattr(m, "color_seed", 0) or 0)
             if getattr(m, "default_color", None):
                 layer["segmentDefaultColor"] = _rgb_to_hex(m.default_color)
+            else:
+                layer.pop("segmentDefaultColor", None)
             if getattr(m, "segment_colors", None):
                 layer["segmentColors"] = {str(k): _rgb_to_hex(v)
                                           for k, v in m.segment_colors.items()}
+            else:
+                layer.pop("segmentColors", None)
+            layer["saturation"] = float(getattr(m, "saturation", 1.0))
             layer["objectAlpha"] = float(getattr(m, "object_alpha", 1.0))      # Opacity (3d)
             layer["meshSilhouetteRendering"] = float(getattr(m, "silhouette", 0.0))  # Silhouette (3d)
         elif em_name and name == em_name:                   # EM image layer

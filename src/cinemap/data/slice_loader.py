@@ -46,6 +46,19 @@ class SliceResult:
     scale_level: int
 
 
+@dataclass(frozen=True)
+class ObliqueSliceSpec:
+    u_xyz: tuple[float, float, float]
+    v_xyz: tuple[float, float, float]
+    n_xyz: tuple[float, float, float]
+    point_xyz: tuple[float, float, float]
+    half_nm: float
+    target_px: int
+    bbox_xyz_nm: tuple[tuple[float, float, float], tuple[float, float, float]]
+    level: int
+    position_nm: float
+
+
 @lru_cache(maxsize=32)
 def _cached_volume(zarr_url: str) -> "EMVolume":
     return EMVolume(zarr_url)
@@ -155,6 +168,49 @@ class EMVolume:
                 return lvl
         return len(self.level_scale_nm) - 1
 
+    def pick_level_for_oblique_nm_per_px(self, nm_per_px: float) -> int:
+        """Coarsest 3D level whose voxels are still no larger than a render pixel.
+
+        Oblique slices read a 3D bounding box before resampling a 2D plane. Loading
+        a much finer 3D level than the final rendered pixel size cannot add visible
+        detail, but it can multiply transient memory.
+        """
+        if nm_per_px <= 0:
+            return 0
+        best = 0
+        for lvl, sc in enumerate(self.level_scale_nm):  # sc is z,y,x
+            if max(float(sc[0]), float(sc[1]), float(sc[2])) <= nm_per_px:
+                best = lvl
+            else:
+                break
+        return best
+
+    def _box_voxel_bounds(self, bbox_xyz_nm, level: int, pad: int = 2):
+        arr = self._open_level(level)
+        sc = self.level_scale_nm[level]          # z,y,x nm/voxel
+        tr = self.level_translation_nm[level]    # z,y,x nm
+        (x0n, y0n, z0n), (x1n, y1n, z1n) = bbox_xyz_nm
+        z0 = max(0, int((z0n - tr[0]) / sc[0]) - pad)
+        z1 = min(arr.shape[0], int((z1n - tr[0]) / sc[0]) + pad)
+        y0 = max(0, int((y0n - tr[1]) / sc[1]) - pad)
+        y1 = min(arr.shape[1], int((y1n - tr[1]) / sc[1]) + pad)
+        x0 = max(0, int((x0n - tr[2]) / sc[2]) - pad)
+        x1 = min(arr.shape[2], int((x1n - tr[2]) / sc[2]) + pad)
+        z1 = max(z1, z0 + 1)
+        y1 = max(y1, y0 + 1)
+        x1 = max(x1, x0 + 1)
+        return (z0, z1), (y0, y1), (x0, x1)
+
+    def estimate_box_bytes(self, bbox_xyz_nm, level: int, pad: int = 2) -> int:
+        """Estimate bytes TensorStore will materialize for a boxed read."""
+        arr = self._open_level(level)
+        (z0, z1), (y0, y1), (x0, x1) = self._box_voxel_bounds(bbox_xyz_nm, level, pad)
+        try:
+            itemsize = np.dtype(arr.dtype).itemsize
+        except Exception:  # noqa: BLE001
+            itemsize = 1
+        return int(max(0, z1 - z0) * max(0, y1 - y0) * max(0, x1 - x0) * itemsize)
+
     def read_box(self, bbox_xyz_nm, level: int, pad: int = 2):
         """Read a 3D subvolume covering bbox at `level`.
 
@@ -164,11 +220,7 @@ class EMVolume:
         arr = self._open_level(level)
         sc = self.level_scale_nm[level]          # z,y,x nm/voxel
         tr = self.level_translation_nm[level]    # z,y,x nm
-        (x0n, y0n, z0n), (x1n, y1n, z1n) = bbox_xyz_nm
-        z0 = max(0, int((z0n - tr[0]) / sc[0]) - pad); z1 = min(arr.shape[0], int((z1n - tr[0]) / sc[0]) + pad)
-        y0 = max(0, int((y0n - tr[1]) / sc[1]) - pad); y1 = min(arr.shape[1], int((y1n - tr[1]) / sc[1]) + pad)
-        x0 = max(0, int((x0n - tr[2]) / sc[2]) - pad); x1 = min(arr.shape[2], int((x1n - tr[2]) / sc[2]) + pad)
-        z1 = max(z1, z0 + 1); y1 = max(y1, y0 + 1); x1 = max(x1, x0 + 1)
+        (z0, z1), (y0, y1), (x0, x1) = self._box_voxel_bounds(bbox_xyz_nm, level, pad)
         sub = np.asarray(arr[z0:z1, y0:y1, x0:x1].read().result())
         return sub, (z0, y0, x0), tuple(sc), tuple(tr)
 
@@ -182,23 +234,60 @@ class EMVolume:
         v = np.cross(n, u)
         return u, v, n
 
-    def read_oblique_slice(self, normal_xyz, point_xyz, half_nm: float,
-                           target_px: int = 640, target_voxels: int = 24_000_000) -> SliceResult:
-        """Resample a tilted plane (unit `normal` through `point`) over a 2*half_nm
-        square patch. Reads the bounding-box subvolume at a level bounded by
-        target_voxels, then nearest-samples the plane grid (fast; fine for EM)."""
+    def oblique_slice_spec(
+        self,
+        normal_xyz,
+        point_xyz,
+        half_nm: float,
+        target_px: int = 640,
+        target_voxels: int = 24_000_000,
+        target_nm_per_px: float | None = None,
+    ) -> ObliqueSliceSpec:
+        """Geometry and multiscale choice for one oblique slice."""
         u, v, n = self.plane_basis(normal_xyz)
         p = np.asarray(point_xyz, float)
         px = max(8, int(target_px))
-        s = np.linspace(-half_nm, half_nm, px)
-        su, sv = np.meshgrid(s, s)                                  # (px,px)
-        world = p[None, None, :] + su[..., None] * u + sv[..., None] * v   # (px,px,3) xyz nm
-        flat = world.reshape(-1, 3)
-        wmin, wmax = flat.min(0), flat.max(0)
+        half = float(half_nm)
+        corners = np.asarray([
+            p - half * u - half * v,
+            p + half * u - half * v,
+            p - half * u + half * v,
+            p + half * u + half * v,
+        ])
+        wmin, wmax = corners.min(0), corners.max(0)
         bbox = ((wmin[0], wmin[1], wmin[2]), (wmax[0], wmax[1], wmax[2]))
         level = self.pick_level_for_box(bbox, target_voxels)
-        sub, (z0, y0, x0), sc, tr = self.read_box(bbox, level)      # sub is z,y,x
-        sub = np.asarray(sub).astype(np.uint8)
+        if target_nm_per_px is not None:
+            level = max(level, self.pick_level_for_oblique_nm_per_px(float(target_nm_per_px)))
+        return ObliqueSliceSpec(
+            u_xyz=tuple(float(x) for x in u),
+            v_xyz=tuple(float(x) for x in v),
+            n_xyz=tuple(float(x) for x in n),
+            point_xyz=tuple(float(x) for x in p),
+            half_nm=half,
+            target_px=px,
+            bbox_xyz_nm=(
+                tuple(float(x) for x in bbox[0]),
+                tuple(float(x) for x in bbox[1]),
+            ),
+            level=int(level),
+            position_nm=float(np.dot(p, n)),
+        )
+
+    @staticmethod
+    def union_bbox(specs: list[ObliqueSliceSpec]):
+        lo = np.asarray([s.bbox_xyz_nm[0] for s in specs], dtype=float).min(axis=0)
+        hi = np.asarray([s.bbox_xyz_nm[1] for s in specs], dtype=float).max(axis=0)
+        return (tuple(float(x) for x in lo), tuple(float(x) for x in hi))
+
+    def _sample_oblique_tile(self, spec: ObliqueSliceSpec, sub, origin_voxel_zyx, sc, tr, su, sv):
+        u = np.asarray(spec.u_xyz, float)
+        v = np.asarray(spec.v_xyz, float)
+        p = np.asarray(spec.point_xyz, float)
+        su_grid, sv_grid = np.meshgrid(su, sv)                       # (rows,cols)
+        world = p[None, None, :] + su_grid[..., None] * u + sv_grid[..., None] * v
+        z0, y0, x0 = origin_voxel_zyx
+        sub = np.asarray(sub).astype(np.uint8, copy=False)
         fx = (world[..., 0] - tr[2]) / sc[2] - x0
         fy = (world[..., 1] - tr[1]) / sc[1] - y0
         fz = (world[..., 2] - tr[0]) / sc[0] - z0
@@ -209,12 +298,142 @@ class EMVolume:
         ix = np.clip(np.round(fx).astype(int), 0, sub.shape[2] - 1)
         img = sub[iz, iy, ix]
         img[oob] = 0
-        origin = p - half_nm * u - half_nm * v   # corner at su=-half, sv=-half (rows=v, cols=u)
+        return img
+
+    @staticmethod
+    def _oblique_tile_bbox(spec: ObliqueSliceSpec, su0: float, su1: float, sv0: float, sv1: float):
+        u = np.asarray(spec.u_xyz, float)
+        v = np.asarray(spec.v_xyz, float)
+        p = np.asarray(spec.point_xyz, float)
+        corners = np.asarray([p + su * u + sv * v for su in (su0, su1) for sv in (sv0, sv1)])
+        lo, hi = corners.min(0), corners.max(0)
+        return (tuple(float(x) for x in lo), tuple(float(x) for x in hi))
+
+    def _sample_oblique_spec(self, spec: ObliqueSliceSpec, sub, origin_voxel_zyx, sc, tr) -> SliceResult:
+        u = np.asarray(spec.u_xyz, float)
+        v = np.asarray(spec.v_xyz, float)
+        p = np.asarray(spec.point_xyz, float)
+        px = max(8, int(spec.target_px))
+        s = np.linspace(-spec.half_nm, spec.half_nm, px)
+        img = self._sample_oblique_tile(spec, sub, origin_voxel_zyx, sc, tr, s, s)
+        origin = p - spec.half_nm * u - spec.half_nm * v
         return SliceResult(
-            image=img, axis="oblique", position_nm=float(np.dot(p, n)),
-            origin_nm=tuple(origin), u_nm=tuple(2 * half_nm * u), v_nm=tuple(2 * half_nm * v),
-            scale_level=level,
+            image=img,
+            axis="oblique",
+            position_nm=spec.position_nm,
+            origin_nm=tuple(float(x) for x in origin),
+            u_nm=tuple(float(x) for x in (2 * spec.half_nm * u)),
+            v_nm=tuple(float(x) for x in (2 * spec.half_nm * v)),
+            scale_level=spec.level,
         )
+
+    def read_oblique_specs(self, specs: list[ObliqueSliceSpec]) -> list[SliceResult]:
+        """Read one union 3D box and sample several compatible oblique planes from it."""
+        if not specs:
+            return []
+        levels = {int(s.level) for s in specs}
+        if len(levels) != 1:
+            return [self.read_oblique_specs([s])[0] for s in specs]
+        level = next(iter(levels))
+        bbox = self.union_bbox(specs)
+        sub, (z0, y0, x0), sc, tr = self.read_box(bbox, level)      # sub is z,y,x
+        return [self._sample_oblique_spec(s, sub, (z0, y0, x0), sc, tr) for s in specs]
+
+    def read_oblique_specs_tiled(
+        self,
+        specs: list[ObliqueSliceSpec],
+        tile_px: int = 192,
+    ) -> list[SliceResult]:
+        """Sample compatible oblique planes via tiled boxed reads.
+
+        A tilted plane's full axis-aligned bbox can contain a large amount of volume not
+        touched by the 2D plane. Tiling keeps each TensorStore read close to the actual
+        plane while still sharing each tile read across adjacent swept planes.
+        """
+        if not specs:
+            return []
+        levels = {int(s.level) for s in specs}
+        target_pxs = {int(s.target_px) for s in specs}
+        halves = {round(float(s.half_nm), 6) for s in specs}
+        bases = {
+            (
+                tuple(round(float(x), 9) for x in s.u_xyz),
+                tuple(round(float(x), 9) for x in s.v_xyz),
+            )
+            for s in specs
+        }
+        if len(levels) != 1 or len(target_pxs) != 1 or len(halves) != 1 or len(bases) != 1:
+            return self.read_oblique_specs(specs)
+
+        level = next(iter(levels))
+        px = next(iter(target_pxs))
+        half = float(specs[0].half_nm)
+        tile = max(16, int(tile_px))
+        samples = np.linspace(-half, half, px)
+        images = [np.zeros((px, px), dtype=np.uint8) for _ in specs]
+        for y0 in range(0, px, tile):
+            y1 = min(px, y0 + tile)
+            sv = samples[y0:y1]
+            for x0 in range(0, px, tile):
+                x1 = min(px, x0 + tile)
+                su = samples[x0:x1]
+                boxes = [
+                    self._oblique_tile_bbox(spec, float(su[0]), float(su[-1]),
+                                            float(sv[0]), float(sv[-1]))
+                    for spec in specs
+                ]
+                lo = np.asarray([b[0] for b in boxes], dtype=float).min(axis=0)
+                hi = np.asarray([b[1] for b in boxes], dtype=float).max(axis=0)
+                sub, (z0, y0v, x0v), sc, tr = self.read_box((tuple(lo), tuple(hi)), level)
+                for i, spec in enumerate(specs):
+                    images[i][y0:y1, x0:x1] = self._sample_oblique_tile(
+                        spec,
+                        sub,
+                        (z0, y0v, x0v),
+                        sc,
+                        tr,
+                        su,
+                        sv,
+                    )
+
+        out = []
+        for spec, img in zip(specs, images):
+            u = np.asarray(spec.u_xyz, float)
+            v = np.asarray(spec.v_xyz, float)
+            p = np.asarray(spec.point_xyz, float)
+            origin = p - spec.half_nm * u - spec.half_nm * v
+            out.append(SliceResult(
+                image=img,
+                axis="oblique",
+                position_nm=spec.position_nm,
+                origin_nm=tuple(float(x) for x in origin),
+                u_nm=tuple(float(x) for x in (2 * spec.half_nm * u)),
+                v_nm=tuple(float(x) for x in (2 * spec.half_nm * v)),
+                scale_level=spec.level,
+            ))
+        return out
+
+    def read_oblique_slice(
+        self,
+        normal_xyz,
+        point_xyz,
+        half_nm: float,
+        target_px: int = 640,
+        target_voxels: int = 24_000_000,
+        target_nm_per_px: float | None = None,
+    ) -> SliceResult:
+        """Resample a tilted plane (unit `normal` through `point`) over a 2*half_nm
+        square patch. Reads the bounding-box subvolume at a level bounded by
+        target_voxels, then nearest-samples the plane grid (fast; fine for EM)."""
+        spec = self.oblique_slice_spec(
+            normal_xyz,
+            point_xyz,
+            half_nm,
+            target_px=target_px,
+            target_voxels=target_voxels,
+            target_nm_per_px=target_nm_per_px,
+        )
+        return self.read_oblique_specs([spec])[0]
 
     def pick_level_for_nm_per_px(self, axis: str, nm_per_px: float) -> int:
         """Neuroglancer-style multiscale choice from physical screen scale.

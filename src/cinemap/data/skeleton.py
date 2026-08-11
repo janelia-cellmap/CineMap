@@ -12,6 +12,7 @@ for a whole layer's selected segments) to stay fast across thousands of segments
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -62,11 +63,258 @@ class ShaderColormap:
         return out
 
 
-def parse_shader_colormap(shader: str) -> ShaderColormap | None:
-    """Recover a ShaderColormap from a skeleton shader, or None if it doesn't match
-    the recognized colormap pattern (then we fall back to flat segment colors)."""
-    if not shader:
+def _turbo(x: np.ndarray) -> np.ndarray:
+    """Google/Neuroglancer turbo colormap polynomial used by many GLSL shaders."""
+    x = np.clip(np.asarray(x, dtype=np.float64), 0.0, 1.0)
+    v4 = np.stack([np.ones_like(x), x, x * x, x * x * x], axis=1)
+    v2 = np.stack([x ** 4, x ** 5], axis=1)
+    red = v4 @ np.array([0.13572138, 4.61539260, -42.66032258, 132.13108234])
+    red += v2 @ np.array([-152.94239396, 59.28637943])
+    green = v4 @ np.array([0.09140261, 2.19418839, 4.84296658, -14.18503333])
+    green += v2 @ np.array([4.27729857, 2.82956604])
+    blue = v4 @ np.array([0.10667330, 12.64194608, -60.58204836, 110.36276771])
+    blue += v2 @ np.array([-89.90310912, 27.34824973])
+    return np.clip(np.stack([red, green, blue], axis=1), 0.0, 1.0)
+
+
+def _edge_attr_values(skel, edges: np.ndarray, name: str) -> np.ndarray | None:
+    """Return a per-edge scalar skeleton attribute matching `prop_<name>()`.
+
+    Neuroglancer skeleton attributes are normally per-vertex.  A tube edge is colored
+    by averaging its two endpoint values, which matches how the old hand-coded
+    radius path behaved and gives stable colors after tube tessellation.
+    """
+    candidates = [name]
+    if name == "radius":
+        candidates.extend(["radii", "vertex_radius", "vertex_radii"])
+    else:
+        candidates.extend([f"{name}s", f"vertex_{name}", f"vertex_{name}s"])
+
+    vals = None
+    for candidate in candidates:
+        if hasattr(skel, candidate):
+            vals = getattr(skel, candidate)
+            break
+    if vals is None and hasattr(skel, "attributes"):
+        attrs = getattr(skel, "attributes")
+        if isinstance(attrs, dict):
+            for candidate in candidates:
+                if candidate in attrs:
+                    vals = attrs[candidate]
+                    break
+    if vals is None and hasattr(skel, "extra_attributes"):
+        attrs = getattr(skel, "extra_attributes")
+        if isinstance(attrs, dict):
+            for candidate in candidates:
+                if candidate in attrs:
+                    vals = attrs[candidate]
+                    break
+    if vals is None:
         return None
+
+    arr = np.asarray(vals, dtype=np.float64).reshape(-1)
+    if arr.size == len(edges):
+        return arr
+    if arr.size <= int(np.max(edges)):
+        return None
+    return (arr[edges[:, 0]] + arr[edges[:, 1]]) * 0.5
+
+
+def _smoothstep(edge0, edge1, x):
+    t = np.clip((x - edge0) / (edge1 - edge0 + 1e-12), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _mix(a, b, t):
+    return a * (1.0 - t) + b * t
+
+
+def _minimum(*args):
+    out = args[0]
+    for arg in args[1:]:
+        out = np.minimum(out, arg)
+    return out
+
+
+def _maximum(*args):
+    out = args[0]
+    for arg in args[1:]:
+        out = np.maximum(out, arg)
+    return out
+
+
+def _vec(n: int, *args):
+    if len(args) == 1:
+        args = args * n
+    if len(args) != n:
+        raise ValueError(f"vec{n} expects 1 or {n} arguments")
+    arrays = [np.asarray(a, dtype=np.float64) for a in args]
+    if any(a.ndim > 0 for a in arrays):
+        return np.stack(np.broadcast_arrays(*arrays), axis=-1)
+    return np.asarray(args, dtype=np.float64)
+
+
+_EVAL_FUNCS = {
+    "abs": np.abs,
+    "clamp": np.clip,
+    "exp": np.exp,
+    "log": np.log,
+    "max": _maximum,
+    "min": _minimum,
+    "mix": _mix,
+    "pow": np.power,
+    "sqrt": np.sqrt,
+    "smoothstep": _smoothstep,
+    "turbo": _turbo,
+    "vec2": lambda *args: _vec(2, *args),
+    "vec3": lambda *args: _vec(3, *args),
+    "vec4": lambda *args: _vec(4, *args),
+}
+
+
+def _eval_expr(expr: str, env: dict[str, object]):
+    """Evaluate a side-effect-free GLSL-like expression as NumPy operations."""
+    expr = re.sub(r"(?<=\d)f\b", "", expr)
+    tree = ast.parse(expr, mode="eval")
+
+    def ev(node):  # noqa: PLR0911
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id in env:
+                return env[node.id]
+            raise NameError(node.id)
+        if isinstance(node, ast.UnaryOp):
+            value = ev(node.operand)
+            if isinstance(node.op, ast.USub):
+                return -value
+            if isinstance(node.op, ast.UAdd):
+                return value
+            raise ValueError("unsupported unary operator")
+        if isinstance(node, ast.BinOp):
+            left, right = ev(node.left), ev(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+            if isinstance(node.op, ast.Pow):
+                return np.power(left, right)
+            raise ValueError("unsupported binary operator")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            fn = _EVAL_FUNCS.get(node.func.id)
+            if fn is None:
+                raise NameError(node.func.id)
+            return fn(*(ev(a) for a in node.args))
+        raise ValueError(f"unsupported expression: {ast.dump(node, include_attributes=False)}")
+
+    return ev(tree)
+
+
+class ExpressionShaderColorizer:
+    """Evaluate a safe Neuroglancer skeleton-shader subset and bake edge colors.
+
+    This is intentionally a constrained expression evaluator, not a general GLSL
+    compiler. It supports the operations commonly used in NG skeleton shaders:
+    uicontrol float defaults, `prop_*()` skeleton attributes, float/vector
+    assignments in `main`, math functions, `vec*` constructors, and `emitRGB(A)`.
+    """
+
+    def __init__(self, shader: str):
+        self.shader = shader or ""
+        self.controls = {
+            name: float(value)
+            for name, value in re.findall(
+                r"#uicontrol\s+float\s+(\w+)\s+slider\([^)]*default=([\d.eE+-]+)",
+                self.shader,
+            )
+        }
+        body = self._main_body(self.shader)
+        self.assignments: list[tuple[str, str]] = []
+        self.emit_kind = ""
+        self.emit_expr = ""
+        if body:
+            for raw in body.split(";"):
+                stmt = raw.strip()
+                if not stmt:
+                    continue
+                m_emit = re.match(r"emit(RGB|RGBA)\s*\((.*)\)\s*$", stmt, re.S)
+                if m_emit:
+                    self.emit_kind = m_emit.group(1)
+                    self.emit_expr = m_emit.group(2).strip()
+                    continue
+                m_assign = re.match(
+                    r"(?:const\s+)?(?:float|int|vec[234]|bool)\s+(\w+)\s*=\s*(.*)\s*$",
+                    stmt,
+                    re.S,
+                )
+                if not m_assign:
+                    m_assign = re.match(r"(\w+)\s*=\s*(.*)\s*$", stmt, re.S)
+                if m_assign:
+                    self.assignments.append((m_assign.group(1), m_assign.group(2).strip()))
+
+    @staticmethod
+    def _main_body(shader: str) -> str:
+        shader = re.sub(r"//.*", "", shader)
+        m = re.search(r"void\s+main\s*\([^)]*\)\s*\{(.*?)\}", shader, re.S)
+        return m.group(1) if m else ""
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.emit_expr)
+
+    def _prepare_expr(self, expr: str, skel, edges: np.ndarray, env: dict[str, object]) -> str:
+        def repl(match: re.Match) -> str:
+            name = match.group(1)
+            key = f"__prop_{name}"
+            if key not in env:
+                values = _edge_attr_values(skel, edges, name)
+                if values is None:
+                    raise NameError(f"prop_{name}")
+                env[key] = values
+            return key
+
+        expr = re.sub(r"\bprop_(\w+)\s*\(\s*\)", repl, expr)
+        return re.sub(r"(?<=\d)f\b", "", expr)
+
+    @staticmethod
+    def _as_rgba(value, n: int, use_alpha: bool) -> np.ndarray | None:
+        arr = np.asarray(value, dtype=np.float64)
+        if arr.ndim == 1 and arr.size in (3, 4):
+            arr = np.tile(arr[None, :], (n, 1))
+        if arr.ndim != 2 or arr.shape[0] != n or arr.shape[1] not in (3, 4):
+            return None
+        rgba = np.empty((n, 4), dtype=np.uint8)
+        rgba[:, :3] = np.clip(arr[:, :3] * 255.0, 0, 255).astype(np.uint8)
+        alpha = arr[:, 3] if (use_alpha and arr.shape[1] == 4) else 1.0
+        rgba[:, 3] = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+        return rgba
+
+    def edge_rgba(self, skel, edges) -> np.ndarray | None:
+        if not self.usable:
+            return None
+        env: dict[str, object] = {
+            "PI": np.pi,
+            "false": False,
+            "true": True,
+            **self.controls,
+        }
+        try:
+            for name, expr in self.assignments:
+                env[name] = _eval_expr(self._prepare_expr(expr, skel, edges, env), env)
+            value = _eval_expr(self._prepare_expr(self.emit_expr, skel, edges, env), env)
+            return self._as_rgba(value, len(edges), self.emit_kind == "RGBA")
+        except Exception:  # noqa: BLE001 - unsupported shader subset falls back cleanly
+            return None
+
+
+def _parse_legacy_shader_colormap(shader: str) -> ShaderColormap | None:
+    """Recover the older CellMap piecewise-smoothstep colormap pattern."""
     floats = dict(re.findall(r"float\s+(\w+)\s*=\s*([\d.eE+f-]+)", shader))
     edges, colors = [], []
     i = 0
@@ -86,6 +334,19 @@ def parse_shader_colormap(shader: str) -> ShaderColormap | None:
     attr, denom = m.group(1), m.group(2)
     norm = float(floats.get(denom, denom).rstrip("f")) if denom else 1.0
     return ShaderColormap(attr, norm, edges, colors)
+
+
+def parse_shader_colormap(shader: str) -> object | None:
+    """Recover a skeleton shader colorizer, or None if it cannot be evaluated."""
+    if not shader:
+        return None
+    legacy = _parse_legacy_shader_colormap(shader)
+    if legacy is not None:
+        return legacy
+    expr = ExpressionShaderColorizer(shader)
+    if expr.usable:
+        return expr
+    return None
 
 
 def _perp_frame(d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -176,6 +437,10 @@ class SkeletonLoader:
         scalar attribute when available (matching neuroglancer); otherwise the flat
         per-segment color from `colorize`."""
         cm = self.colormap
+        if cm is not None and hasattr(cm, "edge_rgba"):
+            rgba = cm.edge_rgba(skel, edges)
+            if rgba is not None:
+                return rgba
         if cm is not None and hasattr(skel, cm.attr):
             attr = np.asarray(getattr(skel, cm.attr), dtype=np.float64).reshape(-1)
             ev = (attr[edges[:, 0]] + attr[edges[:, 1]]) * 0.5 / cm.norm  # per-edge, normalized

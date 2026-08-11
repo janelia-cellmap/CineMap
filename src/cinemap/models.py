@@ -54,6 +54,10 @@ class Camera(BaseModel):
     look_at_nm: list[float]
     fov_deg: float = 40.0
     up: list[float] = Field(default_factory=lambda: [0.0, 0.0, 1.0])
+    # Neuroglancer 2D/cross-section panels are orthographic. Perspective remains the
+    # default for existing projects baked from the 3D panel.
+    projection: Literal["PERSP", "ORTHO"] = "PERSP"
+    ortho_scale_nm: Optional[float] = None
 
 
 class SlicePlane(BaseModel):
@@ -64,6 +68,7 @@ class SlicePlane(BaseModel):
     # an oblique plane with that normal (the EM is resampled on the tilted plane).
     normal: Optional[list[float]] = None
     scale_level: Optional[int] = None  # None => auto-pick from on-screen extent
+    contrast_limits: Optional[list[float]] = None  # [black, white] intensity window
     opacity: float = 1.0
     visible: bool = True
 
@@ -93,7 +98,7 @@ class MeshInstance(BaseModel):
     color_seed: int = 0
     default_color: Optional[list[float]] = None
     segment_colors: dict[str, list[float]] = Field(default_factory=dict)
-    saturation: float = 1.0     # NG layer saturation (0 = grayscale meshes)
+    saturation: float = 1.0     # NG layer saturation (0 = white, 1 = full color)
     # neuroglancer 3D mesh render state (per keyframe -> can change frame to frame)
     object_alpha: float = 1.0   # NG "Opacity (3d)"  (objectAlpha)
     silhouette: float = 0.0     # NG "Silhouette (3d)" (meshSilhouetteRendering)
@@ -138,6 +143,10 @@ class Keyframe(BaseModel):
     duration_in_s: float = 2.0  # transition duration INTO this keyframe (the move)
     hold_in_s: float = 0.0      # rest/dwell ON this keyframe's pose before moving on
     easing: Literal["linear", "ease-in-out", "ease-in", "ease-out"] = "ease-in-out"
+    # Fly-through waypoint: the camera passes through this keyframe at speed instead of
+    # easing to a stop (and any hold is ignored), so a run of waypoints reads as one
+    # continuous flow. First/last keyframes are still treated as stops unless flagged.
+    waypoint: bool = False
     # Camera/edit transition into this keyframe. Layer appearance/style changes are controlled
     # separately by layer_transition below.
     transition: TransitionStyle = "glide"
@@ -184,16 +193,29 @@ class RenderSettings(BaseModel):
     # NAME (EM image or a mesh/seg layer) — drawn even if that layer is currently hidden.
     bbox_source: str = ""
     # By default a layer's precomputed meshes are downloaded (fast, LOD-adaptive,
-    # matches neuroglancer). Set this to instead regenerate watertight meshes from
-    # the OME-Zarr label volume via marching cubes when one is available.
+    # matches neuroglancer). Set this to instead regenerate higher-quality meshes
+    # from the OME-Zarr label volume with zmesh when one is available.
     mesh_from_labels: bool = False
     # Mesh detail multiplier on the per-layer vertex budget (1.0 = default 5M full /
-    # 1.2M draft). Higher = crisper meshes but more VRAM; the worker hard-caps the
+    # 3M draft). Higher = crisper meshes but more VRAM; the worker hard-caps the
     # budget and auto-retries at lower detail if the GPU runs out of memory.
     mesh_detail: float = 1.0
-    # Auto-direction: a non-destructive presentation pass (camera-relative key/fill/
-    # rim lighting, publication materials, subtle depth-of-field on the framed
-    # subject). On by default; off renders the plain neuroglancer-faithful scene.
+    # Label-mesh postprocessing: exact cleanup always runs. Smoothing and lossy
+    # simplification are opt-in because we usually want the label mesh to stay as
+    # representative of the voxel data as possible.
+    label_mesh_smooth_iters: int = 0
+    # Label-mesh decimation keep-fraction (0 disables; 0<f<1 keeps that fraction of
+    # faces). Applied after blockwise assembly, so target_vertices governs how much is
+    # loaded and this reduces the result from there (e.g. load 20M, 0.5 -> ~10M).
+    label_mesh_decimate_fraction: float = 0.0
+    # Read+mesh the label volume one cubic block at a time and weld the seams, instead
+    # of one whole-ROI read. "auto" (default) does this only when the single read would
+    # exceed a memory threshold (sparse-but-huge bboxes that would otherwise OOM); "on"
+    # forces blockwise, "off" forces the single read.
+    label_mesh_blockwise: Literal["auto", "on", "off"] = "auto"
+    # Auto-direction: optional cinematic smoothing/emphasis around the selected Look
+    # preset. On by default; if no Look preset is selected, off renders the plain
+    # neuroglancer-faithful scene.
     auto_direct: bool = True
     # Mesh LOD strategy:
     #   "single" — one LOD for the whole shot (built at the closest frame's scale).
@@ -224,7 +246,8 @@ class Sweep(BaseModel):
     # cutaway = slice a mesh layer's clip plane; slice = sweep an EM cross-section plane.
     kind: Literal["cutaway", "slice"] = "cutaway"
     layer: str = ""                        # mesh layer name the clip plane cuts (cutaway)
-    em_name: str = ""                      # EM layer name the slice shows (slice)
+    em_name: str = ""                      # primary layer the slice shows (slice)
+    overlay_layers: list[str] = Field(default_factory=list)  # extra seg layers on slice scans
     axis: Axis = "z"
     normal: Optional[list[float]] = None   # oblique plane; None => axis-aligned
     side: int = 1
@@ -251,6 +274,9 @@ class RenderPrefs(BaseModel):
     samples: int = 48
     mesh_detail: float = 1.0
     mesh_from_labels: bool = False
+    # Label-mesh build options (persist with the project so they survive reload).
+    label_mesh_smooth_iters: int = 0
+    label_mesh_decimate_fraction: float = 0.0
     auto_direct: bool = True
     lod_mode: str = "frame"
     show_bbox: bool = False

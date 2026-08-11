@@ -32,9 +32,9 @@ export CINEMAP_DATA_ROOTS="http://my-host:8000/data/=/groups/cellmap/cellmap/dat
 
 `localize()` checks each prefix and rewrites if matched.
 
-There is also a built-in Janelia shortcut for the common CellMap URL shape:
-`https://cellmap-vm1.int.janelia.org/nrs/data/...` maps to
-`/nrs/cellmap/data/...` when that path exists.
+There is also an optional shortcut for the common CellMap URL shape:
+`https://cellmap-vm1.int.janelia.org/nrs/data/...` maps under
+`CINEMAP_CELLMAP_DATA_ROOT` when that environment variable is set.
 
 ### B. CineMap can host the data itself
 Drop the need for a separate `python -m http.server` / nginx by mounting a

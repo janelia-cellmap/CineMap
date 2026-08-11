@@ -30,7 +30,7 @@
   <text x="44" y="29" fill="#e9edf3" font-size="16" font-weight="600">mvideo</text>
   <text x="120" y="29" fill="#7d8694" font-size="13">project:</text>
   <text x="178" y="29" fill="#c7cfda" font-size="13" font-weight="600">jrc_mus-salivary-1</text>
-  <text x="340" y="29" fill="#7d8694" font-size="13" font-family="monospace">/nrs/cellmap/.../jrc_mus-salivary/em.zarr</text>
+  <text x="340" y="29" fill="#7d8694" font-size="13" font-family="monospace">$CINEMAP_DATA_ROOT/.../jrc_mus-salivary/em.zarr</text>
   <!-- top right buttons -->
   <rect x="1300" y="12" width="92" height="26" rx="5" fill="#222734" stroke="#333a48"/>
   <text x="1346" y="29" fill="#c7cfda" font-size="12" text-anchor="middle">Analyze</text>

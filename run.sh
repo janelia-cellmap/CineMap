@@ -9,13 +9,20 @@ ENV="${CINEMAP_ENV:-cinemap}"
 HOST="${CINEMAP_HOST:-0.0.0.0}"          # uvicorn bind (0.0.0.0 = all interfaces)
 PORT="${CINEMAP_PORT:-8000}"
 
+# Local machine/user overrides. Keep site-specific paths (for example shared NRS
+# project storage) out of tracked source.
+LOCAL_ENV="${CINEMAP_ENV_FILE:-$HOME/.config/cinemap/env}"
+if [[ -f "$LOCAL_ENV" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$LOCAL_ENV"
+  set +a
+fi
+
 # Where project state + per-project render assets (meshes, slice PNGs, frames, the
-# .mesh_cache fragment cache) live. Defaults to ./projects (next to this repo). Set
-# this to a path OUTSIDE the source tree so thousands of generated files don't sit
-# on NFS / get walked by your editor / land in `git status`. Examples:
-#   export CINEMAP_PROJECTS_DIR=/scratch/$USER/cinemap_projects
-#   export CINEMAP_PROJECTS_DIR="$(realpath ..)/cinemap_projects"
-export CINEMAP_PROJECTS_DIR="${CINEMAP_PROJECTS_DIR:-$(pwd)/projects}"
+# .mesh_cache fragment cache) live. Override with CINEMAP_PROJECTS_DIR in
+# ~/.config/cinemap/env, the shell, or another CINEMAP_ENV_FILE.
+export CINEMAP_PROJECTS_DIR="${CINEMAP_PROJECTS_DIR:-$PWD/projects}"
 
 # Bind the neuroglancer viewer to all interfaces (incl. loopback) by default; the app
 # rewrites the iframe URL to whatever host the browser used (see server._ng_url_for), so

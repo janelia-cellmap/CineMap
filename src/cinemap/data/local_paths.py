@@ -1,8 +1,8 @@
 """Optional renderer-side shortcut from HTTP data URLs to local filesystem paths.
 
 Project files keep portable HTTP URLs for Neuroglancer/browser use. When CineMap runs
-on a machine that can see the same data under /nrs or /groups, Python loaders can skip
-HTTP and read bytes directly from disk.
+on a machine that can see the same data through a configured filesystem mapping,
+Python loaders can skip HTTP and read bytes directly from disk.
 """
 from __future__ import annotations
 
@@ -38,6 +38,11 @@ def _configured_mappings() -> list[tuple[str, str]]:
     return out
 
 
+def _configured_absolute_roots() -> list[str]:
+    raw = os.environ.get("CINEMAP_ABSOLUTE_DATA_ROOTS", "")
+    return [item.rstrip("/") for item in raw.split(os.pathsep) if item.strip()]
+
+
 def _join_under(root: str, rel: str) -> str | None:
     root_real = os.path.realpath(root)
     rel = urllib.parse.unquote(rel).lstrip("/")
@@ -70,13 +75,16 @@ def local_path(url: str, *, require_exists: bool = True) -> str | None:
 
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme in ("http", "https") and parsed.hostname in _JANELIA_DATA_HOSTS:
-        # Common CellMap deployment: browser URLs expose mounted data through cellmap-vm1,
-        # while cluster nodes can read the same tree directly.
+        # Optional CellMap deployment shortcut: browser URLs expose mounted data
+        # through cellmap-vm1, while cluster nodes can read the same tree directly
+        # if CINEMAP_CELLMAP_DATA_ROOT points at that local tree.
+        cellmap_data_root = os.environ.get("CINEMAP_CELLMAP_DATA_ROOT", "").rstrip("/")
         if parsed.path == "/nrs/data" or parsed.path.startswith("/nrs/data/"):
-            path = _join_under("/nrs/cellmap/data", parsed.path[len("/nrs/data/"):])
-            if path and (not require_exists or os.path.exists(path)):
-                return path
-        for root in ("/nrs", "/groups"):
+            if cellmap_data_root:
+                path = _join_under(cellmap_data_root, parsed.path[len("/nrs/data/"):])
+                if path and (not require_exists or os.path.exists(path)):
+                    return path
+        for root in _configured_absolute_roots():
             marker = root + "/"
             if parsed.path == root or parsed.path.startswith(marker):
                 path = _join_under(root, parsed.path[len(marker):])
