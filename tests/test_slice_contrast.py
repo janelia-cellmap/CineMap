@@ -1,6 +1,6 @@
 import numpy as np
 
-from cinemap.models import Camera, Keyframe, SlicePlane
+from cinemap.models import Camera, Keyframe, MeshInstance, SlicePlane
 from cinemap.data.ng_camera import cross_section_plane, ng_to_cross_section_camera
 from cinemap.render.interpolate import build_frames
 from cinemap.render.worker import RenderWorker, _apply_contrast_window
@@ -78,6 +78,28 @@ def test_interpolated_frame_preserves_slice_contrast_limits():
 
     assert frames[0].slices[0].contrast_limits == [90, 140]
     assert frames[1].slices[0].contrast_limits == [90, 140]
+
+
+def test_changing_segment_sets_keep_common_segments_continuous():
+    cam = Camera(position_nm=[0, 0, 10], look_at_nm=[0, 0, 0], fov_deg=45)
+    a = Keyframe(
+        id="a",
+        camera=cam,
+        meshes=[MeshInstance(mesh_name="neurons", segment_ids=[1, 2, 3])],
+    )
+    b = Keyframe(
+        id="b",
+        camera=cam,
+        duration_in_s=1.0,
+        easing="linear",
+        meshes=[MeshInstance(mesh_name="neurons", segment_ids=[3])],
+    )
+
+    mid = build_frames([a, b], fps=2)[1]
+    by_ids = {tuple(m.segment_ids): m.opacity * m.object_alpha for m in mid.meshes}
+
+    assert by_ids[(3,)] == 1.0
+    assert by_ids[(1, 2)] == 0.5
 
 
 def test_cross_section_state_maps_to_orthographic_camera():

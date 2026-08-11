@@ -150,11 +150,16 @@ def _ng_quantize_decode_normals(normals):
     return np.ascontiguousarray(out, dtype=np.float32)
 
 
-def _export_mesh_npz(mesh, out: Path) -> None:
+def _export_mesh_npz(mesh, out: Path, mesh2=None) -> None:
     """Write a trimesh-like object as a compact `.npz` (vertices float32, faces
     int32, Neuroglancer-style vertex normals, and optional uint8 vertex colors).
     Blender loads this ~5–10× faster than going through `bpy.ops.wm.ply_import`
-    (which routes through the operator system + undo stack)."""
+    (which routes through the operator system + undo stack).
+
+    `mesh2`, when given, must share `mesh`'s exact vertex/face topology (same ids,
+    same decimate/smooth params — just a different `colorize`) and contributes a
+    SECOND vertex-color array "c2", so the render material can crossfade between two
+    baked colorings of one merged geometry instead of stacking duplicate meshes."""
     import numpy as np
 
     v = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
@@ -190,6 +195,14 @@ def _export_mesh_npz(mesh, out: Path) -> None:
         )
         if not default_gray:
             arrs["c"] = vc
+    if mesh2 is not None:
+        vc2 = None
+        try:
+            vc2 = mesh2.visual.vertex_colors
+        except Exception:  # noqa: BLE001
+            vc2 = None
+        if vc2 is not None and len(vc2) == len(v):
+            arrs["c2"] = np.ascontiguousarray(vc2, dtype=np.uint8)
     # raw save (no compression) — load speed in Blender matters more than disk
     np.savez(str(out), **arrs)
 
@@ -1061,6 +1074,185 @@ class RenderWorker:
         _export_mesh_npz(combined, out)
         return str(out)
 
+    def _mesh_source_key(self, mesh_name):
+        """Identity of a mesh layer's underlying data (independent of which segment
+        ids/colors a particular layer selects). Two layers with the same key are
+        different "views" (recolors/subsets) of the identical geometry."""
+        src = self._mesh_source(mesh_name)
+        if src is None:
+            return None
+        return (src.mesh_url or "", src.label_zarr or "", src.skeleton_url or "")
+
+    def _recolor_groups(self, fr) -> list[list]:
+        """Same-source mesh instances active this frame that actually occupy the SAME
+        3D geometry (their segment id sets overlap) and are mid-appear/disappear — a
+        recolor crossfade (e.g. several NG layers recoloring subsets of one
+        segmentation) rather than genuinely independent objects. Rendering those as
+        separate, independently-fading meshes stacks near-coincident transparent
+        surfaces, which can fail to resolve in Cycles (the camera ray never reaches
+        the opaque geometry behind the barely-visible duplicate), hiding structure for
+        the whole crossfade.
+
+        Same-source instances whose id sets are DISJOINT (e.g. one mesh_name's own
+        "stays visible" / "fades out" split into different, non-overlapping segments)
+        never occupy the same space — there's no coincidence to fix — and must NOT be
+        merged: a merged asset has exactly one opacity for the whole object, so forcing
+        two segments with genuinely different, independently-varying alphas onto it
+        would let a steady segment's opacity mask a fading segment's, and nothing would
+        ever look transparent. Connected-components by id overlap keeps each such
+        segment on its own independently-fading object."""
+        groups: dict[tuple, list] = {}
+        for m in fr.meshes:
+            if self._mesh_render_alpha(m) <= 0.001:
+                continue
+            key = self._mesh_source_key(m.mesh_name)
+            if key is None:
+                continue
+            groups.setdefault(key, []).append(m)
+        out: list[list] = []
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            id_sets = [set(int(i) for i in m.segment_ids) for m in members]
+            parent = list(range(len(members)))
+
+            def find(i):
+                while parent[i] != i:
+                    i = parent[i]
+                return i
+
+            for i in range(len(members)):
+                for j in range(i + 1, len(members)):
+                    if id_sets[i] & id_sets[j]:
+                        ri, rj = find(i), find(j)
+                        if ri != rj:
+                            parent[ri] = rj
+            components: dict[int, list] = {}
+            for i, m in enumerate(members):
+                components.setdefault(find(i), []).append(m)
+            for comp in components.values():
+                if len(comp) > 1 and any(mm.color_mix is not None for mm in comp):
+                    out.append(comp)
+        return out
+
+    @staticmethod
+    def _mk_colorize(resolved: dict):
+        def rgb(seg_id):
+            return resolved.get(int(seg_id), (1.0, 1.0, 1.0))
+        return rgb
+
+    def _resolve_member_colors(self, members) -> dict:
+        """id -> rgb for a set of same-source FrameMesh members, each contributing
+        color only for its OWN segment ids."""
+        resolved: dict[int, tuple] = {}
+        for m in members:
+            lc = self._frame_colors(m)
+            for sid in m.segment_ids:
+                resolved[int(sid)] = lc.rgb(int(sid))
+        return resolved
+
+    def _merged_mesh_asset(self, rep_name: str, union_ids: list[int],
+                           colorize_from, colorize_to, sig: str) -> str | None:
+        """Build (or reuse) ONE mesh spanning the union of a recolor group's segment
+        ids, baked with BOTH the "before" and "after" colorings (see `_export_mesh_npz`
+        `mesh2`) so the render material can crossfade color on a single, always-solid
+        surface instead of stacking independently-fading duplicate meshes."""
+        src = self._mesh_source(rep_name)
+        if not src:
+            return None
+        uid = f"recolor_{sig}"
+        out = self.assets_dir / f"mesh_{uid}.npz"
+        if out.exists():
+            return str(out)
+        kwargs = dict(
+            target_voxels_single=self._mesh_voxels_single,
+            target_voxels_union=self._mesh_voxels_union,
+            draft=self._draft, prefer_labels=self._prefer_labels,
+            total_budget=self._mesh_budget,
+            label_smooth_iters=self._label_smooth_iters,
+            label_decimate_fraction=self._label_decimate_fraction,
+            label_blockwise=self._label_blockwise,
+        )
+        try:
+            loader = MeshLoader(src.mesh_url, src.label_zarr, cache_dir=self._mesh_cache_dir)
+            combined_from = loader.load_many(union_ids, colorize=colorize_from, **kwargs)
+            combined_to = loader.load_many(union_ids, colorize=colorize_to, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            print(f"[worker] merged recolor mesh ({rep_name} group, {len(union_ids)} segs) "
+                  f"failed: {e}")
+            return None
+        if len(combined_from.vertices) != len(combined_to.vertices):
+            # Should not happen (identical ids + decimate params -> deterministic
+            # topology), but never silently mismatch two vertex-color sets.
+            print(f"[worker] merged recolor topology mismatch for {rep_name} group "
+                  f"({len(combined_from.vertices)} vs {len(combined_to.vertices)} verts); "
+                  "falling back to independent layers")
+            return None
+        os.makedirs(out.parent, exist_ok=True)
+        _export_mesh_npz(combined_from, out, mesh2=combined_to)
+        return str(out)
+
+    def _build_recolor_group(self, members) -> dict | None:
+        """Resolve one same-source recolor group (see `_recolor_groups`) into a merged-
+        mesh spec: the union of all members' segment ids, baked with both the "from"
+        (disappearing members') and "to" (appearing members') colorings. Returns None
+        if the merge can't be built, in which case the caller falls back to rendering
+        the group's layers independently (the pre-fix behavior)."""
+        import hashlib
+
+        union_ids = sorted({int(i) for m in members for i in m.segment_ids})
+        if not union_ids:
+            return None
+        if any(getattr(m, "clip", None) for m in members):
+            return None    # cutaway clips on a recolor group aren't supported yet ->
+                            # fall back to rendering the group's layers independently
+        from_members = [m for m in members if m.transition_role != "to"]
+        to_members = [m for m in members if m.transition_role != "from"]
+        resolved_from = self._resolve_member_colors(from_members)
+        resolved_to = self._resolve_member_colors(to_members)
+        # A segment can be part of this merge without genuinely recoloring — e.g. a
+        # group that's a pure simultaneous disappear (every member "from", nothing of
+        # this source arrives to replace it), a pure simultaneous appear, or a segment
+        # dropped/added within one mesh_name's own id-set split (see interpolate.py's
+        # common/removed/added handling). Any id missing from one side has no real
+        # destination/origin color at all; falling back to a flat white there would make
+        # it visibly flash/bleach toward white as it fades — instead of just fading out/
+        # in via opacity, which is what should happen absent an actual recolor. Filling
+        # the gap with the OTHER side's color instead pins that id's color constant
+        # across the crossfade (color_mix is then a no-op for it), leaving opacity to
+        # carry the whole effect — exactly like the pre-merge independent-layer render.
+        orig_from, orig_to = dict(resolved_from), dict(resolved_to)
+        for sid in union_ids:
+            if sid not in resolved_to:
+                resolved_to[sid] = orig_from.get(sid, (1.0, 1.0, 1.0))
+            if sid not in resolved_from:
+                resolved_from[sid] = orig_to.get(sid, (1.0, 1.0, 1.0))
+        colorize_from = self._mk_colorize(resolved_from)
+        colorize_to = self._mk_colorize(resolved_to)
+        sig_from = tuple(sorted(resolved_from.items()))
+        sig_to = tuple(sorted(resolved_to.items()))
+        rep_name = members[0].mesh_name
+        group_tag = "+".join(sorted({m.mesh_name for m in members}))
+        sig = hashlib.md5(
+            (group_tag + "|" + str(union_ids) + "|" + str(sig_from) + "|" + str(sig_to)
+             + "|geom1").encode()
+        ).hexdigest()[:16]
+        obj_path = self._merged_mesh_asset(rep_name, union_ids, colorize_from, colorize_to, sig)
+        if obj_path is None:
+            return None
+        return {
+            "uid": f"recolor_{sig}",
+            "obj_path": obj_path,
+            "member_names": {m.mesh_name for m in members},
+            "silhouette": max((getattr(m, "silhouette", 0.0) or 0.0) for m in members),
+            "clip": next((getattr(m, "clip", None) for m in members
+                         if getattr(m, "clip", None)), None),
+            "metallic": next((getattr(m, "metallic", None) for m in members
+                              if getattr(m, "metallic", None) is not None), None),
+            "roughness": next((getattr(m, "roughness", None) for m in members
+                               if getattr(m, "roughness", None) is not None), None),
+        }
+
     @staticmethod
     def _clip_normal(cl: dict) -> list[float]:
         nrm = cl.get("normal")
@@ -1439,16 +1631,33 @@ class RenderWorker:
         # _build_chunk_assets); other modes: one combined mesh per (layer, segset, bucket).
         frame_layer_uid = (self._build_chunk_assets(frames, mesh_specs)
                            if self._lod_mode == "chunk" else None)
+        frame_recolor_groups: list[list] = [[] for _ in frames]
         for fi, fr in enumerate(frames):
             if self.cancel.is_set():
                 raise RenderCancelled()
+            grouped_names: set[str] = set()
             if frame_layer_uid is None:
+                for members in self._recolor_groups(fr):
+                    group = self._build_recolor_group(members)
+                    if group is None:
+                        continue
+                    frame_recolor_groups[fi].append(group)
+                    grouped_names.update(mm.mesh_name for mm in members)
+                    if group["uid"] not in mesh_specs:
+                        mesh_specs[group["uid"]] = {
+                            "id": group["uid"],
+                            "obj_path": group["obj_path"],
+                            "color": [1.0, 1.0, 1.0],
+                        }
                 for m in fr.meshes:
-                    if self._mesh_render_alpha(m) <= 0.001:
+                    if self._mesh_render_alpha(m) <= 0.001 or m.mesh_name in grouped_names:
                         continue
                     nmpp = _eff_nmpp(m.mesh_name, fi)
                     lc = self._frame_colors(m)
-                    colorize_segments = self._mesh_needs_vertex_colors(m, lc)
+                    colorize_segments = (
+                        self._mesh_needs_vertex_colors(m, lc)
+                        or self._mesh_uses_shader_vertex_colors(m.mesh_name)
+                    )
                     color_key = lc.cache_key() if colorize_segments else ()
                     uid = self._mesh_uid(m.mesh_name, m.segment_ids, color_key=color_key, nmpp=nmpp)
                     if uid not in mesh_specs:
@@ -1569,12 +1778,50 @@ class RenderWorker:
                 slices.append({**png, "opacity": sl.opacity, "occlude": True,
                                "slot": f"{sl.em_name}:{sl.axis}"})
             overrides = {}
+            grouped_names: set[str] = set()
+            for group in frame_recolor_groups[fi]:
+                if group["uid"] not in mesh_specs:
+                    continue
+                members = [m for m in fr.meshes if m.mesh_name in group["member_names"]]
+                if not members:
+                    continue
+                combined_transparency = 1.0
+                for m in members:
+                    combined_transparency *= (1.0 - max(0.0, min(1.0, self._mesh_render_alpha(m))))
+                eff = 1.0 - combined_transparency
+                is_hero = any(m.mesh_name == emph_hero for m in members)
+                if emph_track and not is_hero and emph_spot < 1.0:
+                    eff *= emph_spot
+                mixes = [m.color_mix for m in members if m.color_mix is not None]
+                ov = {
+                    "opacity": eff,
+                    "visible": eff > 0.001,
+                    "silhouette": group["silhouette"],
+                    "color": [1.0, 1.0, 1.0],
+                    "color_mix": (sum(mixes) / len(mixes)) if mixes else 0.0,
+                }
+                if group.get("metallic") is not None:
+                    ov["metallic"] = group["metallic"]
+                if group.get("roughness") is not None:
+                    ov["roughness"] = group["roughness"]
+                if is_hero and emph_glow > 0.0:
+                    ov["emphasis"] = emph_glow
+                # Cutaway clips on a recolor group aren't supported yet (none of this
+                # project's groups use one); such a group falls back to independent
+                # per-layer rendering instead (see `_recolor_groups`/`_mesh_source_key`).
+                overrides[group["uid"]] = ov
+                grouped_names.update(group["member_names"])
             for m in fr.meshes:
+                if m.mesh_name in grouped_names:
+                    continue
                 lc = self._frame_colors(m)
                 if frame_layer_uid is not None:           # chunk mode: per-frame selection
                     uid = frame_layer_uid[fi].get(m.mesh_name)
                 else:
-                    colorize_segments = self._mesh_needs_vertex_colors(m, lc)
+                    colorize_segments = (
+                        self._mesh_needs_vertex_colors(m, lc)
+                        or self._mesh_uses_shader_vertex_colors(m.mesh_name)
+                    )
                     color_key = lc.cache_key() if colorize_segments else ()
                     uid = self._mesh_uid(
                         m.mesh_name, m.segment_ids, color_key=color_key,

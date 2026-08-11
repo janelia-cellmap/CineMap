@@ -507,29 +507,40 @@ def _load_npz_mesh(path: str, name: str, calc_edges: bool = False, color_space: 
     mesh.polygons.foreach_set("loop_start",
                               (np.arange(Nf, dtype=np.int32) * 3))
     mesh.polygons.foreach_set("loop_total", np.full(Nf, 3, dtype=np.int32))
-    if "c" in arrs.files:                 # per-vertex (per-segment) colors
-        c = np.ascontiguousarray(arrs["c"], dtype=np.uint8)
-        if c.ndim == 2 and c.shape[1] == 3:    # add opaque alpha
-            c = np.concatenate([c, np.full((len(c), 1), 255, dtype=np.uint8)], axis=1)
+    def _bake_color_attr(key: str, attr_name: str) -> None:
         # Trimesh creates a uniform [102,102,102,255] visual by default even when
         # CineMap did not intentionally bake colors. Treat that as uncolored geometry
         # so the explicit mesh material/NG color in scene.json drives the render.
+        c = np.ascontiguousarray(arrs[key], dtype=np.uint8)
+        if c.ndim == 2 and c.shape[1] == 3:    # add opaque alpha
+            c = np.concatenate([c, np.full((len(c), 1), 255, dtype=np.uint8)], axis=1)
         is_default_trimesh_gray = (
             len(c) > 0
             and np.all(c == np.array([102, 102, 102, 255], dtype=np.uint8))
         )
-        if not is_default_trimesh_gray:
-            cf = c.astype(np.float32) / 255.0
-            if str(color_space).lower() == "srgb":
-                rgb = cf[:, :3]
-                cf[:, :3] = np.where(
-                    rgb <= 0.04045,
-                    rgb / 12.92,
-                    ((rgb + 0.055) / 1.055) ** 2.4,
-                )
-            cf = cf.ravel()
-            ca = mesh.color_attributes.new(name="Col", type="FLOAT_COLOR", domain="POINT")
-            ca.data.foreach_set("color", cf)
+        if is_default_trimesh_gray:
+            return
+        cf = c.astype(np.float32) / 255.0
+        if str(color_space).lower() == "srgb":
+            rgb = cf[:, :3]
+            cf[:, :3] = np.where(
+                rgb <= 0.04045,
+                rgb / 12.92,
+                ((rgb + 0.055) / 1.055) ** 2.4,
+            )
+        cf = cf.ravel()
+        ca = mesh.color_attributes.new(name=attr_name, type="FLOAT_COLOR", domain="POINT")
+        ca.data.foreach_set("color", cf)
+
+    if "c" in arrs.files:                 # per-vertex (per-segment) colors
+        _bake_color_attr("c", "Col")
+    # "c2" is a SECOND baked color set sharing the same vertex/face topology as "c" —
+    # used for a same-source recolor crossfade (e.g. several NG layers that recolor
+    # subsets of one segmentation): the merged asset carries the "before" colors as
+    # "c"/Col and the "after" colors as "c2"/Col2, and the material mixes between them
+    # with a per-frame scalar instead of stacking independently-fading duplicate meshes.
+    if "c2" in arrs.files:
+        _bake_color_attr("c2", "Col2")
     # calc_edges builds an explicit edge table from the loops. Only cutaway meshes need
     # that downstream for bmesh bisect/weld/cap; normal render-only meshes can render
     # straight from faces, and skipping edge construction saves cold-start time on big
@@ -662,16 +673,35 @@ def _import_meshes(scene_spec: dict) -> dict:
         _set_in(bsdf, "Subsurface Weight", prof.get("subsurface", 0.0))
         _set_in(bsdf, "Sheen Weight", prof.get("sheen", 0.0))
         _set_in(bsdf, "Coat Weight", prof.get("coat", 0.0))
-        has_colors = bool(getattr(obj.data, "color_attributes", None)) and len(obj.data.color_attributes) > 0
+        color_attrs = getattr(obj.data, "color_attributes", None)
+        has_colors = bool(color_attrs) and len(color_attrs) > 0
+        has_color2 = bool(color_attrs) and color_attrs.get("Col2") is not None
         if has_colors:  # per-vertex (per-segment) colors
             csrc = nt.nodes.new("ShaderNodeVertexColor")
-            csrc.layer_name = obj.data.color_attributes[0].name
+            csrc.layer_name = "Col" if color_attrs.get("Col") is not None else color_attrs[0].name
             color_out = csrc.outputs["Color"]
         else:  # solid color
             csrc = nt.nodes.new("ShaderNodeRGB")
             csrc.name = "cm_color"
             csrc.outputs[0].default_value = col
             color_out = csrc.outputs[0]
+        if has_color2:
+            # Same-source recolor crossfade (see `_load_npz_mesh`): "Col" is the "before"
+            # bake, "Col2" the "after" bake on identical topology. cm_color_mix (0..1,
+            # driven per frame in `_set_mesh_state`) blends them so several NG layers that
+            # recolor the same underlying segmentation read as one object smoothly
+            # changing color, instead of stacked duplicate meshes crossfading opacity.
+            csrc2 = nt.nodes.new("ShaderNodeVertexColor")
+            csrc2.layer_name = "Col2"
+            mix_v = nt.nodes.new("ShaderNodeValue")
+            mix_v.name = "cm_color_mix"
+            mix_v.outputs[0].default_value = 0.0
+            color_mix = nt.nodes.new("ShaderNodeMixRGB")
+            color_mix.blend_type = "MIX"
+            nt.links.new(mix_v.outputs[0], color_mix.inputs["Fac"])
+            nt.links.new(color_out, color_mix.inputs["Color1"])
+            nt.links.new(csrc2.outputs["Color"], color_mix.inputs["Color2"])
+            color_out = color_mix.outputs["Color"]
         if "Specular Tint" in bsdf.inputs:
             tint = float(prof.get("specular_tint", 0.0) or 0.0)
             sock = bsdf.inputs["Specular Tint"]
@@ -1035,6 +1065,9 @@ def _set_mesh_state(
         cv = nt.nodes.get("cm_color")
         if cv is not None and ov.get("color") is not None:
             cv.outputs[0].default_value = _color_for_blender(ov["color"], color_space)
+        cmv = nt.nodes.get("cm_color_mix")
+        if cmv is not None:
+            cmv.outputs[0].default_value = float(ov.get("color_mix", 0.0) or 0.0)
         if av is None and "Alpha" in nt.nodes["Principled BSDF"].inputs:
             nt.nodes["Principled BSDF"].inputs["Alpha"].default_value = opacity
         # per-frame material: override metallic/roughness when this frame sets them, else

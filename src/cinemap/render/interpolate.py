@@ -116,6 +116,13 @@ class FrameMesh:
     clip: dict | None = None    # cutaway plane {axis, position_nm, side} or None
     metallic: float | None = None    # per-frame material override (None = leave look base)
     roughness: float | None = None
+    color_mix: float | None = None   # 0..1 progress through this mesh's OWN appear/disappear
+                                      # transition (None = steady, not mid-transition). Lets the
+                                      # render worker detect several same-source layers fading
+                                      # into/out of each other (a recolor, not independent objects)
+                                      # and merge them into one mesh with a smooth color blend
+                                      # instead of stacking coincident, independently-fading copies.
+    transition_role: str | None = None  # "from" (disappearing) | "to" (appearing) | None (steady)
 
 
 @dataclass
@@ -237,20 +244,56 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
                 normal=s.normal,
                 contrast_limits=s.contrast_limits,
             ))
-    # Meshes are matched by (layer name + exact segment set). A different segment set
-    # is different geometry; layer_transition decides whether that change cross-fades
-    # or cuts hard at the destination keyframe.
-    def mkey(m):
-        return (m.mesh_name, tuple(sorted(m.segment_ids)))
+    # Meshes are matched by layer name, then split by segment membership. Shared
+    # segment ids stay continuously visible, removed ids fade out, and added ids fade
+    # in. Treating the whole selected-id set as one identity made common segments blink
+    # when a layer changed from "many ids" to "one id" across a transition.
+    a_m = {m.mesh_name: m for m in a.meshes}
+    b_m = {m.mesh_name: m for m in b.meshes}
 
-    a_m = {mkey(m): m for m in a.meshes}
-    b_m = {mkey(m): m for m in b.meshes}
-    for key in dict.fromkeys(list(a_m) + list(b_m)):
-        ma, mb = a_m.get(key), b_m.get(key)
-        name, ids = key[0], list(key[1])
-        src = ma if (layer_transition == "cut" and not target_layer and ma) else (mb or ma)
+    def append_mesh(src, ids, op, oa, si, clip, mtl=None, rgh=None,
+                    color_mix=None, transition_role=None):
+        ids = sorted(int(x) for x in ids)
+        if not ids:
+            return
         cc = dict(color_seed=src.color_seed, default_color=src.default_color,
                   segment_colors=src.segment_colors, saturation=src.saturation)
+        fs.meshes.append(FrameMesh(
+            src.mesh_name, ids, src.color, op, src.render_3d,
+            object_alpha=oa, silhouette=si, clip=clip,
+            metallic=mtl, roughness=rgh, color_mix=color_mix,
+            transition_role=transition_role, **cc,
+        ))
+
+    for name in dict.fromkeys(list(a_m) + list(b_m)):
+        ma, mb = a_m.get(name), b_m.get(name)
+        if ma and mb and layer_transition != "cut":
+            a_ids, b_ids = set(ma.segment_ids), set(mb.segment_ids)
+            common = a_ids & b_ids
+            removed = a_ids - b_ids
+            added = b_ids - a_ids
+            op = _blend_value(ma.opacity if ma.visible else 0.0,
+                              mb.opacity if mb.visible else 0.0, t, layer_transition,
+                              lt, layer_transition_at)
+            oa = _blend_value(ma.object_alpha, mb.object_alpha, t, layer_transition,
+                              lt, layer_transition_at)
+            si = _blend_value(ma.silhouette, mb.silhouette, t, layer_transition,
+                              lt, layer_transition_at)
+            clip = _lerp_clip(ma.clip, mb.clip, t)
+            mtl = _mat_lerp(getattr(ma, "metallic", None), getattr(mb, "metallic", None), t, 0.0)
+            rgh = _mat_lerp(getattr(ma, "roughness", None), getattr(mb, "roughness", None), t, 0.5)
+            append_mesh(mb, common, op, oa, si, clip, mtl, rgh)
+            append_mesh(ma, removed, (ma.opacity if ma.visible else 0.0) * (1 - t),
+                        ma.object_alpha, ma.silhouette, _clip_dict(ma.clip),
+                        getattr(ma, "metallic", None), getattr(ma, "roughness", None),
+                        color_mix=t, transition_role="from")
+            append_mesh(mb, added, (mb.opacity if mb.visible else 0.0) * t,
+                        mb.object_alpha, mb.silhouette, _clip_dict(mb.clip),
+                        getattr(mb, "metallic", None), getattr(mb, "roughness", None),
+                        color_mix=t, transition_role="to")
+            continue
+
+        src = ma if (layer_transition == "cut" and not target_layer and ma) else (mb or ma)
         if ma and mb:
             op = _blend_value(ma.opacity if ma.visible else 0.0,
                               mb.opacity if mb.visible else 0.0, t, layer_transition,
@@ -259,25 +302,18 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
                               lt, layer_transition_at)
             si = _blend_value(ma.silhouette, mb.silhouette, t, layer_transition,
                               lt, layer_transition_at)
-            clip = (_clip_dict(mb.clip) if target_layer else _clip_dict(ma.clip)) \
-                if layer_transition == "cut" else _lerp_clip(ma.clip, mb.clip, t)
-            # material lerps too -> a layer can turn reflective over a transition. Only
-            # emitted when a keyframe actually sets it, else None (leave the look base).
-            mtl_t = 1.0 if target_layer else (0.0 if layer_transition == "cut" else t)
+            clip = _clip_dict(mb.clip) if target_layer else _clip_dict(ma.clip)
+            mtl_t = 1.0 if target_layer else 0.0
             mtl = _mat_lerp(getattr(ma, "metallic", None), getattr(mb, "metallic", None), mtl_t, 0.0)
             rgh = _mat_lerp(getattr(ma, "roughness", None), getattr(mb, "roughness", None), mtl_t, 0.5)
-            fs.meshes.append(FrameMesh(name, ids, src.color, op, src.render_3d,
-                                       object_alpha=oa, silhouette=si, clip=clip,
-                                       metallic=mtl, roughness=rgh, **cc))
+            append_mesh(src, src.segment_ids, op, oa, si, clip, mtl, rgh)
         else:
             m = ma or mb
             base = (m.opacity if m.visible else 0.0)
             op = _appear_opacity(base, bool(ma), t, layer_transition, lt, layer_transition_at)
-            fs.meshes.append(FrameMesh(name, ids, m.color, op, m.render_3d,
-                                       object_alpha=m.object_alpha, silhouette=m.silhouette,
-                                       clip=_clip_dict(m.clip),
-                                       metallic=getattr(m, "metallic", None),
-                                       roughness=getattr(m, "roughness", None), **cc))
+            append_mesh(m, m.segment_ids, op, m.object_alpha, m.silhouette, _clip_dict(m.clip),
+                        getattr(m, "metallic", None), getattr(m, "roughness", None),
+                        color_mix=lt, transition_role=("from" if ma else "to"))
     # Annotations are matched by layer name. Their appearance follows layer_transition.
     a_an = {an.name: an for an in a.annotations}
     b_an = {an.name: an for an in b.annotations}
