@@ -15,10 +15,28 @@ import neuroglancer.segment_colors as _ngsc
 
 
 def hex_to_rgb(h: str) -> list[float]:
+    """'#rrggbb' -> [r,g,b] in 0-1, still sRGB-encoded (what neuroglancer displays)."""
     h = h.lstrip("#")
     if len(h) == 3:
         h = "".join(c * 2 for c in h)
     return [int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
+
+
+def srgb_to_linear(c: float) -> float:
+    """One sRGB channel (0-1) -> linear.
+
+    Neuroglancer's colors are display-referred sRGB, but Blender's color inputs are
+    linear and its Standard view transform re-encodes to sRGB on output. Feeding an
+    sRGB value straight in therefore renders it too bright and slightly off-hue. This
+    is the same conversion `scouting._bg_from_state` already applies to the background
+    so it round-trips exactly; mesh colors need it for the same reason.
+    """
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def rgb_to_linear(rgb) -> list[float]:
+    """An [r,g,b] sRGB triple -> linear, for handing to Blender."""
+    return [srgb_to_linear(float(c)) for c in rgb[:3]]
 
 
 @dataclass

@@ -64,8 +64,14 @@ class SlicePlane(BaseModel):
     # an oblique plane with that normal (the EM is resampled on the tilted plane).
     normal: Optional[list[float]] = None
     scale_level: Optional[int] = None  # None => auto-pick from on-screen extent
-    opacity: float = 1.0
+    opacity: float = 1.0               # NG image-layer "opacity" (alpha of the slice)
     visible: bool = True
+    # Neuroglancer's per-layer intensity mapping, captured verbatim so the render shows
+    # the SAME contrast as the viewer: the layer's GLSL and its `shaderControls` (the
+    # invlerp range behind the contrast sliders). Empty => neuroglancer's default shader
+    # for the source dtype. Replayed by data/ng_shader.py; see SlicePlane docs there.
+    shader: str = ""
+    shader_controls: dict[str, Any] = Field(default_factory=dict)
 
 
 class ClipPlane(BaseModel):

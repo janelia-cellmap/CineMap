@@ -22,13 +22,35 @@ import bpy
 from mathutils import Matrix, Vector
 
 
+def _srgb_to_linear(c):
+    """sRGB (0-1) -> linear. Scalar or numpy array.
+
+    Neuroglancer's segment colors are display-referred sRGB, but every color Blender
+    consumes (Base Color, Emission Color, FLOAT_COLOR attributes) is linear and the
+    Standard view transform re-encodes on output. Handing sRGB straight in renders the
+    meshes too bright and slightly off-hue versus the viewer. Mirrors
+    `cinemap.data.colors.srgb_to_linear` — duplicated because this script runs in an
+    isolated bpy subprocess that does not import the cinemap package.
+    """
+    import numpy as _np
+
+    a = _np.asarray(c, dtype=_np.float64)
+    out = _np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** 2.4)
+    return float(out) if _np.isscalar(c) or out.ndim == 0 else out
+
+
 def _clear() -> None:
     bpy.ops.wm.read_factory_settings(use_empty=True)
 
 
 def _setup_render(scene_spec: dict) -> None:
+    global _CAST_SHADOWS
     scene = bpy.context.scene
     r = scene_spec["render"]
+    # A lit Principled look wants shadows; the neuroglancer-faithful emission shader (the
+    # default) must not have them, because NG doesn't.
+    _CAST_SHADOWS = not scene_spec.get("direction", {}).get(
+        "material", {}).get("ng_shader", True)
     # Resolve the requested engine to an id this Blender build actually exposes. Eevee was
     # renamed across versions: "BLENDER_EEVEE" (≤4.1 and again in ≥4.4/5.0) vs
     # "BLENDER_EEVEE_NEXT" (only 4.2–4.3). Assigning an id not in the enum raises and the
@@ -100,6 +122,28 @@ def _setup_render(scene_spec: dict) -> None:
                   f"denoiser={scene.cycles.denoiser}", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[blender] denoise/adaptive unavailable: {e}")
+        # --- anti-sparkle -------------------------------------------------------
+        # The "static" in renders is Cycles fireflies: rare high-radiance paths that a
+        # per-frame denoiser can't remove and that reshuffle every frame, so they twinkle.
+        # All of these were previously left at Blender defaults (no clamping at all).
+        try:
+            # Clamp only INDIRECT paths: direct light stays physically exact, while the
+            # rare indirect spike that becomes a firefly is capped. 0 = disabled.
+            scene.cycles.sample_clamp_indirect = float(r.get("clamp_indirect", 10.0))
+            scene.cycles.sample_clamp_direct = float(r.get("clamp_direct", 0.0))
+            # Blur very sharp glossy paths slightly — kills caustic-style speckle.
+            scene.cycles.blur_glossy = float(r.get("filter_glossy", 1.0))
+            # Stacked semi-transparent meshes (layers + clip planes + backface culling)
+            # routinely exceed the default 8 transparent bounces. A ray that runs out
+            # terminates early, so a pixel's value depends on how many surfaces it happened
+            # to cross — that inconsistency flickers frame to frame. 64 is cheap: these
+            # bounces don't spawn new light paths.
+            scene.cycles.transparent_max_bounces = int(r.get("transparent_bounces", 64))
+            print(f"[blender] anti-sparkle: clamp_indirect={scene.cycles.sample_clamp_indirect} "
+                  f"blur_glossy={scene.cycles.blur_glossy} "
+                  f"transparent_bounces={scene.cycles.transparent_max_bounces}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[blender] clamp/bounce settings unavailable: {e}", flush=True)
     elif scene.render.engine.startswith("BLENDER_EEVEE"):
         # Eevee = rasterizer (no path tracing) -> ~10-50x faster per frame. `samples`
         # here is TAA samples (anti-alias accumulation), NOT light bounces. The look is
@@ -115,16 +159,18 @@ def _setup_render(scene_spec: dict) -> None:
     scene.render.resolution_x = r["width"]
     scene.render.resolution_y = r["height"]
     scene.render.image_settings.file_format = "PNG"
-    # View transform from the director (default AgX + "Punchy"). AgX rolls bright values
-    # off smoothly instead of clipping them to neon -> no oversaturation/blowout, and it
-    # gives soft, dimensional filmic shadows; the "Punchy" look restores color richness so
-    # it isn't washed. (Standard/sRGB matches NG's flat look but clips -> oversaturation.)
+    # View transform: "Standard" (plain linear -> sRGB) is the only one that reproduces
+    # neuroglancer, which does no tone mapping at all — it writes shader output straight
+    # to an sRGB canvas. AgX (the old default) applies a filmic roll-off that desaturates
+    # and lifts the blacks, which is what made EM look washed out and low-contrast next to
+    # the viewer. A project can still opt into a filmic look via look.view_transform, but
+    # nothing defaults to one, so what you see in neuroglancer is what you render.
     view = scene_spec.get("direction", {}).get("view", {})
     try:
-        scene.view_settings.view_transform = view.get("transform", "AgX")
+        scene.view_settings.view_transform = view.get("transform", "Standard")
     except Exception as e:  # noqa: BLE001
         print(f"[blender] view transform: {e}")
-    look = view.get("look", "AgX - Punchy")
+    look = view.get("look", "")
     if look:
         try:
             scene.view_settings.look = look
@@ -380,9 +426,13 @@ def _load_npz_mesh(path: str, name: str, calc_edges: bool = False):
         c = np.ascontiguousarray(arrs["c"], dtype=np.uint8)
         if c.ndim == 2 and c.shape[1] == 3:    # add opaque alpha
             c = np.concatenate([c, np.full((len(c), 1), 255, dtype=np.uint8)], axis=1)
-        cf = (c.astype(np.float32) / 255.0).ravel()
+        cf = c.astype(np.float32) / 255.0
+        # FLOAT_COLOR attributes are interpreted as LINEAR by Blender, but these are NG's
+        # sRGB segment colors — convert so they render at the viewer's brightness. Alpha
+        # is not a color channel and must not be transformed.
+        cf[:, :3] = _srgb_to_linear(cf[:, :3])
         ca = mesh.color_attributes.new(name="Col", type="FLOAT_COLOR", domain="POINT")
-        ca.data.foreach_set("color", cf)
+        ca.data.foreach_set("color", cf.ravel())
     # calc_edges builds an explicit edge table from the loops. Only cutaway meshes need
     # that downstream for bmesh bisect/weld/cap; normal render-only meshes can render
     # straight from faces, and skipping edge construction saves cold-start time on big
@@ -479,7 +529,8 @@ def _import_meshes(scene_spec: dict) -> dict:
             color_out = csrc.outputs["Color"]
         else:  # solid color
             csrc = nt.nodes.new("ShaderNodeRGB")
-            csrc.outputs[0].default_value = (col[0], col[1], col[2], 1.0)
+            lc = _srgb_to_linear([col[0], col[1], col[2]])   # NG color is sRGB; Blender wants linear
+            csrc.outputs[0].default_value = (lc[0], lc[1], lc[2], 1.0)
             color_out = csrc.outputs[0]
         # Ambient occlusion: darken crevices/concavities so bumpy surfaces read crisp
         # and defined (the "within-mesh shadows" that make NG meshes pop). The AO node
@@ -542,20 +593,39 @@ def _import_meshes(scene_spec: dict) -> dict:
             nt.links.new(color_out, edmix.inputs[1])
             nt.links.new(esub.outputs[0], edmix.inputs[2])       # color * factor (broadcast)
             color_out = edmix.outputs[0]
+        # absCosAngle = |dot(normal, viewDir)|, neuroglancer's shading term. Built for
+        # every material (not just the ng_shader path) because the silhouette factor below
+        # is defined from it: NG uses pow(1 - absCosAngle, power). Deriving it here rather
+        # than from Blender's LayerWeight "Facing" removes any doubt about whether Facing
+        # matches NG's definition — this is literally the same expression.
+        geo = nt.nodes.new("ShaderNodeNewGeometry")
+        dotp = nt.nodes.new("ShaderNodeVectorMath"); dotp.operation = "DOT_PRODUCT"
+        nt.links.new(geo.outputs["Normal"], dotp.inputs[0])
+        nt.links.new(geo.outputs["Incoming"], dotp.inputs[1])   # viewDir (toward camera)
+        absd = nt.nodes.new("ShaderNodeMath"); absd.operation = "ABSOLUTE"
+        nt.links.new(dotp.outputs["Value"], absd.inputs[0])
+        # facing = 1 - absCosAngle: 0 head-on, 1 at grazing.
+        facing = nt.nodes.new("ShaderNodeMath"); facing.operation = "SUBTRACT"
+        facing.inputs[0].default_value = 1.0
+        nt.links.new(absd.outputs[0], facing.inputs[1])
+        # silhouetteFactor = pow(facing, cm_silh); cm_silh = 0 -> factor 1 (no effect).
+        powr = nt.nodes.new("ShaderNodeMath"); powr.operation = "POWER"
+        silh_v = nt.nodes.new("ShaderNodeValue"); silh_v.name = "cm_silh"
+        silh_v.outputs[0].default_value = 0.0
+        nt.links.new(facing.outputs[0], powr.inputs[0])
+        nt.links.new(silh_v.outputs[0], powr.inputs[1])
+
         if prof.get("ng_shader"):
-            # Faithful port of neuroglancer's mesh GLSL: per fragment,
-            #   lightingFactor = abs(dot(normal, viewDir)) * 0.8 + 0.2
-            #   color = lightingFactor * baseColor
+            # Faithful port of neuroglancer's mesh GLSL (src/mesh/frontend.ts):
+            #   absCosAngle   = abs(dot(normal, uLightDirection.xyz))
+            #   lightingFactor = absCosAngle * 0.8 + 0.2      (directional 0.8, ambient 0.2
+            #                                                  per perspective_view/panel.ts)
+            #   vColor = vec4(lightingFactor * color, objectAlpha)
+            #   vColor *= pow(1 - absCosAngle, uSilhouettePower)   <- a vec4 multiply
             # A HEADLIGHT (viewDir) from geometry, emission-only (no external lights), so
             # it's exactly NG: vivid (factor<=1 -> never clips/oversaturates), camera-relative
             # shading, no cast shadows. Base Color black so lights/world don't add. NOTE: no
             # cm_emit node here -> _set_mesh_state can't reset Emission Strength (it stays 1).
-            geo = nt.nodes.new("ShaderNodeNewGeometry")
-            dotp = nt.nodes.new("ShaderNodeVectorMath"); dotp.operation = "DOT_PRODUCT"
-            nt.links.new(geo.outputs["Normal"], dotp.inputs[0])
-            nt.links.new(geo.outputs["Incoming"], dotp.inputs[1])   # viewDir (toward camera)
-            absd = nt.nodes.new("ShaderNodeMath"); absd.operation = "ABSOLUTE"
-            nt.links.new(dotp.outputs["Value"], absd.inputs[0])
             fac = nt.nodes.new("ShaderNodeMath"); fac.operation = "MULTIPLY_ADD"
             fac.inputs[1].default_value = 0.8                       # directionalLighting
             fac.inputs[2].default_value = 0.2                       # ambientLighting
@@ -563,9 +633,16 @@ def _import_meshes(scene_spec: dict) -> dict:
             emis = nt.nodes.new("ShaderNodeVectorMath"); emis.operation = "SCALE"
             nt.links.new(color_out, emis.inputs[0])
             nt.links.new(fac.outputs["Value"], emis.inputs["Scale"])
+            # NG's silhouette multiply hits the WHOLE vec4, so the color darkens toward the
+            # interior as well as going transparent. Applying it to alpha alone (the old
+            # behavior) left the head-on faces at full brightness and made silhouette
+            # rendering look like a plain fade instead of NG's glassy shell.
+            silh_rgb = nt.nodes.new("ShaderNodeVectorMath"); silh_rgb.operation = "SCALE"
+            nt.links.new(emis.outputs["Vector"], silh_rgb.inputs[0])
+            nt.links.new(powr.outputs[0], silh_rgb.inputs["Scale"])
             bsdf.inputs["Base Color"].default_value = (0.0, 0.0, 0.0, 1.0)
             if "Emission Color" in bsdf.inputs:
-                nt.links.new(emis.outputs["Vector"], bsdf.inputs["Emission Color"])
+                nt.links.new(silh_rgb.outputs["Vector"], bsdf.inputs["Emission Color"])
             if "Emission Strength" in bsdf.inputs:
                 bsdf.inputs["Emission Strength"].default_value = 1.0
             _set_in(bsdf, "Roughness", 1.0); _set_in(bsdf, "Specular IOR Level", 0.0)
@@ -580,19 +657,13 @@ def _import_meshes(scene_spec: dict) -> dict:
             if "Emission Strength" in bsdf.inputs:
                 nt.links.new(emit_v.outputs[0], bsdf.inputs["Emission Strength"])
 
-        # neuroglancer 3D render state: Alpha = object_alpha * facing^silhouette, where
-        # `facing` is Blender's LayerWeight Facing output = 0 head-on, 1 at grazing
-        # (== neuroglancer's 1 - |normal·view|). So with silhouette>0 the head-on faces
-        # go transparent and only the rim stays opaque (NG's meshSilhouetteRendering, a
-        # glassy shell); silhouette=0 -> facing^0 = 1 -> plain object_alpha everywhere.
-        # Driven per frame by the cm_alpha / cm_silh value nodes.
-        lw = nt.nodes.new("ShaderNodeLayerWeight")
-        powr = nt.nodes.new("ShaderNodeMath"); powr.operation = "POWER"
+        # neuroglancer 3D render state: Alpha = objectAlpha * pow(1 - absCosAngle, silhouette).
+        # With silhouette > 0 the head-on faces go transparent and only the rim stays
+        # opaque (NG's meshSilhouetteRendering, a glassy shell); silhouette = 0 -> the power
+        # is 1 -> plain objectAlpha everywhere. cm_alpha is driven per frame.
         mul = nt.nodes.new("ShaderNodeMath"); mul.operation = "MULTIPLY"; mul.use_clamp = True
-        alpha_v = nt.nodes.new("ShaderNodeValue"); alpha_v.name = "cm_alpha"; alpha_v.outputs[0].default_value = 1.0
-        silh_v = nt.nodes.new("ShaderNodeValue"); silh_v.name = "cm_silh"; silh_v.outputs[0].default_value = 0.0
-        nt.links.new(lw.outputs["Facing"], powr.inputs[0])   # base = facing (0 head-on, 1 grazing)
-        nt.links.new(silh_v.outputs[0], powr.inputs[1])      # exponent = silhouette power
+        alpha_v = nt.nodes.new("ShaderNodeValue"); alpha_v.name = "cm_alpha"
+        alpha_v.outputs[0].default_value = 1.0
         nt.links.new(alpha_v.outputs[0], mul.inputs[0])
         nt.links.new(powr.outputs[0], mul.inputs[1])
         if "Alpha" in bsdf.inputs:
@@ -605,7 +676,7 @@ def _import_meshes(scene_spec: dict) -> dict:
         if edge > 0 and "Emission Strength" in bsdf.inputs:
             egw = nt.nodes.new("ShaderNodeMath"); egw.operation = "MULTIPLY"
             egw.inputs[1].default_value = edge
-            nt.links.new(lw.outputs["Facing"], egw.inputs[0])    # 0 head-on, 1 grazing
+            nt.links.new(facing.outputs[0], egw.inputs[0])       # 0 head-on, 1 grazing
             eadd = nt.nodes.new("ShaderNodeMath"); eadd.operation = "ADD"
             nt.links.new(emit_v.outputs[0], eadd.inputs[0])
             nt.links.new(egw.outputs[0], eadd.inputs[1])
@@ -754,12 +825,13 @@ def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> N
         opacity = ov.get("opacity", 1.0)            # effective alpha = fade * Opacity(3d)
         visible = ov.get("visible", True) and opacity > 0.001
         obj.hide_render = not visible
-        # Always cast a shadow while visible. Cycles attenuates the shadow by the object's
-        # alpha (transparent shadows), so as a layer fades in/out its shadow ramps smoothly
-        # with opacity. A hard on/off threshold here instead caused a one-frame brightness
-        # POP whenever a layer faded through it (e.g. the segmentation reveal at ~2s):
-        # below the cutoff no shadow, above it the whole tangle self-shadowed at once.
-        obj.visible_shadow = visible and not os.environ.get("CINEMAP_NO_CAST_SHADOWS")
+        # Shadow casting is OFF whenever we're reproducing neuroglancer, which has no
+        # shadows at all. Cast shadows between overlapping semi-transparent layers were a
+        # major reason a given "Opacity (3d)" rendered denser here than in the viewer.
+        # Cycles attenuates a shadow by the object's alpha, so when shadows ARE enabled
+        # (a deliberately lit render) they ramp smoothly with opacity rather than popping.
+        obj.visible_shadow = (visible and _CAST_SHADOWS
+                              and not os.environ.get("CINEMAP_NO_CAST_SHADOWS"))
         nt = mat.node_tree
         av, sv = nt.nodes.get("cm_alpha"), nt.nodes.get("cm_silh")
         if av is not None:
@@ -785,6 +857,9 @@ def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> N
 
 
 _slice_objs: list = []
+# Set from the scene spec in main(): shadows only when a lit (non-ng_shader) look is
+# explicitly chosen, since neuroglancer itself casts none.
+_CAST_SHADOWS = False
 
 
 def _make_slice(sl: dict, name: str):
@@ -816,27 +891,44 @@ def _make_slice(sl: dict, name: str):
     nt.nodes.clear()
     tex = nt.nodes.new("ShaderNodeTexImage")
     img = bpy.data.images.load(sl["image_path"], check_existing=True)
-    img.colorspace_settings.name = "Non-Color"
+    # The worker bakes this PNG by running neuroglancer's own shader, and neuroglancer
+    # writes its shader output straight to an sRGB canvas — so these are DISPLAY-referred
+    # sRGB values, not linear ones. Loading them as "Non-Color" told Blender they were
+    # already linear, so a mid-gray 128 was emitted at linear 0.502 and the view transform
+    # re-encoded it to ~0.735: the washed-out, low-contrast EM. Decoding as sRGB and
+    # rendering through the Standard view transform round-trips the value exactly.
+    img.colorspace_settings.name = "sRGB"
+    # Nearest keeps voxel edges crisp like neuroglancer, and avoids the shimmer that
+    # bilinear sampling of high-frequency EM produces as the camera moves.
+    tex.interpolation = "Closest"
     tex.image = img
     emit = nt.nodes.new("ShaderNodeEmission")
     transp = nt.nodes.new("ShaderNodeBsdfTransparent")
     out = nt.nodes.new("ShaderNodeOutputMaterial")
     nt.links.new(tex.outputs["Color"], emit.inputs["Color"])
+    # Strength 1.0 exactly: any other value is a brightness fudge that breaks parity.
+    # Neuroglancer shows the shader's output at full value and modulates only ALPHA by
+    # the layer's opacity, so that is what we do here too.
+    emit.inputs["Strength"].default_value = 1.0
     op = float(sl.get("opacity", 1.0))
     if sl.get("occlude"):
         # opaque cross-section: the EM plane blocks geometry behind it (old behavior)
-        emit.inputs["Strength"].default_value = 0.9
         mix = nt.nodes.new("ShaderNodeMixShader")
         mix.inputs[0].default_value = op
         nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
         nt.links.new(emit.outputs["Emission"], mix.inputs[2])
         nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
     else:
-        # NON-occluding (default): the plane is fully transparent to camera rays, so it
-        # NEVER hides the 3D meshes — the EM is ADDED as a glowing overlay where visible.
-        # Meshes in front still cover it; meshes behind show through. ('both'/cutaway still
-        # removes meshes on the cut side via the clip, independent of this.)
-        emit.inputs["Strength"].default_value = 0.6 * op
+        # NON-occluding: the plane is fully transparent to camera rays, so it NEVER hides
+        # the 3D meshes — the EM is ADDED as a glowing overlay where visible. Meshes in
+        # front still cover it; meshes behind show through. ('both'/cutaway still removes
+        # meshes on the cut side via the clip, independent of this.)
+        scale = nt.nodes.new("ShaderNodeMixRGB")   # additive overlay scaled by opacity
+        scale.blend_type = "MULTIPLY"
+        scale.inputs[0].default_value = 1.0
+        nt.links.new(tex.outputs["Color"], scale.inputs[1])
+        scale.inputs[2].default_value = (op, op, op, 1.0)
+        nt.links.new(scale.outputs[0], emit.inputs["Color"])
         add = nt.nodes.new("ShaderNodeAddShader")
         nt.links.new(emit.outputs["Emission"], add.inputs[0])
         nt.links.new(transp.outputs["BSDF"], add.inputs[1])

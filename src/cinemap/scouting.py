@@ -99,6 +99,29 @@ def current_layer_colors(project: Project, st: dict | None = None) -> dict:
             for l in st.get("layers", []) if l.get("type") == "segmentation"}
 
 
+def slice_from_layer(em_name: str, layer: dict | None, **kw) -> SlicePlane:
+    """Build a SlicePlane carrying the layer's neuroglancer appearance.
+
+    EVERY SlicePlane should be built through here. Opacity and the shader/contrast state
+    used to be dropped on the floor because each construction site set only geometry, so
+    the render always used opacity 1.0 and neuroglancer's default contrast no matter what
+    the viewer showed. Centralizing it means a new call site can't silently regress that.
+    """
+    layer = layer or {}
+    op = layer.get("opacity", 1.0)
+    return SlicePlane(
+        em_name=em_name,
+        opacity=float(op) if op is not None else 1.0,
+        shader=layer.get("shader") or "",
+        shader_controls=dict(layer.get("shaderControls") or {}),
+        **kw,
+    )
+
+
+def _layer_by_name(st: dict, name: str) -> dict | None:
+    return next((l for l in st.get("layers", []) if l.get("name") == name), None)
+
+
 def _meshes_from_visible(project: Project, prev: list[MeshInstance] | None = None,
                          st: dict | None = None) -> list[MeshInstance]:
     """Build mesh instances from the current NG visible segments. A layer renders
@@ -169,7 +192,8 @@ def _scene_from_view(project: Project, st: dict | None = None):
                  for l in st.get("layers", [])}
     # a "3d" layout shows no cross-section in neuroglancer, so bake no EM slice
     show_slice = layer_vis.get(em_name, True) and st.get("layout") != "3d"
-    slices = ([SlicePlane(em_name=em_name, axis="z", position_nm=cam.look_at_nm[2])]
+    slices = ([slice_from_layer(em_name, _layer_by_name(st, em_name),
+                                axis="z", position_nm=cam.look_at_nm[2])]
               if show_slice else [])
     prev = project.keyframes[-1].meshes if project.keyframes else None
     meshes = _meshes_from_visible(project, prev=prev, st=st)   # inherit material from last kf
@@ -355,9 +379,21 @@ def sync_segments(project: Project, keyframe_id: str) -> Keyframe | None:
     # slice on/off follows the EM image layer; keep its axis/position
     em_name = project.manifest.em.name if project.manifest.em else "em"
     if kf.slices:
-        slices = [s.model_copy(update={"visible": vis.get(s.em_name, True)}) for s in kf.slices]
+        # refresh appearance from the live layer too, so a contrast/opacity change in
+        # neuroglancer lands on the existing slice instead of only new ones
+        slices = []
+        for s in kf.slices:
+            live = _layer_by_name(st, s.em_name) or {}
+            op = live.get("opacity", s.opacity)
+            slices.append(s.model_copy(update={
+                "visible": vis.get(s.em_name, True),
+                "opacity": float(op) if op is not None else 1.0,
+                "shader": live.get("shader") or s.shader,
+                "shader_controls": dict(live.get("shaderControls") or s.shader_controls),
+            }))
     elif vis.get(em_name, True):  # EM turned on but keyframe had no slice -> add one
-        slices = [SlicePlane(em_name=em_name, axis="z", position_nm=kf.camera.look_at_nm[2])]
+        slices = [slice_from_layer(em_name, _layer_by_name(st, em_name),
+                                   axis="z", position_nm=kf.camera.look_at_nm[2])]
     else:
         slices = []
 

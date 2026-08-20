@@ -630,9 +630,16 @@ def plane_move(project: Project, axis: str = "z", mode: str = "slice",
                 mc.clip = ClipPlane(axis=axis, position_nm=offset, normal=normal,
                                     side=side, enabled=True)
             meshes.append(mc)
-        slices = ([SlicePlane(em_name=em_name, axis=axis, position_nm=offset,
-                              normal=normal, visible=True)]
-                  if do_slice else [s.model_copy() for s in base.slices])
+        # inherit the base keyframe's slice appearance (opacity + NG contrast/shader) so a
+        # scan doesn't silently reset the EM look to neuroglancer's defaults mid-shot
+        base_sl = next((s for s in base.slices if s.em_name == em_name), None)
+        if do_slice:
+            fields = ({"opacity": base_sl.opacity, "shader": base_sl.shader,
+                       "shader_controls": dict(base_sl.shader_controls)} if base_sl else {})
+            slices = [SlicePlane(em_name=em_name, axis=axis, position_nm=offset,
+                                 normal=normal, visible=True, **fields)]
+        else:
+            slices = [s.model_copy() for s in base.slices]
         # duration-driven: spread total_duration_s across the scan (first keyframe is the
         # instant lead-in to the start, the rest divide the span) so the whole scan takes
         # total_duration_s regardless of how many keyframes sample it.

@@ -18,6 +18,7 @@ from typing import Callable
 
 from ..config import NM_PER_BU, PROJECTS_DIR
 from ..models import Manifest, Project, RenderJob
+from ..data import ng_shader as _ng_shader
 from ..data.mesh_loader import MeshLoader
 from ..data.slice_loader import EMVolume, get_volume
 from .interpolate import FrameAnnotation, FrameState, build_frames, state_at_time
@@ -113,6 +114,7 @@ class RenderWorker:
         self._label_vols: dict[str, EMVolume] = {}
         self._slice_cache: dict[tuple, dict] = {}
         self._slice_cache_lock = threading.Lock()
+        self._warned: set[str] = set()    # keys already reported by _warn_once
         # Resolution budgets. Draft (bake/update/preview thumbnails) trades detail
         # for speed: a coarse EM level and low-voxel meshes. EM scale is selected
         # per frame from physical nm/pixel, matching Neuroglancer's multiscale choice;
@@ -177,6 +179,26 @@ class RenderWorker:
             return src.label_zarr, True
         return (em.zarr_url, False) if em else (None, False)
 
+    def _warn_once(self, key: str, message: str) -> None:
+        """Print a per-render warning the first time only — a shader that falls back
+        would otherwise log identically for every frame of every slice."""
+        if key not in self._warned:
+            self._warned.add(key)
+            print(message, flush=True)
+
+    def _shader_for(self, sl, dtype):
+        """The neuroglancer shader state for this slice's layer, resolved for `dtype`.
+
+        `dtype` matters: an omitted invlerp range defaults to the source's full dtype
+        range (uint8 -> 0..255, uint16 -> 0..65535), exactly as neuroglancer does.
+        """
+        return _ng_shader.from_layer(
+            {"shader": getattr(sl, "shader", "") or "",
+             "shaderControls": getattr(sl, "shader_controls", None) or {},
+             "opacity": getattr(sl, "opacity", 1.0)},
+            dtype,
+        )
+
     @staticmethod
     def _slice_read_plane(sl) -> tuple[str, float, list[float] | None]:
         """Normalize a FrameSlice for reading.
@@ -207,7 +229,12 @@ class RenderWorker:
         seg_key = (tuple(sorted(int(i) for i in slice_seg[0])), slice_seg[1].cache_key()) \
             if (is_label and slice_seg) else None
         return (
-            "slice-v2",
+            # v3: the baked PNG now has neuroglancer's shader applied, so the contrast
+            # state is part of its identity. Bumping the version also retires every v2
+            # file, which held raw (un-windowed, possibly uint8-truncated) pixels.
+            "slice-v3",
+            getattr(sl, "shader", "") or "",
+            json.dumps(getattr(sl, "shader_controls", None) or {}, sort_keys=True),
             sl.em_name,
             zurl,
             bool(is_label),
@@ -310,7 +337,14 @@ class RenderWorker:
             self._slice_cache_put(key, out, meta_path)
             return out
 
-        rgb = np.repeat(res.image[:, :, None].astype(np.float64), 3, axis=2)  # grayscale EM
+        # Run neuroglancer's own shader (invlerp contrast window, colormaps, custom GLSL)
+        # over the native-dtype voxels. Before this, the EM was passed through raw, so the
+        # contrast set in NG had no effect and non-uint8 data wrapped modulo 256.
+        raw = np.asarray(res.image)
+        shaded, warn = _ng_shader.shade(self._shader_for(sl, raw.dtype), raw)
+        if warn:
+            self._warn_once(f"shader:{sl.em_name}", f"[worker] {sl.em_name}: {warn}")
+        rgb = shaded.astype(np.float64)
         H, W = rgb.shape[:2]
 
         for label_zarr, ids, lc in ([] if normal else seg_overlays):  # seg overlay: axis-aligned only

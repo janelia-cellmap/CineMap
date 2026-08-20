@@ -33,9 +33,23 @@ _TS_CONTEXT = ts.Context({
 })
 
 
+def _to_display_dtype(sub: np.ndarray) -> np.ndarray:
+    """Keep image data in its NATIVE dtype for the shader to window.
+
+    This used to be `sub.astype(np.uint8)`, which silently wrapped modulo 256 on any
+    non-8-bit EM (a uint16 value of 40000 came out as 64) and threw away neuroglancer's
+    contrast window even on 8-bit data. Intensity mapping is neuroglancer's job and is
+    now done by `data/ng_shader.py`, which needs the raw values plus the dtype to pick
+    the right default invlerp range. Only multi-channel data is reduced here.
+    """
+    if sub.ndim > 2:                      # squeeze away singleton channel/time axes
+        sub = np.squeeze(sub)
+    return sub
+
+
 @dataclass
 class SliceResult:
-    image: np.ndarray  # 2D uint8
+    image: np.ndarray  # 2D, in the source's NATIVE dtype (see _to_display_dtype)
     axis: str
     position_nm: float
     # world-space rectangle the plane covers, as (origin_nm, u_nm, v_nm) where the
@@ -198,7 +212,7 @@ class EMVolume:
         bbox = ((wmin[0], wmin[1], wmin[2]), (wmax[0], wmax[1], wmax[2]))
         level = self.pick_level_for_box(bbox, target_voxels)
         sub, (z0, y0, x0), sc, tr = self.read_box(bbox, level)      # sub is z,y,x
-        sub = np.asarray(sub).astype(np.uint8)
+        sub = _to_display_dtype(np.asarray(sub))
         fx = (world[..., 0] - tr[2]) / sc[2] - x0
         fy = (world[..., 1] - tr[1]) / sc[1] - y0
         fz = (world[..., 2] - tr[0]) / sc[0] - z0
@@ -306,7 +320,7 @@ class EMVolume:
         sel[v_zyx] = slice(v0, v1)
         sub = np.asarray(arr[tuple(sel)].read().result())
         if not raw:
-            sub = sub.astype(np.uint8)
+            sub = _to_display_dtype(sub)
         # orient so rows=v, cols=u
         sub = np.moveaxis(sub, (0, 1), (0, 1)) if v_zyx < u_zyx else sub.T
 

@@ -51,8 +51,13 @@ class MaterialProfile:
                                  # see-through transparent state (closer to neuroglancer)
     flat_shading: bool = False   # smooth (per-vertex) normals like neuVid/NG -> rounded
                                  # form-shading on the tubes (not faceted)
-    ng_shader: bool = False      # faithful neuroglancer mesh shader (emission-only headlight,
-                                 # abs(N·view)*0.8+0.2) instead of lit Principled. The "ng" look.
+    # Faithful neuroglancer mesh shader (emission-only headlight, abs(N·view)*0.8+0.2)
+    # instead of a lit Principled BSDF. ON by default: it is what neuroglancer actually
+    # draws, so colors and — critically — TRANSPARENCY read the same. A lit BSDF with
+    # shadows/AO makes a given objectAlpha look far denser than the viewer does, which is
+    # why opacity used to need shifting by hand to match. Set look.ng_shader=false for a
+    # deliberately lit render.
+    ng_shader: bool = True
 
 
 @dataclass
@@ -78,7 +83,9 @@ class LightRig:
 
 @dataclass
 class DepthOfField:
-    enabled: bool = True
+    # OFF by default: neuroglancer renders everything in focus, so any blur is a
+    # departure from what the viewer showed. Opt in per project via look.
+    enabled: bool = False
     fstop: float = 4.0           # subtle; higher = less background blur
 
 
@@ -97,8 +104,11 @@ class Emphasis:
 class Bloom:
     """Soft glow on bright/emissive areas (compositor) — bright structures bloom
     against the dark background, the 'publication glow'. Constant, so it works the
-    same with one object or thousands (unlike a per-object flash)."""
-    enabled: bool = True
+    same with one object or thousands (unlike a per-object flash).
+
+    OFF by default: bloom bleeds brightness across a structure's silhouette, which reads
+    as extra opacity and desaturates the EM — neuroglancer has no such glow."""
+    enabled: bool = False
     threshold: float = 0.6       # brightness above which it blooms
     size: int = 7                # blur radius (larger = softer/wider glow)
     mix: float = -0.55           # -1 image only … +1 glare only; small = subtle add
@@ -114,9 +124,11 @@ class DirectorSettings:
     smooth_camera: bool = False  # cinematic ease of the FIRST/LAST transition. Off by
                                  # default: neuroglancer's video_tool is pure linear, so
                                  # linear keeps our timing/motion exactly NG-faithful.
-    # AgX rolls the bright raking highlights off instead of clipping to neon. Plain AgX
-    # (no "Punchy") keeps the lighter, more even non-dramatic look closer to neuroglancer.
-    view_transform: str = "AgX"
+    # "Standard" = plain linear->sRGB, the only transform that matches neuroglancer (which
+    # does no tone mapping). AgX is available per-project via look.view_transform for a
+    # deliberately cinematic export, but it is never the default: it desaturates and lifts
+    # blacks, which broke EM contrast parity with the viewer.
+    view_transform: str = "Standard"
     view_look: str = ""
 
 
