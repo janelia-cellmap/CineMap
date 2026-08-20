@@ -472,8 +472,17 @@ class RenderWorker:
             # None lets read_slice auto-pick the EM pyramid level from the camera region.
             # 0 forces full-resolution s0, which turns full-plane sweeps into hundreds-MB
             # PNGs and makes asset prep look like "downloading EM frames" forever.
-            out.append(FrameSlice(sw.em_name or default_em, sw.axis, float(pos), None,
-                                  float(sw.opacity), normal=sw.normal))
+            # Borrow the contrast/shader the keyframes use for this layer. A sweep only
+            # says where the plane goes, not how the EM is windowed, so without this a
+            # slice sweep would render at neuroglancer's default contrast while the
+            # surrounding keyframes render at the user's.
+            em_name = sw.em_name or default_em
+            ksl = next((s for kf in self.project.keyframes for s in kf.slices
+                        if s.em_name == em_name and (s.shader or s.shader_controls)), None)
+            out.append(FrameSlice(em_name, sw.axis, float(pos), None,
+                                  float(sw.opacity), normal=sw.normal,
+                                  shader=(ksl.shader if ksl else ""),
+                                  shader_controls=dict(ksl.shader_controls) if ksl else {}))
         return out
 
     @staticmethod

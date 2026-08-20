@@ -78,6 +78,13 @@ class FrameSlice:
     scale_level: int | None
     opacity: float
     normal: list[float] | None = None   # oblique plane normal (xyz); None = axis-aligned
+    # Neuroglancer's intensity mapping for this layer, carried through interpolation so
+    # the worker can bake the same contrast the viewer shows. These do NOT blend: a
+    # contrast window is a lookup, and cross-fading two windows would show a frame of
+    # contrast that neither keyframe asked for. They snap with the rest of the layer
+    # appearance instead (see the `target_layer` switch below).
+    shader: str = ""
+    shader_controls: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -190,12 +197,17 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
                              sb.opacity if sb.visible else 0.0, t, layer_transition,
                              lt, layer_transition_at),
                 normal=(sb.normal if (same_n or t >= 0.5 or target_layer) else sa.normal),
+                # snap with the rest of the layer appearance rather than blending
+                shader=(sb.shader if target_layer else sa.shader),
+                shader_controls=dict((sb if target_layer else sa).shader_controls),
             ))
         else:  # appearing or disappearing
             s = sa or sb
             base = (s.opacity if s.visible else 0.0)
             op = _appear_opacity(base, bool(sa), t, layer_transition, lt, layer_transition_at)
-            fs.slices.append(FrameSlice(key[0], key[1], s.position_nm, s.scale_level, op, normal=s.normal))
+            fs.slices.append(FrameSlice(key[0], key[1], s.position_nm, s.scale_level, op,
+                                        normal=s.normal, shader=s.shader,
+                                        shader_controls=dict(s.shader_controls)))
     # Meshes are matched by (layer name + exact segment set). A different segment set
     # is different geometry; layer_transition decides whether that change cross-fades
     # or cuts hard at the destination keyframe.
