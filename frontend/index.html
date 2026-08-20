@@ -156,10 +156,11 @@
       <label title="Frames per second of the output video (motion smoothness). Total frames rendered = total duration (sum of keyframe durations) × fps.">fps</label><input id="fps" value="30" />
       <label title="Cycles render samples per pixel: higher = less grain/noise but slower to render. ~16–32 for previews, 48+ for final.">samples</label><input id="samples" value="48" />
       <label class="chk" title="Fast mode: 32 samples + aggressive adaptive sampling (noise threshold 0.06) and let the AI denoiser (OpenImageDenoise) clean the rest. ~2x faster frames at near-identical quality. Overrides the samples box."><input id="fastSample" type="checkbox" checked /> ⚡ fast</label>
-      <label title="Render engine. Cycles = photoreal path tracing (true transparency/AO/soft shadows) but slow — seconds–minutes per frame. Eevee = real-time rasterizer, ~10–50× faster per frame; shadows/transparency are approximate. Use Eevee for fast previews and movie drafts, Cycles for finals.">engine
+      <label title="Render engine. Auto (recommended) rasterizes previews with Eevee (~10–50× faster per frame) and renders exports with Cycles. Because meshes use neuroglancer's emission-only shader — no shadows, no global illumination — the two engines agree on color and contrast; they differ only in how overlapping transparency resolves, which is why exports use Cycles.">engine
         <select id="engine">
-          <option value="CYCLES" selected>Cycles (photoreal)</option>
-          <option value="BLENDER_EEVEE_NEXT">Eevee (⚡ fast)</option>
+          <option value="AUTO" selected>Auto (Eevee preview / Cycles export)</option>
+          <option value="CYCLES">Cycles (always)</option>
+          <option value="BLENDER_EEVEE_NEXT">Eevee (always, ⚡ fast)</option>
         </select></label>
       <label title="Mesh quality = the per-layer vertex budget. Higher = crisper but more GPU memory (auto-retries lower if it runs out).">quality
         <select id="detail">
@@ -209,9 +210,9 @@
     <button onclick="openOrbitPanel()" title="Add an orbit move: the camera circles the current target. Choose the rotation axis, sweep degrees, duration, elevation, and sample count.">↻ Orbit</button>
     <button onclick="openPlanePanel()" title="Add a plane move: an EM slice sweep or a cutaway, as an independent clip on the timeline (start→stop over a duration).">▤ Plane scan</button>
     <span style="width:12px"></span>
-    <label class="msg" title="Opacity of the 3D meshes on the SELECTED keyframe. Slide down to fade the meshes and reveal the EM cross-section behind them (0 = meshes hidden, only the EM slice shows).">3D mesh opacity</label>
+    <label class="msg" title="CineMap-only fade applied to ALL mesh layers on the selected keyframe, on top of each layer's neuroglancer Opacity (3d). Slide down to reveal the EM cross-section behind them (0 = meshes hidden, only the EM slice shows). This is a movie effect and is NOT part of the neuroglancer state — to change a single layer's real NG opacity, use ✎ Propagate edit.">mesh fade (this keyframe)</label>
     <input id="meshOp" type="range" min="0" max="1" step="0.05" value="1" style="width:90px"
-      onchange="setMeshOpacity()" title="Opacity of the 3D meshes on the selected keyframe (0 = hidden, reveals the EM slice; 1 = solid)." />
+      onchange="setMeshOpacity()" title="Fades every mesh layer on the selected keyframe (0 = hidden, reveals the EM slice; 1 = each layer at its own neuroglancer opacity). CineMap-only; not part of the NG state." />
     <button id="autoThumbBtn" onclick="toggleAutoThumbs()" title="Render a still thumbnail for every keyframe, one by one, so the timeline strip below fills in with previews. Thumbnails only — this is not the video (use Export for that).">⟳ Render all</button>
     <button onclick="openLookPanel()" title="Open the Look panel: try render styles (glow, roughness, material presets, tone-mapping) and preview them on the selected keyframe — non-destructive, doesn't change your data.">✨ Look</button>
     <button onclick="openPropPanel()" title="edit a layer setting on the selected keyframe and propagate it to later/earlier keyframes">✎ Propagate edit</button>
@@ -245,13 +246,16 @@
   <select id="propField" onchange="propFieldChanged()" style="width:100%">
     <option value="segment_color">segment color</option>
     <option value="default_color">default color (all segments)</option>
-    <option value="object_alpha">opacity (3d)</option>
-    <option value="silhouette">silhouette (3d)</option>
-    <option value="saturation">saturation</option>
-    <option value="metallic">metallic (reflective)</option>
-    <option value="roughness">roughness</option>
+    <option value="object_alpha">NG opacity 3d (objectAlpha)</option>
+    <option value="silhouette">NG silhouette 3d</option>
+    <option value="saturation">NG saturation</option>
+    <option value="metallic">metallic (CineMap-only)</option>
+    <option value="roughness">roughness (CineMap-only)</option>
     <option value="color_seed">color seed</option>
     <option value="visible">visible</option>
+    <option value="shader_controls">NG contrast (min / max)</option>
+    <option value="opacity">NG layer opacity</option>
+    <option value="shader">NG shader (GLSL)</option>
   </select>
   <div id="propSegWrap"><label class="msg">Segment</label><select id="propSeg" style="width:100%"></select></div>
   <label class="msg">New value</label> <span id="propValInput"></span>
@@ -1603,9 +1607,19 @@ async function openPropPanel() {
   $('propPanel').style.display = 'block';
 }
 const curPropLayer = () => PROP_LAYERS[+$('propLayer').value];
+// Mesh layers and image/EM slice layers expose different properties: a slice has a
+// contrast window and layer opacity but no segments or 3D material, and vice versa.
+// Showing every field for every layer offered edits that could never apply.
+const MESH_FIELDS = ['segment_color', 'default_color', 'object_alpha', 'silhouette',
+  'saturation', 'metallic', 'roughness', 'color_seed', 'visible'];
+const SLICE_FIELDS = ['shader_controls', 'opacity', 'shader'];
 function propLayerChanged() {
   const l = curPropLayer(); if (!l) return;
   $('propSeg').innerHTML = (l.segment_ids || []).map(s => `<option value="${s}">${s}</option>`).join('');
+  const allowed = l.kind === 'slice' ? SLICE_FIELDS : MESH_FIELDS;
+  const sel = $('propField');
+  [...sel.options].forEach(o => { o.hidden = !allowed.includes(o.value); });
+  if (!allowed.includes(sel.value)) sel.value = allowed[0];
   propFieldChanged();
 }
 function rgbToHex(c) {
@@ -1624,7 +1638,18 @@ function propFieldChanged() {
     html = `<select id="propVal"><option value="true">true</option><option value="false">false</option></select>`;
   } else if (f === 'color_seed') {
     html = `<input type="number" id="propVal" step="1" value="${l ? l.color_seed : 0}" style="width:90px">`;
-  } else {  // object_alpha, silhouette, saturation
+  } else if (f === 'shader_controls') {
+    // The contrast window as neuroglancer's invlerp min/max. Editing the two numbers is
+    // far clearer than hand-writing the shaderControls JSON, and it is what the viewer's
+    // sliders actually set.
+    const c = (l && l.contrast) || [0, 255];
+    html = `<input type="number" id="propVal" step="1" value="${c[0]}" style="width:70px" title="min: values at or below this render black">`
+         + ` <input type="number" id="propValHi" step="1" value="${c[1]}" style="width:70px" title="max: values at or above this render white">`
+         + `<div class="msg" style="margin-top:3px;color:#8a93a6">neuroglancer invlerp range for this image layer</div>`;
+  } else if (f === 'shader') {
+    html = `<textarea id="propVal" rows="4" style="width:100%;font-family:monospace;font-size:11px"
+      placeholder="leave blank for neuroglancer's default shader">${(l && l.shader) || ''}</textarea>`;
+  } else {  // object_alpha, silhouette, saturation, opacity
     const v = l && l[f] != null ? l[f] : 1;
     html = `<input type="number" id="propVal" step="0.05" min="0" value="${v}" style="width:90px">`;
   }
@@ -1638,6 +1663,16 @@ async function applyPropagate() {
   else if (f === 'default_color') value = hexToRgb(raw);
   else if (f === 'visible') value = raw === 'true';
   else if (f === 'color_seed') value = parseInt(raw, 10);
+  else if (f === 'shader') value = raw;
+  else if (f === 'shader_controls') {
+    // rebuild the control dict, preserving whichever control name this layer's shader
+    // declared (usually "normalized", but a custom shader can name it anything)
+    const name = Object.keys(l.shader_controls || {})[0] || 'normalized';
+    const prev = (l.shader_controls || {})[name];
+    const keep = (prev && typeof prev === 'object' && !Array.isArray(prev)) ? { ...prev } : {};
+    keep.range = [parseFloat(raw), parseFloat($('propValHi').value)];
+    value = { ...(l.shader_controls || {}), [name]: keep };
+  }
   else value = parseFloat(raw);
   try {
     const r = await api('POST', `/api/projects/${PID}/keyframes/${id}/propagate`,
@@ -1653,9 +1688,11 @@ async function applyPropagate() {
 // ---- after updating a keyframe from NG, offer to propagate the changed settings ----
 let NG_CHANGES = [], NG_PROP_KID = null;
 const FIELD_LABELS = { segment_color: 'segment color', default_color: 'default color',
-  object_alpha: 'opacity (3d)', silhouette: 'silhouette (3d)', saturation: 'saturation',
-  color_seed: 'color seed', visible: 'visible', color: 'color',
-  metallic: 'metallic', roughness: 'roughness' };
+  object_alpha: 'NG opacity 3d (objectAlpha)', silhouette: 'NG silhouette 3d',
+  saturation: 'NG saturation', color_seed: 'color seed', visible: 'visible', color: 'color',
+  metallic: 'metallic (CineMap-only)', roughness: 'roughness (CineMap-only)',
+  opacity: 'NG layer opacity', shader_controls: 'NG contrast (shader controls)',
+  shader: 'NG shader (GLSL)' };
 function changeLabel(c) {
   let s = `${c.mesh_name} • ${FIELD_LABELS[c.field] || c.field}`;
   if (c.field === 'segment_color') s += ` (seg ${c.segment_id})`;

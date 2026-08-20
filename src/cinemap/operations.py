@@ -221,12 +221,93 @@ def _colors_equal(a, b, tol=1.0 / 512) -> bool:
 def _values_equal(field, a, b) -> bool:
     if field in ("color", "default_color"):
         return _colors_equal(a, b)
-    if field in ("object_alpha", "silhouette", "saturation"):
-        return abs(float(a) - float(b)) <= 1e-4
+    if field in ("object_alpha", "silhouette", "saturation", "opacity"):
+        return abs(float(a or 0.0) - float(b or 0.0)) <= 1e-4
+    if field == "shader_controls":            # dicts; compare by content, not identity
+        return (a or {}) == (b or {})
     return a == b
 
 
 _UNSET = object()
+
+
+# Image/EM slice-layer settings that can be propagated. Kept separate from the mesh
+# fields above because they live on SlicePlane, not MeshInstance — a slice layer has no
+# segments or 3D material, and a mesh layer has no contrast window.
+_SLICE_PROPAGATABLE_FIELDS = {"opacity", "shader", "shader_controls"}
+
+
+def diff_slice_settings(old_slices, new_slices) -> list[dict]:
+    """Appearance changes between two keyframes' slice lists, matched by layer name.
+
+    Without this, a contrast adjustment made in neuroglancer was captured onto the
+    updated keyframe but never offered for propagation, so a shot re-contrasted at one
+    keyframe silently kept the old window everywhere else.
+    """
+    old_by = {s.em_name: s for s in old_slices}
+    changes: list[dict] = []
+    for ns in new_slices:
+        os_ = old_by.get(ns.em_name)
+        if os_ is None:
+            continue
+        for f in sorted(_SLICE_PROPAGATABLE_FIELDS):
+            ov, nv = getattr(os_, f, None), getattr(ns, f, None)
+            if f == "opacity":
+                if abs(float(ov or 0.0) - float(nv or 0.0)) <= 1e-4:
+                    continue
+            elif ov == nv:
+                continue
+            changes.append({"mesh_name": ns.em_name, "field": f, "old": ov, "new": nv,
+                            "layer_kind": "slice"})
+    return changes
+
+
+def propagate_slice_field(project: Project, from_keyframe_id: str, em_name: str,
+                          field: str, value, direction: str = "right",
+                          match_old: bool = True, match_value=_UNSET) -> dict:
+    """Set a slice layer's appearance on one keyframe and push it to others.
+
+    Mirrors `propagate_layer_field` (same direction/match_old semantics) but operates on
+    `keyframe.slices`, which that function cannot reach.
+    """
+    if field not in _SLICE_PROPAGATABLE_FIELDS:
+        raise ValueError(f"field not propagatable: {field}")
+    kfs = project.keyframes
+    idx = next((i for i, k in enumerate(kfs) if k.id == from_keyframe_id), None)
+    if idx is None:
+        raise ValueError("no such keyframe")
+
+    def layer(kf):
+        return next((s for s in kf.slices if s.em_name == em_name), None)
+
+    src = layer(kfs[idx])
+    if src is None:
+        raise ValueError(f"slice layer {em_name} not in keyframe {from_keyframe_id}")
+    old = getattr(src, field) if match_value is _UNSET else match_value
+
+    if direction == "this":
+        targets = [idx]
+    elif direction == "left":
+        targets = list(range(0, idx + 1))
+    elif direction == "all":
+        targets = list(range(len(kfs)))
+    else:                                    # "right" (default): this keyframe and later
+        targets = list(range(idx, len(kfs)))
+
+    changed: list[str] = []
+    for i in targets:
+        sl = layer(kfs[i])
+        if sl is None:
+            continue
+        # i == idx is the edit the user actually made, so it always applies; elsewhere
+        # match_old protects keyframes that were deliberately set to something else.
+        if i != idx and match_old and not _values_equal(field, getattr(sl, field), old):
+            continue
+        updated = sl.model_copy(update={field: value})
+        kfs[i].slices = [updated if s.em_name == em_name else s for s in kfs[i].slices]
+        changed.append(kfs[i].id)
+    store.save(project)
+    return {"changed": changed}
 
 
 def diff_layer_settings(old_meshes, new_meshes) -> list[dict]:

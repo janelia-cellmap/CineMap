@@ -171,7 +171,12 @@ class RenderSettings(BaseModel):
     # the denoiser removes the rest. Higher = faster (bails sooner), still clean thanks to
     # OIDN. 0.01 = conservative/clean; ~0.06 = the fast "denoise does the work" setting.
     noise_threshold: float = 0.01
-    engine: Literal["CYCLES", "BLENDER_EEVEE_NEXT"] = "CYCLES"
+    # "AUTO" = Eevee for previews/drafts, Cycles for finals. Safe by default now that
+    # meshes use neuroglancer's emission-only shader with no shadows or global
+    # illumination: there is no path-traced lighting left for Cycles to converge, so the
+    # two engines agree on everything except order-dependent alpha blending — which is
+    # why finals still use Cycles.
+    engine: Literal["AUTO", "CYCLES", "BLENDER_EEVEE_NEXT"] = "AUTO"
     # when set, the job produces a self-contained .blend (camera, mesh and slice
     # animation baked to F-curves; textures packed in) instead of rendering frames.
     export_blend: bool = False

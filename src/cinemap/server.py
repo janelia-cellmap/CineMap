@@ -440,10 +440,14 @@ def update_from_ng(pid: str, kid: str):
     p = store.load(pid)
     kf_old = next((k for k in p.keyframes if k.id == kid), None)
     old_meshes = [m.model_copy(deep=True) for m in kf_old.meshes] if kf_old else []
+    old_slices = [s.model_copy(deep=True) for s in kf_old.slices] if kf_old else []
     kf = scouting.update_keyframe_from_view(p, kid)
     if kf is None:
         raise HTTPException(404, "no such keyframe")
-    changes = ops.diff_layer_settings(old_meshes, kf.meshes)
+    # image-layer changes (contrast window, layer opacity) count too — they used to be
+    # captured but never offered for propagation, so a re-contrast stopped at one keyframe
+    changes = (ops.diff_layer_settings(old_meshes, kf.meshes)
+               + ops.diff_slice_settings(old_slices, kf.slices))
     return {**kf.model_dump(), "changes": changes}
 
 
@@ -500,13 +504,29 @@ def keyframe_layers(pid: str, kid: str):
     kf = next((k for k in p.keyframes if k.id == kid), None)
     if kf is None:
         raise HTTPException(404, "no such keyframe")
-    return {"layers": [
-        {"mesh_name": m.mesh_name, "render_3d": m.render_3d, "visible": m.visible,
-         "color_seed": m.color_seed, "default_color": m.default_color,
+    from .data import ng_shader as _ngs
+
+    layers = [
+        {"mesh_name": m.mesh_name, "kind": "mesh", "render_3d": m.render_3d,
+         "visible": m.visible, "color_seed": m.color_seed,
+         "default_color": m.default_color,
          "segment_colors": m.segment_colors, "segment_ids": m.segment_ids[:200],
          "object_alpha": m.object_alpha, "silhouette": m.silhouette,
          "saturation": m.saturation, "color": m.color}
-        for m in kf.meshes]}
+        for m in kf.meshes]
+    # Image/EM slice layers, so the UI can show and propagate the neuroglancer contrast
+    # window that was previously invisible here. `contrast` is the resolved invlerp range
+    # (what the viewer's slider is actually set to), for display.
+    for s in kf.slices:
+        sh = _ngs.from_layer({"shader": s.shader, "shaderControls": s.shader_controls,
+                              "opacity": s.opacity})
+        layers.append({
+            "mesh_name": s.em_name, "kind": "slice", "visible": s.visible,
+            "opacity": s.opacity, "shader": s.shader,
+            "shader_controls": s.shader_controls,
+            "contrast": list(sh.primary_range) if sh.primary_range else None,
+        })
+    return {"layers": layers}
 
 
 @app.post("/api/projects/{pid}/keyframes/{kid}/propagate")
@@ -517,9 +537,16 @@ def propagate_layer(pid: str, kid: str, req: PropagateReq):
     p = store.load(pid)
     kw = {"match_value": req.match_value} if req.match_value_set else {}
     try:
-        res = ops.propagate_layer_field(
-            p, kid, req.mesh_name, req.field, req.value, segment_id=req.segment_id,
-            direction=req.direction, match_old=req.match_old, **kw)
+        # `mesh_name` doubles as the layer name; a slice-only field (contrast/opacity)
+        # routes to the slice propagator because slices are not in keyframe.meshes.
+        if req.field in ops._SLICE_PROPAGATABLE_FIELDS:
+            res = ops.propagate_slice_field(
+                p, kid, req.mesh_name, req.field, req.value,
+                direction=req.direction, match_old=req.match_old, **kw)
+        else:
+            res = ops.propagate_layer_field(
+                p, kid, req.mesh_name, req.field, req.value, segment_id=req.segment_id,
+                direction=req.direction, match_old=req.match_old, **kw)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     return {"ok": True, **res, "count": len(res["changed"])}
@@ -551,7 +578,8 @@ def keyframe_diffs(pid: str):
     p = store.load(pid)
     out = []
     for i, k in enumerate(p.keyframes):
-        changes = ops.diff_layer_settings(p.keyframes[i - 1].meshes, k.meshes) if i > 0 else []
+        changes = (ops.diff_layer_settings(p.keyframes[i - 1].meshes, k.meshes)
+                   + ops.diff_slice_settings(p.keyframes[i - 1].slices, k.slices)) if i > 0 else []
         out.append({"keyframe_id": k.id, "changes": changes})
     return {"diffs": out}
 

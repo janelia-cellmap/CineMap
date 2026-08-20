@@ -8,6 +8,7 @@ Validated path (spike): tensorstore zarr driver + http kvstore, zstd, '/' sep.
 """
 from __future__ import annotations
 
+import os
 import urllib.error
 from dataclasses import dataclass
 from functools import lru_cache
@@ -27,8 +28,18 @@ _AXIS_TO_ZYX = {"z": 0, "y": 1, "x": 2}
 # dozens of times (cold slices were ~50s each). One shared pool with a real byte limit
 # lets overlapping reads hit cache, and the bumped concurrency fans out the cold chunk
 # fetches instead of serializing them. Sharing is safe: volume data is immutable.
+#
+# Sizing matters more than it looks. A cross-section is one voxel deep, but these volumes
+# are chunked 64^3, so reading a single plane forces tensorstore to fetch and decode the
+# whole 64-plane band of every chunk it touches — about 1 GB decompressed for a 16 MB
+# plane. That is fine ONLY if the band survives long enough for the other planes in it to
+# be read (a warm plane measures ~0.05 s against ~3.8 s cold). With several render threads
+# each working a different band, a small pool evicts bands before they pay off, so the
+# amplification is paid over and over. Hence a pool sized in bands, not megabytes.
+# Override with CINEMAP_TS_CACHE_BYTES on memory-constrained machines.
+_TS_CACHE_BYTES = int(os.environ.get("CINEMAP_TS_CACHE_BYTES") or 12_000_000_000)
 _TS_CONTEXT = ts.Context({
-    "cache_pool": {"total_bytes_limit": 4_000_000_000},  # 4 GB of decompressed chunks
+    "cache_pool": {"total_bytes_limit": _TS_CACHE_BYTES},
     "data_copy_concurrency": {"limit": 16},
 })
 

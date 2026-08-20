@@ -179,6 +179,20 @@ class RenderWorker:
             return src.label_zarr, True
         return (em.zarr_url, False) if em else (None, False)
 
+    def _resolved_engine(self) -> str:
+        """Concrete Blender engine id for this job, resolving "AUTO".
+
+        Preview/draft renders rasterize with Eevee (roughly 10-50x faster per frame).
+        That is a fair trade now that meshes use neuroglancer's emission-only shader:
+        with no shadows and no global illumination there is no path-traced lighting for
+        Cycles to converge, so the two engines differ only in how they resolve
+        overlapping transparency — hence Cycles for the final.
+        """
+        engine = getattr(self.job.settings, "engine", "AUTO") or "AUTO"
+        if engine != "AUTO":
+            return engine
+        return "BLENDER_EEVEE_NEXT" if self._draft else "CYCLES"
+
     def _warn_once(self, key: str, message: str) -> None:
         """Print a per-render warning the first time only — a shader that falls back
         would otherwise log identically for every frame of every slice."""
@@ -907,6 +921,24 @@ class RenderWorker:
                 warm_seen.add(key)
                 warm_jobs.append((sl, region, seg_overlays, slice_seg, target_nm_per_px))
 
+        # Order the fetches by the plane they read, so threads running at the same time sit
+        # in the SAME chunk band and share its decompressed chunks.
+        #
+        # A cross-section is one voxel deep but zarr chunks are not: these volumes use 64^3
+        # inner chunks, so reading a single z-plane makes tensorstore fetch and decode all
+        # 64 planes of every chunk it touches — measured at ~1 GB decompressed for a 16 MB
+        # plane, ~64x amplification. That cost is unavoidable per band, but it is paid ONCE
+        # if the band stays cached: a second plane from the same band measured 0.03-0.07 s
+        # against 3.8 s cold. Jobs arrive in frame order, which for a sweep means every
+        # worker is in a different band at once, so the shared pool thrashes and bands get
+        # evicted before their other planes are read. Sorting restores that locality.
+        def _locality(job):
+            sl = job[0]
+            axis, position_nm, normal = self._slice_read_plane(sl)
+            return (sl.em_name, axis, bool(normal), float(position_nm))
+
+        warm_jobs.sort(key=_locality)
+
         def _warm(job):
             sl, region, seg_overlays, slice_seg, target_nm_per_px = job
             try:
@@ -916,8 +948,15 @@ class RenderWorker:
                 pass
 
         if warm_jobs and not self.cancel.is_set():
+            # Fewer threads than the mesh fetcher on purpose. Each in-flight slice pins a
+            # whole decompressed chunk band (~1 GB), so running one per core overruns the
+            # tensorstore cache pool and evicts bands that other threads are about to need.
+            # Decode is also only ~2.5 cores' worth of work, so the extra threads buy little.
+            # CINEMAP_SLICE_WORKERS overrides.
+            slice_workers = int(os.environ.get("CINEMAP_SLICE_WORKERS")
+                                or max(2, min(6, _FETCH_WORKERS)))
             self._progress(0.45, f"fetching {len(warm_jobs)} unique slice images")
-            with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
+            with ThreadPoolExecutor(max_workers=slice_workers) as ex:
                 done = 0
                 for _ in ex.map(_warm, warm_jobs):
                     done += 1
@@ -1012,11 +1051,13 @@ class RenderWorker:
             })
             self._progress(0.45 + 0.15 * (fi + 1) / len(frames),
                            f"building frame specs {fi + 1}/{len(frames)}")
+        render_spec = self.job.settings.model_dump()
+        render_spec["engine"] = self._resolved_engine()
         spec = {
             "world": {"nm_per_bu": self.nm_per_bu,
                       "background": self.project.lighting.background},
             "lighting": {"key_energy": self.project.lighting.key_energy},
-            "render": self.job.settings.model_dump(),
+            "render": render_spec,
             "meshes": list(mesh_specs.values()),
             "frames": frame_specs,
             "output_dir": str(self.frames_dir),
@@ -1056,7 +1097,7 @@ class RenderWorker:
                            tuple(mm.get("color") or ()))
                           for mm in mesh_specs.values())
             sig_src = json.dumps([geom, spec.get("direction", {}).get("material", {}),
-                                  self.job.settings.engine, round(self.nm_per_bu, 6),
+                                  self._resolved_engine(), round(self.nm_per_bu, 6),
                                   bool(self._auto_direct)],
                                  sort_keys=True, default=str)
             sig = hashlib.md5(sig_src.encode()).hexdigest()[:16]
