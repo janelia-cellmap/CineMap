@@ -167,9 +167,11 @@ class RenderReq(BaseModel):
     fps: int = 30
     samples: int = 48
     noise_threshold: float = 0.01   # adaptive-sampling bail threshold (higher = faster)
-    # render engine: CYCLES (path-traced, photoreal, slow) or BLENDER_EEVEE_NEXT
-    # (rasterized, ~10-50x faster per frame — ideal for fast previews / movie drafts).
-    engine: Literal["CYCLES", "BLENDER_EEVEE_NEXT"] = "CYCLES"
+    # render engine: AUTO (Eevee for drafts, Cycles for finals), CYCLES (path-traced,
+    # photoreal, slow) or BLENDER_EEVEE_NEXT (rasterized, ~10-50x faster per frame).
+    # Must stay in sync with RenderSettings.engine — the UI sends AUTO by default, and a
+    # narrower Literal here rejects every render with a 422.
+    engine: Literal["AUTO", "CYCLES", "BLENDER_EEVEE_NEXT"] = "AUTO"
     kf_range: list[int] | None = None
     export_blend: bool = False  # produce a self-contained .blend instead of a video
     draft: bool = False         # fast low-res preview (coarse EM + low-voxel meshes)
@@ -519,7 +521,7 @@ def keyframe_layers(pid: str, kid: str):
     # (what the viewer's slider is actually set to), for display.
     for s in kf.slices:
         sh = _ngs.from_layer({"shader": s.shader, "shaderControls": s.shader_controls,
-                              "opacity": s.opacity})
+                              "opacity": s.opacity}, _slice_dtype(p, s.em_name))
         layers.append({
             "mesh_name": s.em_name, "kind": "slice", "visible": s.visible,
             "opacity": s.opacity, "shader": s.shader,
@@ -527,6 +529,30 @@ def keyframe_layers(pid: str, kid: str):
             "contrast": list(sh.primary_range) if sh.primary_range else None,
         })
     return {"layers": layers}
+
+
+def _slice_dtype(project, em_name: str):
+    """The source dtype for a slice layer, for resolving a default invlerp range.
+
+    An omitted range defaults to the FULL dtype range, so assuming uint8 would report
+    0-255 for a uint16 volume — and propagating that displayed value would then clamp
+    almost everything to white. Falls back to uint8 only if the volume can't be opened
+    (the display value is cosmetic; never fail the panel over it).
+    """
+    import numpy as np
+
+    try:
+        from .data.slice_loader import get_volume
+
+        em = project.manifest.em
+        url = (em.zarr_url if em and (not em_name or em_name == em.name)
+               else next((m.label_zarr for m in project.manifest.meshes
+                          if m.name == em_name and m.label_zarr), None))
+        if url:
+            return get_volume(url).dtype
+    except Exception:  # noqa: BLE001
+        pass
+    return np.uint8
 
 
 @app.post("/api/projects/{pid}/keyframes/{kid}/propagate")

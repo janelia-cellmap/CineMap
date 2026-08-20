@@ -385,11 +385,17 @@ def sync_segments(project: Project, keyframe_id: str) -> Keyframe | None:
         for s in kf.slices:
             live = _layer_by_name(st, s.em_name) or {}
             op = live.get("opacity", s.opacity)
+            # Key presence, not truthiness: if the layer is in the live state, its
+            # appearance is authoritative. `or` would make clearing a custom shader or
+            # resetting the contrast in neuroglancer un-syncable, since the empty value
+            # would silently fall back to the stale captured one.
+            in_state = s.em_name in {l.get("name") for l in st.get("layers", [])}
             slices.append(s.model_copy(update={
                 "visible": vis.get(s.em_name, True),
                 "opacity": float(op) if op is not None else 1.0,
-                "shader": live.get("shader") or s.shader,
-                "shader_controls": dict(live.get("shaderControls") or s.shader_controls),
+                "shader": (live.get("shader") or "") if in_state else s.shader,
+                "shader_controls": (dict(live.get("shaderControls") or {}) if in_state
+                                    else dict(s.shader_controls)),
             }))
     elif vis.get(em_name, True):  # EM turned on but keyframe had no slice -> add one
         slices = [slice_from_layer(em_name, _layer_by_name(st, em_name),

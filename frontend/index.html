@@ -1665,13 +1665,19 @@ async function applyPropagate() {
   else if (f === 'color_seed') value = parseInt(raw, 10);
   else if (f === 'shader') value = raw;
   else if (f === 'shader_controls') {
-    // rebuild the control dict, preserving whichever control name this layer's shader
-    // declared (usually "normalized", but a custom shader can name it anything)
-    const name = Object.keys(l.shader_controls || {})[0] || 'normalized';
-    const prev = (l.shader_controls || {})[name];
+    // Rebuild the control dict, preserving whichever control name this layer's shader
+    // declared (usually "normalized", but a custom shader can name it anything).
+    // Pick the INVLERP control specifically: a shader can also declare sliders,
+    // colors and checkboxes, and blindly taking the first key would write a range
+    // onto e.g. a brightness slider — clobbering it and losing the contrast edit.
+    const sc = l.shader_controls || {};
+    const isInvlerp = (v) => (v && typeof v === 'object' && !Array.isArray(v) && 'range' in v)
+                          || (Array.isArray(v) && v.length === 2);
+    const name = Object.keys(sc).find(k => isInvlerp(sc[k])) || 'normalized';
+    const prev = sc[name];
     const keep = (prev && typeof prev === 'object' && !Array.isArray(prev)) ? { ...prev } : {};
     keep.range = [parseFloat(raw), parseFloat($('propValHi').value)];
-    value = { ...(l.shader_controls || {}), [name]: keep };
+    value = { ...sc, [name]: keep };
   }
   else value = parseFloat(raw);
   try {

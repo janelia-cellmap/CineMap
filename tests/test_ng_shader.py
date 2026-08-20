@@ -232,3 +232,42 @@ def test_shading_is_layer_agnostic():
                          np.zeros((2, 2), dtype=np.uint8))
     assert warn == ""
     np.testing.assert_array_equal(out[0, 0], [0, 0, 255])
+
+
+# ------------------------------------------------- regressions from code review
+def test_custom_invlerp_name_falls_back_without_crashing():
+    """An unsupported shader whose invlerp is NOT called `normalized`.
+
+    The fallback renders neuroglancer's default shader, which calls normalized(); the
+    kept control has to be re-keyed to match or evaluation raises straight back out and
+    the slice vanishes from every frame.
+    """
+    src = ("#uicontrol invlerp myWindow\n"
+           "void main(){ emitGrayscale(bogusFn(myWindow())); }")
+    data = np.array([[0, 100, 200]], dtype=np.uint8)
+    sh = ns.from_layer({"shader": src,
+                        "shaderControls": {"myWindow": {"range": [50, 150]}}}, np.uint8)
+    out, warn = ns.shade(sh, data)          # must not raise
+    assert warn
+    np.testing.assert_array_equal(out[..., 0], _u8(_invlerp(data, 50, 150)))
+
+
+def test_conditional_shader_refuses_rather_than_baking_black():
+    """Two emit* calls = per-pixel branching we don't model. Taking the first would
+    silently produce an all-black slice with no warning."""
+    src = ("#uicontrol invlerp normalized\n"
+           "void main(){ if (normalized() < 0.1) { emitTransparent(); }\n"
+           "             else { emitGrayscale(normalized()); } }")
+    data = np.array([[0, 128, 255]], dtype=np.uint8)
+    out, warn = ns.shade(ns.from_layer({"shader": src}, np.uint8), data)
+    assert warn and "emit" in warn
+    np.testing.assert_array_equal(out[..., 0], data)   # fell back to plain invlerp
+
+
+def test_smoothstep_applies_edges_to_vectors():
+    src = ("#uicontrol invlerp normalized\n"
+           "void main(){ emitRGB(smoothstep(vec3(0.0), vec3(1.0), vec3(normalized()))); }")
+    out, warn = ns.shade(ns.from_layer({"shader": src}, np.uint8),
+                         np.array([[0, 255]], dtype=np.uint8))
+    assert warn == ""
+    assert out[0, 0, 0] == 0 and out[0, 1, 0] == 255

@@ -298,10 +298,16 @@ def _mix(a, b, t):
 
 
 def _smoothstep(e0, e1, x):
-    t = _clamp((x - e0) / (e1 - e0) if not isinstance(x, list) else x, 0.0, 1.0)
-    if isinstance(t, list):
-        return [c * c * (3 - 2 * c) for c in t]
-    return t * t * (3 - 2 * t)
+    """GLSL smoothstep, component-wise. Edges are applied for vector x too — an earlier
+    version passed x straight through when it was a vec, silently ignoring e0/e1."""
+    def one(a, b, v):
+        t = np.clip((v - a) / ((b - a) or 1e-12), 0.0, 1.0)
+        return t * t * (3 - 2 * t)
+
+    if any(isinstance(v, list) for v in (e0, e1, x)):
+        a3, b3, x3 = _as_rgb(e0), _as_rgb(e1), _as_rgb(x)
+        return [one(a3[i], b3[i], x3[i]) for i in range(3)]
+    return one(e0, e1, x)
 
 
 def _elementwise(fn):
@@ -504,11 +510,22 @@ class LayerShader:
         return (np.clip(out, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
 
     def _emit(self, env: dict, arr: np.ndarray) -> list:
-        """Find the emit* call in main() and evaluate its argument."""
+        """Find the emit* call in main() and evaluate its argument.
+
+        Only a shader with exactly ONE emit is safe to evaluate this way. A branching
+        shader (`if (x) emitTransparent(); else emitGrayscale(v);`) has per-pixel control
+        flow we do not model, and silently taking the first emit would bake, say, an
+        all-black slice while reporting success. Refuse instead and let the caller fall
+        back with a warning.
+        """
         _, body = parse_directives(self.source, arr.dtype) if self.source else ({}, "")
-        m = re.search(r"\bemit(Grayscale|RGBA|RGB|Transparent)\s*\(", body)
-        if m is None:
+        emits = list(re.finditer(r"\bemit(Grayscale|RGBA|RGB|Transparent)\s*\(", body))
+        if not emits:
             raise ShaderUnsupported("no emit* call found")
+        if len(emits) > 1:
+            raise ShaderUnsupported(
+                f"{len(emits)} emit* calls (conditional shader not supported)")
+        m = emits[0]
         kind = m.group(1)
         if kind == "Transparent":
             return [0.0, 0.0, 0.0]
@@ -565,9 +582,15 @@ def shade(layer_shader: LayerShader, data: np.ndarray) -> tuple[np.ndarray, str]
         return layer_shader.apply(data), layer_shader.warning
     except ShaderUnsupported as e:
         fb = _fallback(data.dtype, layer_shader.opacity, str(e))
-        # keep any invlerp the state DID give us — contrast still tracks the slider
-        for name, c in layer_shader.controls.items():
+        # Keep the invlerp range the state DID give us, so contrast still tracks the
+        # slider even though the rest of the shader was out of scope. The control must be
+        # re-keyed to "normalized": the fallback SOURCE is neuroglancer's default shader,
+        # which calls normalized(). Installing it under a custom name (a shader is free to
+        # call its control anything) would leave normalized() undefined and raise straight
+        # back out of the fallback — dropping the slice from every frame.
+        for c in layer_shader.controls.values():
             if c.kind == "invlerp":
-                fb.controls = {name: c}
+                fb.controls = {"normalized": Control("normalized", "invlerp",
+                                                     c.value, clamp=c.clamp)}
                 break
         return fb.apply(data), f"unsupported shader, using invlerp only: {e}"

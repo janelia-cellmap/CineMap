@@ -51,10 +51,12 @@ def _to_display_dtype(sub: np.ndarray) -> np.ndarray:
     non-8-bit EM (a uint16 value of 40000 came out as 64) and threw away neuroglancer's
     contrast window even on 8-bit data. Intensity mapping is neuroglancer's job and is
     now done by `data/ng_shader.py`, which needs the raw values plus the dtype to pick
-    the right default invlerp range. Only multi-channel data is reduced here.
+    the right default invlerp range.
+
+    Shape is deliberately left alone. This also runs on the 3D subvolume the oblique
+    reader samples from, and squeezing a 1-voxel-thick box down to 2D there breaks the
+    `sub.shape[2]` indexing that follows, dropping the slice.
     """
-    if sub.ndim > 2:                      # squeeze away singleton channel/time axes
-        sub = np.squeeze(sub)
     return sub
 
 
@@ -130,6 +132,13 @@ class EMVolume:
         attrs = grp.get("attributes", {})
         ome = attrs.get("ome", attrs)  # OME-Zarr 0.5 nests multiscales under "ome"
         return ome["multiscales"][0]
+
+    @property
+    def dtype(self):
+        """The volume's numpy dtype — what neuroglancer resolves a default invlerp
+        range against (uint8 -> 0..255, uint16 -> 0..65535). Cheap: the coarsest level
+        is already open or is a metadata-only read."""
+        return self._open_level(len(self.datasets) - 1).dtype.numpy_dtype
 
     @lru_cache(maxsize=16)
     def _open_level(self, level: int):

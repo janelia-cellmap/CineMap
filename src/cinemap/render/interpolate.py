@@ -197,9 +197,14 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
                              sb.opacity if sb.visible else 0.0, t, layer_transition,
                              lt, layer_transition_at),
                 normal=(sb.normal if (same_n or t >= 0.5 or target_layer) else sa.normal),
-                # snap with the rest of the layer appearance rather than blending
-                shader=(sb.shader if target_layer else sa.shader),
-                shader_controls=dict((sb if target_layer else sa).shader_controls),
+                # Snap to the destination at the halfway point, like `normal` above.
+                # NOT keyed on target_layer alone: that is only ever true for a "cut"
+                # transition, so under the default "fade" the destination's contrast
+                # would never be used — a re-contrast on the last keyframe would never
+                # render at all, since no later segment promotes it to the `a` side.
+                shader=(sb.shader if (t >= 0.5 or target_layer) else sa.shader),
+                shader_controls=dict(
+                    (sb if (t >= 0.5 or target_layer) else sa).shader_controls),
             ))
         else:  # appearing or disappearing
             s = sa or sb

@@ -22,6 +22,17 @@ import bpy
 from mathutils import Matrix, Vector
 
 
+def _uses_ng_shader(scene_spec: dict) -> bool:
+    """Whether meshes render with neuroglancer's emission-only shader.
+
+    Defaults to True, including when there is no `direction` block at all (auto_direct
+    off), because that path is documented as the plain neuroglancer-faithful scene. Read
+    through one helper so the material build and the shadow decision cannot disagree —
+    they did, and the mismatch produced a lit Principled render with every shadow off.
+    """
+    return bool(scene_spec.get("direction", {}).get("material", {}).get("ng_shader", True))
+
+
 def _srgb_to_linear(c):
     """sRGB (0-1) -> linear. Scalar or numpy array.
 
@@ -49,8 +60,7 @@ def _setup_render(scene_spec: dict) -> None:
     r = scene_spec["render"]
     # A lit Principled look wants shadows; the neuroglancer-faithful emission shader (the
     # default) must not have them, because NG doesn't.
-    _CAST_SHADOWS = not scene_spec.get("direction", {}).get(
-        "material", {}).get("ng_shader", True)
+    _CAST_SHADOWS = not _uses_ng_shader(scene_spec)
     # Resolve the requested engine to an id this Blender build actually exposes. Eevee was
     # renamed across versions: "BLENDER_EEVEE" (≤4.1 and again in ≥4.4/5.0) vs
     # "BLENDER_EEVEE_NEXT" (only 4.2–4.3). Assigning an id not in the enum raises and the
@@ -615,7 +625,7 @@ def _import_meshes(scene_spec: dict) -> dict:
         nt.links.new(facing.outputs[0], powr.inputs[0])
         nt.links.new(silh_v.outputs[0], powr.inputs[1])
 
-        if prof.get("ng_shader"):
+        if _uses_ng_shader(scene_spec):
             # Faithful port of neuroglancer's mesh GLSL (src/mesh/frontend.ts):
             #   absCosAngle   = abs(dot(normal, uLightDirection.xyz))
             #   lightingFactor = absCosAngle * 0.8 + 0.2      (directional 0.8, ambient 0.2
