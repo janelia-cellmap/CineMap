@@ -5,6 +5,8 @@ Expected values are computed from neuroglancer's own formulas (see the citations
 """
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -271,3 +273,28 @@ def test_smoothstep_applies_edges_to_vectors():
                          np.array([[0, 255]], dtype=np.uint8))
     assert warn == ""
     assert out[0, 0, 0] == 0 and out[0, 1, 0] == 255
+
+
+# ------------------------------------- real hemibrain state (public demo script)
+HEMIBRAIN_SYNAPSE_SHADER = json.loads(r'''"#uicontrol bool showPsds checkbox(default=true)\n#uicontrol vec3 preColor color(default=\"red\")\n#uicontrol vec3 postColor color(default=\"blue\")\n#uicontrol float preConfidence slider(min=0, max=1, default=0)\n#uicontrol float postConfidence slider(min=0, max=1, default=0)\n\nvoid main() {\n  setColor(defaultColor());\n}\n"''')
+
+
+def test_real_annotation_layer_controls_parse():
+    """An ANNOTATION layer from the public hemibrain video script.
+
+    Proves the parsing is layer-agnostic: this is not an image layer and uses
+    checkbox/color/slider controls rather than invlerp.
+    """
+    layer = {"type": "annotation", "shader": HEMIBRAIN_SYNAPSE_SHADER,
+             "shaderControls": {"showPsds": False}}
+    sh = ns.from_layer(layer, np.uint8)
+    assert sh.controls["preColor"].value == (1.0, 0.0, 0.0)      # "red"
+    assert sh.controls["postColor"].value == (0.0, 0.0, 1.0)     # "blue"
+    assert sh.controls["preConfidence"].value == 0.0
+    assert sh.controls["showPsds"].value is False                # state overrode the default
+
+
+def test_escaped_quote_color_still_resolves():
+    """A double-encoded state keeps the backslashes; the color must not fall back."""
+    src = '#uicontrol vec3 c color(default=\\"red\\")\nvoid main(){ emitRGB(c); }'
+    assert ns.from_layer({"shader": src}, np.uint8).controls["c"].value == (1.0, 0.0, 0.0)

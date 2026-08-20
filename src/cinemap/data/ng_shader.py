@@ -120,6 +120,11 @@ def _parse_literal(text: str):
         return True
     if low == "false":
         return False
+    # Tolerate a still-escaped quote (`\"red\"`). A properly JSON-decoded state never has
+    # these, but hand-edited and double-encoded states do, and there is no other sensible
+    # reading — without this the value silently degrades to the default color.
+    if t.startswith('\\"') and t.endswith('\\"'):
+        return t[2:-2]
     if t[0] in "\"'" and t[-1] == t[0]:
         return t[1:-1]
     if t.startswith("[") and t.endswith("]"):
