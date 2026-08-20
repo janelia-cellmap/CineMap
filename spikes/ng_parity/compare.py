@@ -11,13 +11,16 @@ Usage:
 
 STATE is a neuroglancer state: a share link, a URL, or a path to a JSON file.
 
-Requires a browser: neuroglancer renders in WebGL, so its screenshot API drives a
-headless chromedriver. `selenium` is already a project dependency, but the chromium and
-chromedriver BINARIES may not be:
+Requires a browser. Neuroglancer rasterizes in WebGL on the client, so every capture path
+it offers — viewer.screenshot, neuroglancer.tool.screenshot, neuroglancer.tool.video_tool
+— drives a real browser via selenium. Pointing at a public deployment (e.g.
+`--static-content-url https://neuroglancer-demo.appspot.com`) only changes where the JS
+bundle is served from; webdriver still navigates a browser to it. `selenium` is already a
+project dependency, but the binaries may not be:
 
-    mamba install -n cinemap -c conda-forge chromium chromedriver
+    mamba install -n cinemap -c conda-forge firefox geckodriver
 
-Without them this script exits with that message rather than a stack trace.
+Without them this script exits with that message rather than hanging.
 
 What it reports, per test case, is the mean and max absolute per-channel difference
 (0-255) plus the mean signed bias. Bias matters more than magnitude: a uniform positive
@@ -95,30 +98,30 @@ BROWSER_HELP = (
     "neuroglancer renders in WebGL, so every one of its capture paths — viewer.screenshot,\n"
     "neuroglancer.tool.screenshot and neuroglancer.tool.video_tool alike — drives a real\n"
     "browser through selenium. There is no pure-Python rasterizer to fall back on.\n"
-    "Install the binaries (selenium itself is already a project dependency):\n"
-    "    mamba install -n cinemap -c conda-forge chromium chromedriver")
+    "Install a browser AND its driver (selenium itself is already a project dependency);\n"
+    "conda-forge has no chromium/chromedriver for linux-64, so firefox is the easy route:\n"
+    "    mamba install -n cinemap -c conda-forge firefox geckodriver")
 
 
-def require_browser() -> None:
-    """Fail fast with an actionable message if no chromedriver/chromium is present.
+def pick_browser() -> str:
+    """"chrome" or "firefox", whichever has both a browser and its driver on PATH.
 
     Checked up front because otherwise Viewer() binds a server and the webdriver call
-    blocks for a long time before failing, which looks like a hang.
+    blocks for a long time before failing, which just looks like a hang.
     """
     import shutil
 
-    driver = shutil.which("chromedriver")
-    browser = next((b for b in ("chromium", "chromium-browser", "google-chrome",
-                                "chrome", "firefox") if shutil.which(b)), None)
-    if driver and browser:
-        return
-    missing = ", ".join(x for x, ok in (("chromedriver", driver), ("a browser", browser))
-                        if not ok)
-    sys.exit(f"cannot capture neuroglancer screenshots: {missing} not on PATH.\n"
+    if shutil.which("chromedriver") and any(
+            shutil.which(b) for b in ("chromium", "chromium-browser",
+                                      "google-chrome", "chrome")):
+        return "chrome"
+    if shutil.which("geckodriver") and shutil.which("firefox"):
+        return "firefox"
+    sys.exit("cannot capture neuroglancer screenshots: no browser + driver pair on PATH.\n"
              + BROWSER_HELP)
 
 
-def ng_screenshot(state: dict, size: tuple[int, int]):
+def ng_screenshot(state: dict, size: tuple[int, int], browser: str = "chrome"):
     """Screenshot `state` from a real neuroglancer, as an HxWx3 uint8 array."""
     try:
         import neuroglancer
@@ -130,13 +133,10 @@ def ng_screenshot(state: dict, size: tuple[int, int]):
     viewer.set_state(state)
     try:
         driver = neuroglancer.webdriver.Webdriver(viewer, headless=True,
-                                                  window_size=size)
+                                                  browser=browser, window_size=size)
     except Exception as e:  # noqa: BLE001 — almost always a missing browser binary
-        sys.exit(
-            "could not start headless chromedriver "
-            f"({type(e).__name__}: {e}).\n"
-            "neuroglancer renders in WebGL, so a browser is required. Install one:\n"
-            "    mamba install -n cinemap -c conda-forge chromium chromedriver")
+        sys.exit(f"could not start headless {browser} "
+                 f"({type(e).__name__}: {e}).\n" + BROWSER_HELP)
     with driver:
         with viewer.config_state.txn() as s:
             s.show_ui_controls = False
@@ -193,13 +193,15 @@ def main() -> int:
     ap.add_argument("-o", "--out", default="spikes/ng_parity/out",
                     help="directory for ng/cinemap/diff PNGs")
     ap.add_argument("--size", nargs=2, type=int, default=[640, 480], metavar=("W", "H"))
+    ap.add_argument("--browser", choices=["chrome", "firefox"], default=None,
+                    help="force a browser; default = whichever has a driver on PATH")
     ap.add_argument("--tolerance", type=float, default=4.0,
                     help="max acceptable mean absolute difference (0-255)")
     args = ap.parse_args()
 
     from PIL import Image
 
-    require_browser()
+    browser = args.browser or pick_browser()
     state = load_state(args.state)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -209,7 +211,7 @@ def main() -> int:
     for desc, st in variants(state):
         slug = desc.replace(" ", "_").replace("/", "-")
         print(f"\n=== {desc} ===", flush=True)
-        ng = ng_screenshot(st, size)
+        ng = ng_screenshot(st, size, browser=browser)
         cm = cinemap_render(st, size, out / slug)
         stats = compare(ng, cm)
         Image.fromarray(ng).save(out / f"{slug}.ng.png")
