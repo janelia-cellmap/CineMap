@@ -47,6 +47,14 @@ dev = ["ruff", "pytest"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/cinemap"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  # Tests that launch a real Blender render (seconds each, needs bpy).
+  # Skip them with: pytest -m "not slow"
+  "slow: spawns a Blender subprocess",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
