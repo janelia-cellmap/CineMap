@@ -548,6 +548,7 @@ _DECL = re.compile(rf"^(?:const\s+)?{_TYPES}\s+([A-Za-z_]\w*)\s*=\s*(.+)$", re.S
 _ASSIGN = re.compile(r"^([A-Za-z_]\w*)\s*=\s*(.+)$", re.S)
 _RETURN = re.compile(r"^return\b\s*(.*)$", re.S)
 _EMIT_CALL = re.compile(r"^emit(Grayscale|RGBA|RGB|Transparent)\s*\((.*)\)$", re.S)
+_VOID_CALL = re.compile(r"^([A-Za-z_]\w*)\s*\((.*)\)$", re.S)
 _CONTROL_FLOW = re.compile(r"\b(if|else|for|while|do|switch|discard)\b")
 _MAX_CALL_DEPTH = 16
 
@@ -573,6 +574,28 @@ def _match_brace(text: str, open_idx: int) -> int:
             if depth == 0:
                 return i + 1
     raise ShaderUnsupported("unbalanced braces")
+
+
+def _split_args(text: str) -> list[str]:
+    """Top-level comma-separated arguments, ignoring commas nested in (), [] or {}."""
+    text = text.strip()
+    if not text:
+        return []
+    out: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur).strip())
+    return [a for a in out if a]
 
 
 def _split_statements(body: str) -> list[str]:
@@ -614,6 +637,10 @@ class _Program:
     def __init__(self, code: str):
         self.funcs: dict[str, _Func] = {}
         self.main: str = ""
+        # Void setter calls in call order. Annotation shaders have no emit*: they call
+        # setColor / setPointMarkerColor / setLineWidth ... and the LAST call for a given
+        # target wins, so order has to be preserved rather than collapsed into a dict.
+        self.setters: list[tuple[str, list]] = []
         self._parse(code)
 
     def _parse(self, code: str) -> None:
@@ -675,14 +702,44 @@ class _Program:
             if m and m.group(1) in env:
                 env[m.group(1)] = self._eval(m.group(2), env, depth)
                 continue
+            m = _VOID_CALL.match(st)
+            if m:
+                name, argtext = m.group(1), m.group(2)
+                args = [self._eval(a, env, depth) for a in _split_args(argtext)]
+                if name in self.funcs:                 # a void helper the shader defines
+                    fn = self.funcs[name]
+                    inner = dict(self.base_env)
+                    inner.update(dict(zip(fn.params, args)))
+                    self._run(fn.body, inner, depth + 1)
+                    continue
+                if name.startswith("set"):
+                    self.setters.append((name, args))
+                    continue
+                raise ShaderUnsupported(f"unsupported call {name!r}")
             raise ShaderUnsupported(f"unsupported statement {st.strip()[:60]!r}")
         return "", None
 
     def _eval(self, expr: str, env: dict, depth: int):
         return _Expr(expr, env, _ProgramAtDepth(self, depth)).parse()
 
+    def run_main(self, env: dict) -> dict:
+        """Run `main` for its SETTERS (annotation shaders) and return the final env."""
+        self.setters = []
+        self.base_env = dict(env)
+        genv = dict(env)
+        if self.globals.strip():
+            self._run(self.globals, genv, 0)
+            self.base_env = dict(genv)
+        kind, _ = self._run(self.main, genv, 0)
+        if kind == "emit":
+            raise ShaderUnsupported("emit* in a shader that should use setColor")
+        if not self.setters:
+            raise ShaderUnsupported("main() set nothing")
+        return genv
+
     def emit(self, env: dict) -> tuple[str, object]:
         """Run `main` and return (emit kind, evaluated argument)."""
+        self.setters = []
         self.base_env = dict(env)
         genv = dict(env)
         if self.globals.strip():
@@ -949,3 +1006,109 @@ def shade_properties(shader_src: str, props: dict[str, np.ndarray],
         return (np.clip(out, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8), ""
     except Exception as e:  # noqa: BLE001 — a bad shader must never kill a render
         return np.zeros((n, 3), dtype=np.uint8), f"{type(e).__name__}: {e}"
+
+
+# ------------------------------------------------------------- annotation shaders
+DEFAULT_ANNOTATION_SHADER = "void main() {\n  setColor(defaultColor());\n}\n"
+
+# Which primitive kinds each neuroglancer setter affects, transcribed from the aliases
+# declared in annotation/type_handler.ts:459-556. `setColor` fans out to all of them:
+#     void setColor(vec4 color) {
+#       setPointMarkerColor(color);
+#       setLineColor(color);
+#       setEndpointMarkerColor(color);
+#       setBoundingBoxBorderColor(color);
+#       setEllipsoidFillColor(vec4(color.rgb, color.a * (PROJECTION_VIEW ? 1.0 : 0.5)));
+#     }
+# We render the 3D projection view, so the ellipsoid alpha keeps the * 1.0 branch.
+_ANNOTATION_COLOR_SETTERS: dict[str, tuple[str, ...]] = {
+    "setColor": ("point", "line", "box", "ellipsoid"),
+    "setPointMarkerColor": ("point",),
+    "setLineColor": ("line",),
+    "setSingleLineColor": ("line",),
+    "setPolyLineColor": ("line",),
+    "setBoundingBoxBorderColor": ("box",),
+    "setBoundingBoxFillColor": ("box",),
+    "setEllipsoidFillColor": ("ellipsoid",),
+}
+_ANNOTATION_KINDS = ("point", "line", "box", "ellipsoid")
+
+
+def _as_rgba(v) -> list:
+    """A setter argument as [r, g, b, a]; vec3 gets alpha 1, matching NG's overloads."""
+    if not isinstance(v, list):
+        return [v, v, v, 1.0]
+    if len(v) >= 4:
+        return list(v[:4])
+    if len(v) == 3:
+        return [v[0], v[1], v[2], 1.0]
+    raise ShaderUnsupported(f"colour argument has {len(v)} components")
+
+
+def shade_annotations(shader_src: str, props: dict[str, Any], default_color,
+                      shader_controls: dict | None = None,
+                      count: int = 1) -> tuple[dict[str, np.ndarray], str]:
+    """Colour a layer's annotations the way neuroglancer's annotation shader does.
+
+    `props` maps a property id to a per-annotation array (a 1-D array for numeric
+    properties, or an (N, 3)/(N, 4) array for `rgb`/`rgba` ones), exposed to the GLSL as
+    `prop_<id>()`. `default_color` is the layer's `annotationColor`, which the default
+    shader emits via `defaultColor()`.
+
+    Returns ({kind: (N, 4) uint8 RGBA}, warning) for kind in point/line/box/ellipsoid.
+    On any unsupported GLSL the warning is set and every kind falls back to
+    `default_color`, so annotations still draw rather than vanishing.
+
+    Two-argument gradient setters (`setLineColor(start, end)`) are averaged: we sweep one
+    tube per line, which can only carry a single colour.
+    """
+    fallback = np.tile(
+        (np.array([*_as_rgb(list(default_color)), 1.0]) * 255).round().astype(np.uint8),
+        (count, 1))
+    out = {k: fallback.copy() for k in _ANNOTATION_KINDS}
+    src = shader_src or DEFAULT_ANNOTATION_SHADER
+    try:
+        declared, body = parse_directives(src, np.float32)
+        controls = apply_shader_controls(declared, shader_controls, np.float32)
+        env: dict[str, Any] = {"defaultColor": [float(c) for c in _as_rgb(list(default_color))]}
+        for name, c in controls.items():
+            if c.kind == "color":
+                env[name] = [float(x) for x in c.value]
+            elif c.kind == "checkbox":
+                env[name] = 1.0 if c.value else 0.0
+            elif c.kind == "slider":
+                env[name] = float(c.value)
+            elif c.kind == "invlerp":
+                env[name] = 0.0
+            else:
+                env[name] = c.value
+        for pid, arr in props.items():
+            a = np.asarray(arr, dtype=np.float64)
+            env[f"prop_{pid}"] = [a[:, i] for i in range(a.shape[1])] if a.ndim == 2 else a
+
+        prog = _Program(body)
+        prog.run_main(env)
+
+        resolved: dict[str, list | None] = {k: None for k in _ANNOTATION_KINDS}
+        for name, args in prog.setters:
+            kinds = _ANNOTATION_COLOR_SETTERS.get(name)
+            if not kinds or not args:
+                continue                      # a size/width setter, or one we don't model
+            rgba = _as_rgba(args[0])
+            if len(args) > 1:                 # gradient form: one tube, so average
+                other = _as_rgba(args[1])
+                rgba = [(a + b) * 0.5 for a, b in zip(rgba, other)]
+            for k in kinds:
+                resolved[k] = rgba
+        if all(v is None for v in resolved.values()):
+            raise ShaderUnsupported("no colour setter ran")
+        for k, rgba in resolved.items():
+            if rgba is None:
+                continue
+            chans = [np.broadcast_to(np.asarray(c, dtype=np.float64), (count,))
+                     for c in rgba]
+            out[k] = (np.clip(np.stack(chans, axis=-1), 0.0, 1.0) * 255.0
+                      + 0.5).astype(np.uint8)
+        return out, ""
+    except Exception as e:  # noqa: BLE001 — a bad shader must never kill a render
+        return {k: fallback.copy() for k in _ANNOTATION_KINDS}, f"{type(e).__name__}: {e}"

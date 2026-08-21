@@ -116,6 +116,15 @@ class FrameAnnotation:
     ellipsoids: list = field(default_factory=list)
     point_radius_nm: float = 80.0
     line_radius_nm: float = 40.0
+    # The annotation shader and the per-annotation properties it reads. These MUST be
+    # carried here: a field the frame state drops is a field the renderer never sees,
+    # however carefully it was captured.
+    shader: str = ""
+    shader_controls: dict = field(default_factory=dict)
+    point_props: dict = field(default_factory=dict)
+    line_props: dict = field(default_factory=dict)
+    box_props: dict = field(default_factory=dict)
+    ellipsoid_props: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -269,7 +278,9 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
             op = _appear_opacity(base, bool(aa), t, layer_transition, lt, layer_transition_at)
         fs.annotations.append(FrameAnnotation(
             src.name, src.color, op, src.points, src.lines, src.boxes, src.ellipsoids,
-            src.point_radius_nm, src.line_radius_nm))
+            src.point_radius_nm, src.line_radius_nm,
+            src.shader, dict(src.shader_controls), dict(src.point_props),
+            dict(src.line_props), dict(src.box_props), dict(src.ellipsoid_props)))
     return fs
 
 

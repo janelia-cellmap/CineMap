@@ -627,8 +627,15 @@ class RenderWorker:
         becomes a distinct asset."""
         import hashlib
 
+        # The shader, its controls and the per-annotation properties all change the baked
+        # vertex colours, so they belong in the key -- otherwise an asset coloured by the
+        # old flat-colour path gets reused and the shader looks like it did nothing.
         sig = json.dumps([an.name, an.color, an.points, an.lines, an.boxes, an.ellipsoids,
-                          an.point_radius_nm, an.line_radius_nm], sort_keys=True)
+                          an.point_radius_nm, an.line_radius_nm,
+                          getattr(an, "shader", ""), getattr(an, "shader_controls", {}),
+                          getattr(an, "point_props", {}), getattr(an, "line_props", {}),
+                          getattr(an, "box_props", {}),
+                          getattr(an, "ellipsoid_props", {})], sort_keys=True)
         return f"ann_{hashlib.md5(sig.encode()).hexdigest()[:10]}"
 
     def _extent_for_layer(self, name: str, kfs):
@@ -737,12 +744,45 @@ class RenderWorker:
             return str(out)
         prims = {"points": an.points, "lines": an.lines, "boxes": an.boxes,
                  "ellipsoids": an.ellipsoids}
-        mesh = annotations_to_mesh(prims, an.color, an.point_radius_nm, an.line_radius_nm)
+        mesh = annotations_to_mesh(prims, an.color, an.point_radius_nm, an.line_radius_nm,
+                                   styles=self._ann_styles(an))
         if mesh is None:
             return None
         os.makedirs(out.parent, exist_ok=True)
         _export_mesh_npz(mesh, out)
         return str(out)
+
+    def _ann_styles(self, an) -> dict | None:
+        """Per-primitive RGBA from the layer's annotation shader, or None for the flat
+        colour. Each primitive kind is shaded separately because neuroglancer's setters
+        are kind-specific (`setPointMarkerColor` vs `setEllipsoidFillColor`), and each
+        kind has its own property arrays."""
+        from ..data.ng_shader import shade_annotations
+
+        shader = getattr(an, "shader", "")
+        if not shader:
+            return None                      # default shader == the flat annotationColor
+        counts = {"point": len(an.points), "line": len(an.lines),
+                  "box": len(an.boxes), "ellipsoid": len(an.ellipsoids)}
+        props_for = {"point": getattr(an, "point_props", {}),
+                     "line": getattr(an, "line_props", {}),
+                     "box": getattr(an, "box_props", {}),
+                     "ellipsoid": getattr(an, "ellipsoid_props", {})}
+        controls = getattr(an, "shader_controls", {}) or {}
+        styles: dict = {}
+        for kind, n in counts.items():
+            if not n:
+                continue
+            shaded, warn = shade_annotations(shader, props_for[kind], an.color,
+                                             controls, count=n)
+            if warn:
+                self._warn_once(
+                    f"annshader:{an.name}",
+                    f"[worker] annotation {an.name}: shader not applied ({warn}); "
+                    f"using the flat annotationColor")
+                return None
+            styles[kind] = shaded[kind]
+        return styles or None
 
     # rough draco bytes per vertex, only used to turn the layer vertex budget into a
     # byte ceiling for the per-chunk selection (raise tolerance if a frame is over).

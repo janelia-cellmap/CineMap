@@ -129,6 +129,15 @@ class AnnotationInstance(BaseModel):
     ellipsoids: list[dict] = Field(default_factory=list)            # [{center, radii}, ...]
     point_radius_nm: float = 80.0
     line_radius_nm: float = 40.0
+    # NG annotation `shader` + `shaderControls`. The default is `setColor(defaultColor())`,
+    # i.e. the flat `color` above; a custom one can colour each annotation from its own
+    # properties, which are captured per primitive below (same order as the lists above).
+    shader: str = ""
+    shader_controls: dict = Field(default_factory=dict)
+    point_props: dict[str, list] = Field(default_factory=dict)
+    line_props: dict[str, list] = Field(default_factory=dict)
+    box_props: dict[str, list] = Field(default_factory=dict)
+    ellipsoid_props: dict[str, list] = Field(default_factory=dict)
 
 
 class Lighting(BaseModel):

@@ -249,12 +249,19 @@ def _annotations_from_view(project: Project, st: dict) -> list[AnnotationInstanc
         prims = _ann.parse_inline(layer, vox, perm)
         if not _ann.has_geometry(prims):
             continue
+        props = prims.get("props") or {}
         out.append(AnnotationInstance(
             name=layer.get("name", "annotations"),
             color=_hex_to_rgb(layer.get("annotationColor", "#ffff4d")),
             visible=layer.get("visible", True) is not False,
             points=prims["points"], lines=prims["lines"],
-            boxes=prims["boxes"], ellipsoids=prims["ellipsoids"]))
+            boxes=prims["boxes"], ellipsoids=prims["ellipsoids"],
+            shader=layer.get("shader") or "",
+            shader_controls=dict(layer.get("shaderControls") or {}),
+            point_props=props.get("points") or {},
+            line_props=props.get("lines") or {},
+            box_props=props.get("boxes") or {},
+            ellipsoid_props=props.get("ellipsoids") or {}))
     return out
 
 
