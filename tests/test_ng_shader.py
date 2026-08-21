@@ -84,11 +84,19 @@ def test_window_is_ignored():
     np.testing.assert_array_equal(out_w, out_plain)
 
 
-def test_legacy_bare_array_shader_controls():
+def test_bare_array_shader_controls_are_ignored_like_neuroglancer():
+    """A bare `[lo, hi]` instead of `{"range": [lo, hi]}` must NOT change the image.
+
+    Neuroglancer's parseImageInvlerpParameters calls verifyObject first, which throws on
+    an array, and restoreState swallows the error — so the control keeps its default.
+    Confirmed against a live viewer (spikes/ng_parity/shader_parity.py): neuroglancer
+    renders the identity ramp for this input, not a [50,150] window.
+    """
     data = np.array([[0, 100, 200]], dtype=np.uint8)
     out, _ = ns.shade(ns.from_layer({"shaderControls": {"normalized": [50, 150]}},
                                     np.uint8), data)
-    np.testing.assert_array_equal(out[..., 0], _u8(_invlerp(data, 50, 150)))
+    plain, _ = ns.shade(ns.from_layer({}, np.uint8), data)
+    np.testing.assert_array_equal(out, plain)
 
 
 def test_inverted_range_inverts_the_image():

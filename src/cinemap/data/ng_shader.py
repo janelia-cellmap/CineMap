@@ -209,9 +209,15 @@ def apply_shader_controls(controls: dict[str, Control], shader_controls: dict | 
                           dtype) -> dict[str, Control]:
     """Overlay the state's `shaderControls` JSON onto the declared defaults.
 
-    An invlerp entry is normally `{"range": [lo, hi], "window": [...]}`; older states
-    write a bare `[lo, hi]`. Only `range` is read — `window` is the slider's zoom level
-    in the UI and has no effect on rendered pixels.
+    An invlerp entry is `{"range": [lo, hi], "window": [...]}`. Only `range` is read —
+    `window` is the slider's zoom level in the UI and has no effect on rendered pixels.
+
+    A bare `[lo, hi]` array is DISCARDED, matching neuroglancer. Its
+    `parseImageInvlerpParameters` starts with `verifyObject`, which rejects arrays
+    (util/json.ts), and `ShaderControlState.restoreState` swallows that error
+    (shader_ui_controls.ts:1783) — so such an entry leaves the control at its default.
+    Honoring it would make us apply a contrast window neuroglancer itself is ignoring;
+    verified against a live viewer by spikes/ng_parity/shader_parity.py.
     """
     if not shader_controls:
         return controls
@@ -229,13 +235,13 @@ def apply_shader_controls(controls: dict[str, Control], shader_controls: dict | 
                 cur = Control(name, "checkbox", raw)
             elif isinstance(raw, str):
                 cur = Control(name, "color", _parse_color(raw))
-            elif isinstance(raw, (list, tuple)) and len(raw) == 2:
-                cur = Control(name, "invlerp", default_range_for(dtype))
             else:
                 continue
         if cur.kind == "invlerp":
-            rng = raw.get("range") if isinstance(raw, dict) else raw
-            clamp = raw.get("clamp", cur.clamp) if isinstance(raw, dict) else cur.clamp
+            if not isinstance(raw, dict):
+                continue                      # bare array / scalar: neuroglancer ignores it
+            rng = raw.get("range")
+            clamp = raw.get("clamp", cur.clamp)
             if isinstance(rng, (list, tuple)) and len(rng) >= 2:
                 cur = Control(name, "invlerp", (float(rng[0]), float(rng[1])),
                               clamp=bool(clamp))
