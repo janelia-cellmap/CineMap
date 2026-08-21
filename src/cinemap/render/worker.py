@@ -430,8 +430,16 @@ class RenderWorker:
 
         # `decode2` versions the mesh decoder: bump it to invalidate combined-layer assets
         # cached from an older (buggy) decode so a re-render can't reuse stale geometry.
+        # The skeleton shader is part of the key because it decides the per-edge colors
+        # baked into the .npz; without it, assets colored by the old flat-color fallback
+        # would be reused and the shader fix would look like it did nothing.
+        src = next((m for m in self.manifest.meshes if m.name == mesh_name), None)
+        # md5, not hash(): str.__hash__ is salted per process, so a builtin hash here
+        # would change the asset name on every restart and defeat the cache entirely.
+        skel_sig = hashlib.md5(((src.skeleton_shader or "") if src else "").encode()
+                               ).hexdigest()[:8]
         sig = (",".join(map(str, sorted(ids))) + "|" + str(color_key) + "|"
-               + self._lod_tag_for(nmpp) + "|decode4")
+               + self._lod_tag_for(nmpp) + "|decode4|skel:" + skel_sig)
         return f"{mesh_name}_{hashlib.md5(sig.encode()).hexdigest()[:8]}"
 
     def _clip_from_sweeps(self, layer_name: str, t: float) -> dict | None:

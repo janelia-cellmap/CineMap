@@ -101,7 +101,9 @@ CASES = [
     ("uint8 emitRGBA",              np.uint8,  {"shader": RGBA_SHADER}),
     ("uint16 default shader",       np.uint16, {}),
     ("uint16 range [1000,40000]",   np.uint16, {"shaderControls": {"normalized": {"range": [1000, 40000]}}}),
-    ("uint8 opacity 0.5",           np.uint8,  {"opacity": 0.5}),
+    ("uint8 opacity 0.5 == full",   np.uint8,  {"opacity": 0.5}),
+    ("uint8 opacity 0.25 == full",  np.uint8,  {"opacity": 0.25}),
+    ("uint8 opacity 0 -> hidden",   np.uint8,  {"opacity": 0.0}),
 ]
 
 
@@ -112,13 +114,22 @@ def expected_row(layer: dict, data_row: np.ndarray) -> tuple[np.ndarray, str]:
     return rgb[0], warn
 
 
-def composite(rgb: np.ndarray, opacity: float) -> np.ndarray:
-    """Neuroglancer blends the layer over the cross-section background in the framebuffer,
-    i.e. on the shader's own display-referred values, not in linear light."""
-    if opacity >= 1.0:
+def composite(rgb: np.ndarray, layer: dict) -> np.ndarray:
+    """Apply what neuroglancer's `opacity` ACTUALLY does, per ng_shader.
+
+    Not an alpha blend. The bottom-most image layer is drawn with GL blending disabled,
+    so its opacity never modulates RGB; the panel then shows the background only where
+    alpha is exactly 0. This function deliberately calls the production rule so a change
+    to it is checked against the live viewer rather than against a second copy of the
+    assumption.
+    """
+    eff = ng_shader.effective_image_opacity({"layers": [{**layer, "type": "image",
+                                                         "name": "em"}]},
+                                            {**layer, "type": "image", "name": "em"})
+    if eff >= 1.0:
         return rgb
     bg = np.array(BG, dtype=np.float64)
-    return np.clip(rgb * opacity + bg * (1.0 - opacity) + 0.5, 0, 255).astype(np.uint8)
+    return np.clip(rgb * eff + bg * (1.0 - eff) + 0.5, 0, 255).astype(np.uint8)
 
 
 def contact_sheet(rows: list[tuple[str, np.ndarray, np.ndarray]], path: Path) -> None:
@@ -138,23 +149,19 @@ def contact_sheet(rows: list[tuple[str, np.ndarray, np.ndarray]], path: Path) ->
     img.save(path)
 
 
-def main() -> int:
-    import neuroglancer
+def run_dtype(neuroglancer, dtype, cases, sheet) -> int:
+    """Run every case for one dtype in its own viewer + browser session.
+
+    One session per dtype, not one for everything: repointing a layer at a DIFFERENT
+    LocalVolume mid-session makes `viewer.screenshot` block forever waiting on chunk
+    statistics that never settle. Switching shader/opacity on a FIXED source is fine, so
+    grouping by dtype keeps this to one browser launch per dtype.
+    """
     import neuroglancer.webdriver
 
-    neuroglancer.set_server_bind_address("127.0.0.1")
     viewer = neuroglancer.Viewer()
     dims = neuroglancer.CoordinateSpace(names=["x", "y", "z"], units="nm", scales=[1, 1, 1])
-    volumes = {dt: neuroglancer.LocalVolume(data=ramp(dt), dimensions=dims)
-               for dt in {c[1] for c in CASES}}
-    # Layers are built from raw JSON, exactly as a captured state stores them. The python
-    # wrapper's setters reject the legacy bare-array `shaderControls` form that the web
-    # frontend still accepts, and that form is one of the things we need to verify.
-    sources = {}
-    for dt, vol in volumes.items():
-        with viewer.txn() as s:
-            s.layers["em"] = neuroglancer.ImageLayer(source=vol)
-        sources[dt] = viewer.state.layers["em"].source[0].url
+    volume = neuroglancer.LocalVolume(data=ramp(dtype), dimensions=dims)
 
     with viewer.txn() as s:
         s.dimensions = dims
@@ -165,47 +172,75 @@ def main() -> int:
         s.show_axis_lines = False
         s.show_scale_bar = False
         s.show_default_annotations = False
+        s.layers["em"] = neuroglancer.ImageLayer(source=volume)
+    source_url = viewer.state.layers["em"].source[0].url
 
     driver = neuroglancer.webdriver.Webdriver(
         viewer, headless=False, browser="firefox",
         browser_binary_path=firefox_binary(), window_size=(600, 600), print_logs=False)
 
     failures = 0
-    sheet: list[tuple[str, np.ndarray, np.ndarray]] = []
     try:
-        for name, dtype, layer in CASES:
-            layer_json = {"type": "image", "source": sources[dtype], **layer}
+        for name, layer in cases:
+            # Layers are built from raw JSON, exactly as a captured state stores them. The
+            # python wrapper's setters reject the bare-array `shaderControls` form, and how
+            # neuroglancer treats that form is one of the things we need to observe.
+            layer_json = {"type": "image", "source": source_url, **layer}
             with viewer.txn() as s:
                 s.layers["em"] = neuroglancer.viewer_state.ImageLayer(json_data=layer_json)
 
             got = np.asarray(viewer.screenshot(size=(N, N)).screenshot.image_pixels)[N // 2, :, :3]
+            if layer.get("opacity") == 0.0:
+                # The background SHOWING is the expected result here, not a load failure.
+                hidden = bool((got == np.array(BG)).all())
+                print(f"{'PASS' if hidden else 'FAIL'}  {name:<32} "
+                      f"background shown: {hidden}")
+                failures += not hidden
+                continue
             if (got == np.array(BG)).all(axis=-1).any():
                 print(f"SKIP  {name}: background showed through (chunk not loaded)")
                 failures += 1
                 continue
 
             want, warn = expected_row(layer, ramp(dtype)[:, 0, 0])
-            want = composite(want, layer.get("opacity", 1.0))
+            want = composite(want, layer)
             diff = np.abs(got.astype(int) - want.astype(int))
             ok = diff.max() <= 1                    # 1/255 for float->byte rounding
             failures += not ok
             note = f"  [fallback: {warn}]" if warn else ""
             print(f"{'PASS' if ok else 'FAIL'}  {name:<32} max|d|={diff.max():3}  "
-                  f"mean|d|={diff.mean():5.2f}  bias={(got.astype(int) - want).mean():+6.2f}{note}")
+                  f"mean|d|={diff.mean():5.2f}  bias={(got.astype(int) - want).mean():+6.2f}{note}",
+                  flush=True)
             sheet.append((name, got, want))
             if not ok:
                 bad = int(np.argmax(diff.max(axis=-1)))
                 print(f"        worst at x={bad}: ng={got[bad].tolist()} ours={want[bad].tolist()}")
     finally:
-        # Written here, not after the loop: a case that hangs still leaves the strips for
-        # every case that did complete, which is what makes this useful while iterating.
+        driver.driver.quit()
+    return failures
+
+
+def main() -> int:
+    import neuroglancer
+
+    neuroglancer.set_server_bind_address("127.0.0.1")
+    by_dtype: dict[type, list] = {}
+    for name, dtype, layer in CASES:
+        by_dtype.setdefault(dtype, []).append((name, layer))
+
+    failures = 0
+    sheet: list[tuple[str, np.ndarray, np.ndarray]] = []
+    try:
+        for dtype, cases in by_dtype.items():
+            failures += run_dtype(neuroglancer, dtype, cases, sheet)
+    finally:
+        # Written even on a hang/abort, so the strips for completed cases survive.
         if sheet:
             out = (Path(sys.argv[1]) if len(sys.argv) > 1
                    else REPO / "spikes" / "ng_parity" / "out" / "parity.png")
             out.parent.mkdir(parents=True, exist_ok=True)
             contact_sheet(sheet, out)
             print(f"contact sheet: {out}")
-        driver.driver.quit()
 
     print(f"\n{len(CASES) - failures}/{len(CASES)} cases match neuroglancer")
     return 1 if failures else 0

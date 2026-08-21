@@ -367,3 +367,119 @@ def test_segmentation_layers_are_not_image_render_layers():
     seg = {"type": "segmentation", "name": "seg"}
     em = {"type": "image", "name": "em", "opacity": 0.5}
     assert ns.effective_image_opacity(_state(seg, em), em) == 1.0
+
+
+# ------------------------------------------------- full-GLSL shaders (functions, locals)
+# Real neuroglancer shaders are not single expressions: they define helper functions,
+# declare `const` coefficient vectors, and compute locals before emitting. The cellmap
+# skeleton shaders do all three, which is why matching shader TEMPLATES lost their color.
+
+TURBO = """
+#uicontrol float minRadiusNm slider(min=1.0, max=300.0, step=1.0, default=30.0)
+#uicontrol float maxRadiusNm slider(min=100.0, max=3000.0, step=10.0, default=1300.0)
+
+vec3 turbo(float x) {
+  x = clamp(x, 0.0, 1.0);
+  const vec4 kRed = vec4(0.13572138, 4.61539260, -42.66032258, 132.13108234);
+  const vec4 kGreen = vec4(0.09140261, 2.19418839, 4.84296658, -14.18503333);
+  const vec4 kBlue = vec4(0.10667330, 12.64194608, -60.58204836, 110.36276771);
+  const vec2 kRed2 = vec2(-152.94239396, 59.28637943);
+  const vec2 kGreen2 = vec2(4.27729857, 2.82956604);
+  const vec2 kBlue2 = vec2(-89.90310912, 27.34824973);
+  vec4 v4 = vec4(1.0, x, x * x, x * x * x);
+  vec2 v2 = v4.zw * v4.z;
+  return clamp(vec3(dot(v4, kRed) + dot(v2, kRed2),
+                    dot(v4, kGreen) + dot(v2, kGreen2),
+                    dot(v4, kBlue) + dot(v2, kBlue2)), 0.0, 1.0);
+}
+
+void main() {
+  float radiusNm = max(prop_radius(), 0.001);
+  float lo = log(max(minRadiusNm, 0.001));
+  float hi = log(max(maxRadiusNm, minRadiusNm + 0.001));
+  float t = clamp((log(radiusNm) - lo) / (hi - lo), 0.0, 1.0);
+  emitRGB(turbo(t));
+}
+"""
+
+
+def test_shader_property_names_finds_prop_accessors():
+    assert ns.shader_property_names(TURBO) == {"radius"}
+    assert ns.shader_property_names("void main(){emitGrayscale(0.5);}") == set()
+
+
+def test_turbo_skeleton_shader_evaluates():
+    """The exact shader shape that used to fall back to one flat color."""
+    radii = np.array([10.0, 30.0, 100.0, 300.0, 1000.0, 1300.0, 5000.0])
+    rgb, warn = ns.shade_properties(TURBO, {"radius": radii})
+    assert warn == "", warn
+    assert rgb.shape == (7, 3)
+    # turbo runs dark blue -> cyan -> yellow -> red as t goes 0..1
+    assert rgb[2][2] > rgb[2][0]        # 100nm: blue-ish channel dominates red
+    assert rgb[4][0] > rgb[4][2]        # 1000nm: red channel dominates blue
+    # clamped at both ends of [minRadiusNm, maxRadiusNm]
+    np.testing.assert_array_equal(rgb[0], rgb[1])       # 10nm and 30nm both clamp to t=0
+    np.testing.assert_array_equal(rgb[5], rgb[6])       # 1300nm and 5000nm both clamp to t=1
+    assert len(np.unique(rgb, axis=0)) >= 5             # genuinely varying, not flat
+
+
+def test_slider_controls_reach_a_property_shader():
+    """Narrowing the radius window must move the colors, or the sliders are decorative."""
+    radii = np.array([50.0, 100.0, 200.0])
+    a, _ = ns.shade_properties(TURBO, {"radius": radii})
+    b, warn = ns.shade_properties(
+        TURBO, {"radius": radii}, {"minRadiusNm": 40.0, "maxRadiusNm": 220.0})
+    assert warn == ""
+    assert not np.array_equal(a, b)
+
+
+def test_user_function_and_locals_in_an_image_shader():
+    """The same machinery has to work for image layers, not just skeletons."""
+    src = """
+#uicontrol invlerp normalized
+float boost(float v) { float k = v * v; return k; }
+void main() { emitGrayscale(boost(normalized())); }
+"""
+    data = np.array([[0, 128, 255]], dtype=np.uint8)
+    out, warn = ns.shade(ns.from_layer({"shader": src}, np.uint8), data)
+    assert warn == ""
+    want = _u8(_invlerp(data, 0, 255) ** 2)
+    np.testing.assert_array_equal(out[..., 0], want)
+
+
+def test_vec4_arithmetic_is_not_truncated_to_vec3():
+    """A vec4 dot product must use all four components."""
+    src = """
+#uicontrol invlerp normalized
+void main() {
+  vec4 v = vec4(1.0, 2.0, 3.0, 4.0);
+  vec4 k = vec4(0.0, 0.0, 0.0, 0.25);
+  emitGrayscale(dot(v, k));
+}
+"""
+    out, warn = ns.shade(ns.from_layer({"shader": src}, np.uint8),
+                         np.array([[0]], dtype=np.uint8))
+    assert warn == ""
+    assert out[0, 0, 0] == 255          # dot == 4*0.25 == 1.0; a vec3 truncation gives 0
+
+
+def test_mismatched_vector_widths_are_refused_not_padded():
+    """vec2 * vec3 is nonsense; padding with the last component would invent a value."""
+    with pytest.raises(ns.ShaderUnsupported):
+        ns._Expr("a * b", {"a": [1.0, 2.0], "b": [1.0, 2.0, 3.0]}).parse()
+
+
+def test_control_flow_falls_back_loudly():
+    src = """
+#uicontrol invlerp normalized
+void main() { float v = normalized(); if (v > 0.5) { v = 1.0; } emitGrayscale(v); }
+"""
+    _, warn = ns.shade(ns.from_layer({"shader": src}, np.uint8),
+                       np.array([[0, 255]], dtype=np.uint8))
+    assert warn        # falls back rather than baking a guessed branch
+
+
+def test_property_shader_reports_why_it_could_not_run():
+    rgb, warn = ns.shade_properties("void main() { emitRGB(vec3(nope())); }",
+                                    {"radius": np.array([1.0])})
+    assert warn and rgb.shape == (1, 3)

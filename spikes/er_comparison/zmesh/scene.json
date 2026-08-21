@@ -1,0 +1,66 @@
+{
+  "world": {
+    "nm_per_bu": 1000.0,
+    "background": [
+      0.015,
+      0.016,
+      0.02
+    ]
+  },
+  "lighting": {
+    "key_energy": 4500.0
+  },
+  "render": {
+    "width": 1280,
+    "height": 720,
+    "fps": 1,
+    "samples": 48,
+    "engine": "CYCLES",
+    "export_blend": false
+  },
+  "meshes": [
+    {
+      "id": "zmesh",
+      "obj_path": "/groups/cellmap/cellmap/ackermand/Programming/CineMap/spikes/er_comparison/er_955_zmesh.ply",
+      "color": [
+        0.9,
+        0.86,
+        0.86
+      ]
+    }
+  ],
+  "frames": [
+    {
+      "camera": {
+        "position_bu": [
+          125.03128312946946,
+          96.94398026685228,
+          229.21996134416207
+        ],
+        "look_at_bu": [
+          124.086515625,
+          92.081609375,
+          226.114296875
+        ],
+        "fov_rad": 0.7853981633974483,
+        "up": [
+          -0.9797509515638975,
+          0.07072914278010767,
+          0.18731113493657656
+        ]
+      },
+      "slices": [],
+      "mesh_overrides": {
+        "zmesh": {
+          "opacity": 1.0,
+          "visible": true,
+          "silhouette": 0.0
+        }
+      },
+      "index": 0
+    }
+  ],
+  "output_dir": "/groups/cellmap/cellmap/ackermand/Programming/CineMap/spikes/er_comparison/zmesh",
+  "fps": 1,
+  "export_blend": null
+}

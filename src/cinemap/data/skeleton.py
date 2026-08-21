@@ -150,6 +150,9 @@ class SkeletonLoader:
         self.radius_nm = radius_nm
         self.parent, self.subdir = self.skeleton_url.rsplit("/", 1) if self.skeleton_url else ("", "")
         self.colormap = parse_shader_colormap(shader)  # None if shader has no colormap
+        self.shader_src = shader or ""
+        self.shader_controls: dict = {}
+        self._warned = False
         self._cv = None
 
     @property
@@ -172,9 +175,22 @@ class SkeletonLoader:
         return self._cv
 
     def _edge_colors(self, skel, edges, seg_id, colorize) -> np.ndarray | None:
-        """Per-edge rgba (E,4 uint8). Uses the shader colormap on the skeleton's
-        scalar attribute when available (matching neuroglancer); otherwise the flat
-        per-segment color from `colorize`."""
+        """Per-edge rgba (E,4 uint8), matching what neuroglancer paints on the skeleton.
+
+        Preference order:
+          1. Interpret the layer's `skeletonRendering.shader` as GLSL over the skeleton's
+             own vertex properties (`prop_radius()` and friends). This handles any shader,
+             including the cellmap `turbo(log(prop_radius()))` ones.
+          2. The legacy piecewise-smoothstep colormap matcher, kept because it needs no
+             property lookup and covers the shaders it was written for.
+          3. The flat per-segment colour.
+
+        The attribute is averaged per EDGE and shaded once, rather than shading each
+        vertex: we sweep one tube per edge, so the tube gets a single colour either way.
+        """
+        rgba = self._shader_edge_colors(skel, edges)
+        if rgba is not None:
+            return rgba
         cm = self.colormap
         if cm is not None and hasattr(skel, cm.attr):
             attr = np.asarray(getattr(skel, cm.attr), dtype=np.float64).reshape(-1)
@@ -188,6 +204,43 @@ class SkeletonLoader:
             r, g, b = colorize(int(seg_id))
             return np.tile((np.array([r, g, b, 1.0]) * 255).astype(np.uint8), (len(edges), 1))
         return None
+
+    def _shader_edge_colors(self, skel, edges) -> np.ndarray | None:
+        """Run the layer's GLSL over the skeleton's vertex properties; None if we can't.
+
+        Returns None (rather than raising) whenever the shader declares no properties, the
+        skeleton is missing one it reads, or the GLSL is outside the supported subset --
+        the caller then falls back. The reason is logged ONCE per loader so a shader we
+        cannot interpret is visible in the log instead of silently rendering flat.
+        """
+        from .ng_shader import shade_properties, shader_property_names
+
+        if not self.shader_src:
+            return None
+        names = shader_property_names(self.shader_src)
+        if not names:
+            return None
+        props = {}
+        for name in names:
+            if not hasattr(skel, name):
+                self._warn_shader(f"skeleton has no vertex property {name!r}")
+                return None
+            vals = np.asarray(getattr(skel, name), dtype=np.float64).reshape(-1)
+            props[name] = (vals[edges[:, 0]] + vals[edges[:, 1]]) * 0.5   # per-edge
+        rgb, warn = shade_properties(self.shader_src, props, self.shader_controls)
+        if warn:
+            self._warn_shader(warn)
+            return None
+        rgba = np.empty((len(edges), 4), dtype=np.uint8)
+        rgba[:, :3] = rgb
+        rgba[:, 3] = 255
+        return rgba
+
+    def _warn_shader(self, msg: str) -> None:
+        if not self._warned:
+            self._warned = True
+            print(f"[skeleton] {self.subdir}: shader not applied ({msg}); "
+                  f"falling back to the flat segment color")
 
     def load_many(self, seg_ids, colorize=None, radius_nm: float | None = None) -> trimesh.Trimesh:
         """One combined tube mesh for all `seg_ids`. Colors each segment via the

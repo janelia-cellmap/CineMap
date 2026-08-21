@@ -1,0 +1,53 @@
+{
+  "bbox_xyz_nm": [
+    [
+      113148.0,
+      81404.0,
+      208380.0
+    ],
+    [
+      132604.0,
+      92668.0,
+      225788.0
+    ]
+  ],
+  "zmesh_vertices": 1135548,
+  "zmesh_faces": 2323796,
+  "shared_input_level": 4,
+  "shared_input_stride": 1,
+  "shared_input_scale_zyx_nm": [
+    128.0,
+    128.0,
+    128.0
+  ],
+  "shared_input_shape_zyx": [
+    142,
+    94,
+    158
+  ],
+  "voxel_occupied": 298673,
+  "voxel_surface_vertices": 4542192,
+  "voxel_surface_faces": 2271096,
+  "project_path": "/groups/cellmap/cellmap/ackermand/cinemap_projects2/liverzonmovie-30/project.json",
+  "keyframe_id": "kf_d241583d",
+  "camera": {
+    "position_nm": [
+      125031.28312946946,
+      96943.98026685228,
+      229219.96134416206
+    ],
+    "look_at_nm": [
+      124086.515625,
+      92081.609375,
+      226114.296875
+    ],
+    "fov_deg": 45.0,
+    "up": [
+      -0.9797509515638975,
+      0.07072914278010767,
+      0.18731113493657656
+    ]
+  },
+  "zmesh_png": "/groups/cellmap/cellmap/ackermand/Programming/CineMap/spikes/er_comparison/zmesh/frame_00000.png",
+  "voxels_png": "/groups/cellmap/cellmap/ackermand/Programming/CineMap/spikes/er_comparison/voxels/frame_00000.png"
+}
