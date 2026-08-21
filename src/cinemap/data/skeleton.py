@@ -145,13 +145,13 @@ def edges_to_tubes(verts: np.ndarray, edges: np.ndarray, radius: float,
 
 class SkeletonLoader:
     def __init__(self, skeleton_url: str = "", radius_nm: float = DEFAULT_RADIUS_NM,
-                 shader: str = ""):
+                 shader: str = "", shader_controls: dict | None = None):
         self.skeleton_url = (skeleton_url or "").rstrip("/")
         self.radius_nm = radius_nm
         self.parent, self.subdir = self.skeleton_url.rsplit("/", 1) if self.skeleton_url else ("", "")
         self.colormap = parse_shader_colormap(shader)  # None if shader has no colormap
         self.shader_src = shader or ""
-        self.shader_controls: dict = {}
+        self.shader_controls: dict = dict(shader_controls or {})
         self._warned = False
         self._cv = None
 

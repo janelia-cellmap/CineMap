@@ -436,8 +436,9 @@ class RenderWorker:
         src = next((m for m in self.manifest.meshes if m.name == mesh_name), None)
         # md5, not hash(): str.__hash__ is salted per process, so a builtin hash here
         # would change the asset name on every restart and defeat the cache entirely.
-        skel_sig = hashlib.md5(((src.skeleton_shader or "") if src else "").encode()
-                               ).hexdigest()[:8]
+        skel_spec = ((src.skeleton_shader or "")
+                     + json.dumps(src.skeleton_shader_controls, sort_keys=True)) if src else ""
+        skel_sig = hashlib.md5(skel_spec.encode()).hexdigest()[:8]
         sig = (",".join(map(str, sorted(ids))) + "|" + str(color_key) + "|"
                + self._lod_tag_for(nmpp) + "|decode4|skel:" + skel_sig)
         return f"{mesh_name}_{hashlib.md5(sig.encode()).hexdigest()[:8]}"
@@ -601,7 +602,9 @@ class RenderWorker:
                 # skeleton-only layer -> sweep skeletons into tubes
                 from ..data.skeleton import SkeletonLoader
 
-                combined = SkeletonLoader(src.skeleton_url, shader=src.skeleton_shader).load_many(
+                combined = SkeletonLoader(
+                    src.skeleton_url, shader=src.skeleton_shader,
+                    shader_controls=src.skeleton_shader_controls).load_many(
                     ids, colorize=lc.rgb)
             else:
                 combined = MeshLoader(src.mesh_url, src.label_zarr,

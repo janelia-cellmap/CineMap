@@ -33,6 +33,12 @@ def _uses_ng_shader(scene_spec: dict) -> bool:
     return bool(scene_spec.get("direction", {}).get("material", {}).get("ng_shader", True))
 
 
+# neuroglancer's perspective lighting constants (perspective_view/panel.ts:990):
+#   const ambient = 0.2; const directional = 1 - ambient;
+_NG_AMBIENT = 0.2
+_NG_DIRECTIONAL = 1.0 - _NG_AMBIENT
+
+
 def _srgb_to_linear(c):
     """sRGB (0-1) -> linear. Scalar or numpy array.
 
@@ -614,10 +620,21 @@ def _import_meshes(scene_spec: dict) -> dict:
         nt.links.new(geo.outputs["Incoming"], dotp.inputs[1])   # viewDir (toward camera)
         absd = nt.nodes.new("ShaderNodeMath"); absd.operation = "ABSOLUTE"
         nt.links.new(dotp.outputs["Value"], absd.inputs[0])
-        # facing = 1 - absCosAngle: 0 head-on, 1 at grazing.
+        # Neuroglancer scales the light vector by directionalLighting BEFORE the dot:
+        #   uLightDirection.xyz = lightDirection * (1 - ambient)   // perspective_view/panel.ts
+        #   float absCosAngle = abs(dot(normal, uLightDirection.xyz));
+        # so its `absCosAngle` is already 0.8*|dot(N, L)|, and BOTH the lighting factor and
+        # the silhouette term are defined from that scaled value. Using the raw |dot| for
+        # the silhouette (the old behaviour) made pow(1 - absCosAngle, power) far too small
+        # -- at a 60 degree normal with silhouette 4 it gave pow(0.5,4)=0.0625 where
+        # neuroglancer gives pow(0.6,4)=0.1296, i.e. half the opacity along the whole shell.
+        scaled = nt.nodes.new("ShaderNodeMath"); scaled.operation = "MULTIPLY"
+        scaled.inputs[1].default_value = _NG_DIRECTIONAL
+        nt.links.new(absd.outputs[0], scaled.inputs[0])
+        # facing = 1 - absCosAngle: ~0.2 head-on, 1 at grazing.
         facing = nt.nodes.new("ShaderNodeMath"); facing.operation = "SUBTRACT"
         facing.inputs[0].default_value = 1.0
-        nt.links.new(absd.outputs[0], facing.inputs[1])
+        nt.links.new(scaled.outputs[0], facing.inputs[1])
         # silhouetteFactor = pow(facing, cm_silh); cm_silh = 0 -> factor 1 (no effect).
         powr = nt.nodes.new("ShaderNodeMath"); powr.operation = "POWER"
         silh_v = nt.nodes.new("ShaderNodeValue"); silh_v.name = "cm_silh"
@@ -636,10 +653,9 @@ def _import_meshes(scene_spec: dict) -> dict:
             # it's exactly NG: vivid (factor<=1 -> never clips/oversaturates), camera-relative
             # shading, no cast shadows. Base Color black so lights/world don't add. NOTE: no
             # cm_emit node here -> _set_mesh_state can't reset Emission Strength (it stays 1).
-            fac = nt.nodes.new("ShaderNodeMath"); fac.operation = "MULTIPLY_ADD"
-            fac.inputs[1].default_value = 0.8                       # directionalLighting
-            fac.inputs[2].default_value = 0.2                       # ambientLighting
-            nt.links.new(absd.outputs[0], fac.inputs[0])
+            fac = nt.nodes.new("ShaderNodeMath"); fac.operation = "ADD"
+            fac.inputs[1].default_value = _NG_AMBIENT                # uLightDirection.w
+            nt.links.new(scaled.outputs[0], fac.inputs[0])           # already *directional
             emis = nt.nodes.new("ShaderNodeVectorMath"); emis.operation = "SCALE"
             nt.links.new(color_out, emis.inputs[0])
             nt.links.new(fac.outputs["Value"], emis.inputs["Scale"])

@@ -24,7 +24,10 @@ class MeshSource(BaseModel):
     mesh_url: str = ""  # multilod-draco mesh dir + segment_properties (for ids/bbox)
     label_zarr: str = ""  # OME-Zarr label volume — preferred geometry via marching cubes
     skeleton_url: str = ""  # precomputed neuroglancer_skeletons dir (rendered as tubes)
-    skeleton_shader: str = ""  # NG skeletonRendering.shader -> matched colormap on tubes
+    skeleton_shader: str = ""  # NG skeletonRendering.shader -> evaluated per skeleton vertex
+    # NG skeletonRendering.shaderControls: the shader's slider/color values. Without these
+    # a user narrowing e.g. the radius window in neuroglancer sees no change in the render.
+    skeleton_shader_controls: dict = Field(default_factory=dict)
     segment_ids: list[int] = Field(default_factory=list)
 
 

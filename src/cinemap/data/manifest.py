@@ -215,10 +215,14 @@ def analyze_state_dict(state: dict) -> Manifest:
                 mesh_url = vol_url
             if mesh_url or label_zarr or skel_url:
                 seg_ids = [int(s) for s in (layer.get("segments") or []) if str(s).isdigit()]
-                shader = (layer.get("skeletonRendering") or {}).get("shader", "") if skel_url else ""
+                skel_render = (layer.get("skeletonRendering") or {}) if skel_url else {}
+                shader = skel_render.get("shader", "")
+                shader_controls = dict(skel_render.get("shaderControls") or {})
                 meshes.append(MeshSource(name=name, mesh_url=mesh_url or "",
                                          label_zarr=label_zarr or "", skeleton_url=skel_url or "",
-                                         skeleton_shader=shader, segment_ids=seg_ids))
+                                         skeleton_shader=shader,
+                                         skeleton_shader_controls=shader_controls,
+                                         segment_ids=seg_ids))
 
     # A mesh-only layer (precomputed mesh, no label volume) can still be generated
     # cleanly from labels: borrow the label volume of a layer sharing the same
