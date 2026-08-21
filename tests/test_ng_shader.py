@@ -306,3 +306,64 @@ def test_escaped_quote_color_still_resolves():
     """A double-encoded state keeps the backslashes; the color must not fall back."""
     src = '#uicontrol vec3 c color(default=\\"red\\")\nvoid main(){ emitRGB(c); }'
     assert ns.from_layer({"shader": src}, np.uint8).controls["c"].value == (1.0, 0.0, 0.0)
+
+
+# --------------------------------------------------------------- effective opacity
+# Neuroglancer's image `opacity` does NOT scale displayed pixels for the bottom-most
+# image layer: it disables GL blending entirely for renderLayerNum 0 with the default
+# blend mode (sliceview/volume/image_renderlayer.ts:152), and the panel composites the
+# background with `if (sampledColor.a == 0.0)` rather than an alpha blend
+# (sliceview/frontend.ts:753). Measured against a live viewer: opacity 0.25/0.5/0.75/1.0
+# all render an identical full-strength ramp; only 0.0 shows the background.
+
+def _state(*layers):
+    return {"layers": list(layers)}
+
+
+def test_bottom_image_layer_ignores_opacity():
+    """The case that matters: one EM layer at neuroglancer's DEFAULT opacity of 0.5.
+
+    Taking the raw value would render every EM slice at half strength in Blender against
+    a viewer showing it whole.
+    """
+    em = {"type": "image", "name": "em"}                  # no explicit opacity -> 0.5
+    assert ns.effective_image_opacity(_state(em), em) == 1.0
+    dimmed = {"type": "image", "name": "em", "opacity": 0.25}
+    assert ns.effective_image_opacity(_state(dimmed), dimmed) == 1.0
+
+
+def test_zero_opacity_hides_the_layer():
+    """alpha == 0 is the one value the panel's if/else treats as 'show the background'."""
+    em = {"type": "image", "name": "em", "opacity": 0}
+    assert ns.effective_image_opacity(_state(em), em) == 0.0
+
+
+def test_image_layer_above_the_first_does_blend():
+    """renderLayerNum > 0 enables blending, so opacity is real for stacked image layers."""
+    em = {"type": "image", "name": "em"}
+    overlay = {"type": "image", "name": "overlay", "opacity": 0.3}
+    st = _state(em, overlay)
+    assert ns.effective_image_opacity(st, em) == 1.0
+    assert ns.effective_image_opacity(st, overlay) == 0.3
+
+
+def test_additive_blend_keeps_opacity_even_at_the_bottom():
+    """`BLEND_MODES.ADDITIVE` takes the gl.enable(BLEND) branch regardless of layer num."""
+    em = {"type": "image", "name": "em", "opacity": 0.4, "blend": "additive"}
+    assert ns.effective_image_opacity(_state(em), em) == 0.4
+
+
+def test_hidden_layers_do_not_claim_the_bottom_slot():
+    """A hidden or archived layer is not drawn, so the next one is renderLayerNum 0."""
+    hidden = {"type": "image", "name": "hidden", "visible": False}
+    em = {"type": "image", "name": "em", "opacity": 0.5}
+    assert ns.effective_image_opacity(_state(hidden, em), em) == 1.0
+    archived = {"type": "image", "name": "old", "archived": True}
+    assert ns.effective_image_opacity(_state(archived, em), em) == 1.0
+
+
+def test_segmentation_layers_are_not_image_render_layers():
+    """Only image layers occupy the image renderLayerNum sequence."""
+    seg = {"type": "segmentation", "name": "seg"}
+    em = {"type": "image", "name": "em", "opacity": 0.5}
+    assert ns.effective_image_opacity(_state(seg, em), em) == 1.0

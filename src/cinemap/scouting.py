@@ -12,6 +12,7 @@ import neuroglancer
 
 from . import operations as ops
 from .data.manifest import fetch_state
+from .data.ng_shader import effective_image_opacity
 from .models import AnnotationInstance, Camera, Keyframe, MeshInstance, Project, SlicePlane
 
 _viewer: neuroglancer.Viewer | None = None
@@ -99,19 +100,24 @@ def current_layer_colors(project: Project, st: dict | None = None) -> dict:
             for l in st.get("layers", []) if l.get("type") == "segmentation"}
 
 
-def slice_from_layer(em_name: str, layer: dict | None, **kw) -> SlicePlane:
+def slice_from_layer(em_name: str, layer: dict | None, st: dict | None = None,
+                     **kw) -> SlicePlane:
     """Build a SlicePlane carrying the layer's neuroglancer appearance.
 
     EVERY SlicePlane should be built through here. Opacity and the shader/contrast state
     used to be dropped on the floor because each construction site set only geometry, so
     the render always used opacity 1.0 and neuroglancer's default contrast no matter what
     the viewer showed. Centralizing it means a new call site can't silently regress that.
+
+    `opacity` is the EFFECTIVE opacity, not the raw layer value -- see
+    `ng_shader.effective_image_opacity`. Neuroglancer defaults image opacity to 0.5 but
+    does not blend the bottom-most image layer at all, so the raw value would render
+    every EM slice at half strength against a viewer that shows it whole.
     """
     layer = layer or {}
-    op = layer.get("opacity", 1.0)
     return SlicePlane(
         em_name=em_name,
-        opacity=float(op) if op is not None else 1.0,
+        opacity=effective_image_opacity(st, layer),
         shader=layer.get("shader") or "",
         shader_controls=dict(layer.get("shaderControls") or {}),
         **kw,
@@ -192,7 +198,7 @@ def _scene_from_view(project: Project, st: dict | None = None):
                  for l in st.get("layers", [])}
     # a "3d" layout shows no cross-section in neuroglancer, so bake no EM slice
     show_slice = layer_vis.get(em_name, True) and st.get("layout") != "3d"
-    slices = ([slice_from_layer(em_name, _layer_by_name(st, em_name),
+    slices = ([slice_from_layer(em_name, _layer_by_name(st, em_name), st,
                                 axis="z", position_nm=cam.look_at_nm[2])]
               if show_slice else [])
     prev = project.keyframes[-1].meshes if project.keyframes else None
@@ -383,22 +389,23 @@ def sync_segments(project: Project, keyframe_id: str) -> Keyframe | None:
         # neuroglancer lands on the existing slice instead of only new ones
         slices = []
         for s in kf.slices:
-            live = _layer_by_name(st, s.em_name) or {}
-            op = live.get("opacity", s.opacity)
+            live = _layer_by_name(st, s.em_name)
             # Key presence, not truthiness: if the layer is in the live state, its
             # appearance is authoritative. `or` would make clearing a custom shader or
             # resetting the contrast in neuroglancer un-syncable, since the empty value
             # would silently fall back to the stale captured one.
             in_state = s.em_name in {l.get("name") for l in st.get("layers", [])}
+            live = live or {}
             slices.append(s.model_copy(update={
                 "visible": vis.get(s.em_name, True),
-                "opacity": float(op) if op is not None else 1.0,
+                "opacity": (effective_image_opacity(st, live) if in_state
+                            else s.opacity),
                 "shader": (live.get("shader") or "") if in_state else s.shader,
                 "shader_controls": (dict(live.get("shaderControls") or {}) if in_state
                                     else dict(s.shader_controls)),
             }))
     elif vis.get(em_name, True):  # EM turned on but keyframe had no slice -> add one
-        slices = [slice_from_layer(em_name, _layer_by_name(st, em_name),
+        slices = [slice_from_layer(em_name, _layer_by_name(st, em_name), st,
                                    axis="z", position_nm=kf.camera.look_at_nm[2])]
     else:
         slices = []

@@ -605,3 +605,65 @@ def shade(layer_shader: LayerShader, data: np.ndarray) -> tuple[np.ndarray, str]
                                                      c.value, clamp=c.clamp)}
                 break
         return fb.apply(data), f"unsupported shader, using invlerp only: {e}"
+
+
+def effective_image_opacity(state: dict | None, layer: dict | None) -> float:
+    """What a neuroglancer image layer's `opacity` ACTUALLY does to displayed pixels.
+
+    Not `layer["opacity"]`. Neuroglancer disables GL blending entirely for the
+    bottom-most image render layer when its blend mode is the default:
+
+        // sliceview/volume/image_renderlayer.ts
+        if (blendModeValue === BLEND_MODES.ADDITIVE || renderLayerNum > 0) {
+          gl.enable(gl.BLEND); BLEND_FUNCTIONS.get(blendModeValue)!(gl);
+        } else {
+          gl.disable(WebGL2RenderingContext.BLEND);
+        }
+
+    So that layer's `uOpacity` reaches only the framebuffer's alpha channel and never
+    modulates its RGB. The panel then composites with an if/else, not a blend:
+
+        // sliceview/frontend.ts
+        if (sampledColor.a == 0.0) { sampledColor = uBackgroundColor; }
+        emit(sampledColor * uColorFactor, 0u);
+
+    -- so the background shows only where alpha is exactly zero. Net effect for a single
+    image layer: it renders at FULL strength for any opacity > 0, and vanishes at 0.
+
+    This matters a lot here, because neuroglancer's image `opacity` DEFAULTS to 0.5
+    (layer/image/index.ts:129). Feeding that value into Blender's alpha renders every EM
+    slice at half strength while neuroglancer shows it whole -- the long-standing
+    "EM looks much worse in Blender / we have to shift opacity to match" mismatch.
+
+    Measured against a live viewer: opacity 0.25/0.5/0.75/1.0 all render an identical
+    full-strength ramp, and only 0.0 shows the background.
+    """
+    layer = layer or {}
+    raw = layer.get("opacity", 0.5)          # neuroglancer's default, not 1.0
+    opacity = float(raw) if raw is not None else 0.5
+    if opacity <= 0.0:
+        return 0.0
+    if str(layer.get("blend", "default")).lower() == "additive":
+        return opacity                        # additive always blends, even at index 0
+    if _is_bottom_image_layer(state, layer):
+        return 1.0
+    return opacity
+
+
+def _is_bottom_image_layer(state: dict | None, layer: dict | None) -> bool:
+    """True if `layer` is the first image layer neuroglancer draws (renderLayerNum 0).
+
+    With no state to compare against we assume it is: CineMap bakes exactly one EM slice
+    per keyframe, so the single-layer case is the norm, and it is the case where getting
+    this wrong halves the EM.
+    """
+    if not state or not layer:
+        return True
+    name = layer.get("name")
+    for l in state.get("layers", []) or []:
+        if l.get("type") != "image" or l.get("archived"):
+            continue
+        if l.get("visible", True) is False:
+            continue
+        return l.get("name") == name
+    return True
