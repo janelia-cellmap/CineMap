@@ -33,14 +33,15 @@ def test_annotation_without_an_override_still_fades():
     assert _op(kfs, 1.0, "x") == pytest.approx(0.5)
 
 
-def test_an_override_cut_switches_at_the_start_of_the_move():
-    """The arrow you are travelling toward is the one you want to see on the way."""
+def test_an_override_cut_lands_on_the_destination_keyframe():
+    """A callout swap belongs to the shot it introduces: the change happens when you get
+    there, not four seconds early while the camera is still travelling."""
     on, off = _an("x", layer_transition="cut"), _an("x", visible=False,
                                                     layer_transition="cut")
-    kfs = [_kf("a", [on], hold_in_s=1.0), _kf("b", [off])]
-    assert _op(kfs, 0.5, "x") == 1.0        # still on while dwelling on the source
-    assert _op(kfs, 1.0, "x") == 0.0        # ... and gone the instant the move starts
-    assert _op(kfs, 2.0, "x") == 0.0
+    kfs = [_kf("a", [on]), _kf("b", [off])]
+    assert _op(kfs, 0.0, "x") == 1.0
+    assert _op(kfs, 1.9, "x") == 1.0        # held, at full strength, through the move
+    assert _op(kfs, 2.0, "x") == 0.0        # ... and off on arrival
 
 
 def test_an_override_cut_point_is_configurable():
@@ -51,10 +52,17 @@ def test_an_override_cut_point_is_configurable():
     assert _op(kfs, 1.6, "x") == 0.0        # 80%
 
 
-def test_a_layer_appearing_mid_movie_cuts_too():
+def test_a_layer_appearing_mid_movie_pops_on_when_it_arrives():
     kfs = [_kf("a"), _kf("b", [_an("x", layer_transition="cut")])]
-    assert _op(kfs, 0.01, "x") == 1.0
-    assert _op(kfs, 1.9, "x") == 1.0
+    assert _op(kfs, 1.9, "x") == 0.0
+    assert _op(kfs, 2.0, "x") == 1.0
+
+
+def test_a_layer_leaving_is_gone_as_the_camera_moves_off():
+    """The mirror image: what a shot introduced does not ride along into the next move."""
+    kfs = [_kf("a", [_an("x", layer_transition="cut")], hold_in_s=1.0), _kf("b")]
+    assert _op(kfs, 0.5, "x") == 1.0
+    assert _op(kfs, 1.0, "x") == 0.0
 
 
 def test_the_override_is_per_layer_not_per_keyframe():
@@ -62,8 +70,9 @@ def test_the_override_is_per_layer_not_per_keyframe():
     kfs = [_kf("a", [_an("arrow", layer_transition="cut"), _an("mesh outline")]),
            _kf("b", [_an("arrow", visible=False, layer_transition="cut"),
                      _an("mesh outline", visible=False)])]
-    assert _op(kfs, 1.0, "arrow") == 0.0
-    assert _op(kfs, 1.0, "mesh outline") == pytest.approx(0.5)
+    assert _op(kfs, 1.0, "arrow") == 1.0                      # cut: no half-arrow
+    assert _op(kfs, 2.0, "arrow") == 0.0
+    assert _op(kfs, 1.0, "mesh outline") == pytest.approx(0.5)  # fade: halfway out
 
 
 def test_cut_annotations_do_not_drag_the_meshes_or_slices_with_them():
@@ -106,10 +115,13 @@ def test_em_cut_can_hold_the_plane_to_the_end_of_the_move():
     assert _slice_op(kfs, 1.9) == 1.0
 
 
-def test_em_cut_also_governs_an_arriving_plane():
+def test_em_cut_pops_an_arriving_plane_on_at_its_keyframe():
+    """Turning the EM on at the start of the move put a cross-section on screen four
+    seconds before the shot that wanted it."""
     kfs = [_kf("a"), _kf("b", em_transition="cut",
                          slices=[SlicePlane(em_name="em", axis="z", position_nm=0.0)])]
-    assert _slice_op(kfs, 0.01) == 1.0       # on, full strength, no ramp
+    assert _slice_op(kfs, 1.9) == 0.0
+    assert _slice_op(kfs, 2.0) == 1.0        # on, full strength, no ramp
 
 
 def test_em_cut_between_two_planes_still_switches_at_the_keyframe():

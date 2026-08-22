@@ -187,15 +187,28 @@ def _target_layer_active(layer_transition: str, layer_t: float, layer_transition
     return layer_transition == "cut" and layer_t >= _layer_cut_at(layer_transition_at)
 
 
-def _an_transition(an, layer_transition: str, layer_transition_at: float) -> tuple[str, float]:
+def _cut_at(explicit: float | None, has_a: bool, has_b: bool, inherited: float) -> float:
+    """When a hard-cut layer switches, as a fraction of the camera move.
+
+    Direction matters, and both halves come straight from how the edit reads on screen:
+    something that ARRIVES pops on when you get to the keyframe that has it (turning the
+    EM on the moment the camera left the previous shot showed it four seconds early),
+    while something that LEAVES is gone as the camera moves away (scan, then rotate: the
+    plane should not ride along through the move). A layer present on both sides is a
+    value change, not an appearance, so it follows the keyframe's own cut point.
+    """
+    if explicit is not None:
+        return _layer_cut_at(explicit)
+    if has_a and has_b:
+        return _layer_cut_at(inherited)
+    return 1.0 if has_b else 0.0
+
+
+def _an_transition(an, layer_transition: str) -> tuple[str, float | None]:
     """An annotation layer may override the keyframe's layer_transition (see
-    AnnotationInstance.layer_transition). An override cut defaults to switching at the
-    START of the move; an inherited one keeps the keyframe's own cut point."""
+    AnnotationInstance.layer_transition), and may pin its own cut point."""
     lt = getattr(an, "layer_transition", None) or layer_transition
-    at = getattr(an, "layer_transition_at", None)
-    if at is None:
-        at = layer_transition_at if lt == layer_transition else 0.0
-    return lt, _layer_cut_at(at)
+    return lt, getattr(an, "layer_transition_at", None)
 
 
 def _blend_value(av: float, bv: float, t: float, layer_transition: str,
@@ -331,12 +344,10 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
         b_sl = {(s.em_name, s.axis): s for s in b.slices}
         matched = [(a_sl.get(k), b_sl.get(k))
                    for k in dict.fromkeys(list(a_sl) + list(b_sl))]
-    # An EM cut has its own switch point: plane-to-plane it keeps the keyframe's timing,
-    # but a plane that ARRIVES or LEAVES snaps at the start of the move by default — an EM
-    # scan that ends before a rotation should be off the moment the camera moves, not
-    # hang around as a ghost. An explicit em_transition_at always wins.
+    # An EM cut has its own switch point, independent of the meshes': plane-to-plane it
+    # keeps the keyframe's timing, while a plane that arrives or leaves follows _cut_at.
+    # An explicit em_transition_at always wins.
     em_at = layer_transition_at if em_transition_at is None else em_transition_at
-    em_gone_at = _layer_cut_at(0.0 if em_transition_at is None else em_transition_at)
     em_snap = lt >= _layer_cut_at(em_at)
     n_slot: dict[str, int] = {}
     for sa, sb in matched:
@@ -382,7 +393,9 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
             # "cut" the plane is simply present or absent, never a ghost dissolving over
             # the move. ("glide" has nothing to glide from, so it falls back to the fade.)
             if em_cut:
-                op = _appear_opacity(base, bool(sa), t, "cut", lt, em_gone_at)
+                op = _appear_opacity(base, bool(sa), t, "cut", lt,
+                                     _cut_at(em_transition_at, bool(sa), bool(sb),
+                                             layer_transition_at))
             else:
                 op = _appear_opacity(base, bool(sa), t, layer_transition, lt,
                                      layer_transition_at)
@@ -442,7 +455,9 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
     b_an = {an.name: an for an in b.annotations}
     for key in dict.fromkeys(list(a_an) + list(b_an)):
         aa, ab = a_an.get(key), b_an.get(key)
-        an_lt, an_at = _an_transition(ab or aa, layer_transition, layer_transition_at)
+        an_lt, an_pin = _an_transition(ab or aa, layer_transition)
+        an_at = _cut_at(an_pin, bool(aa), bool(ab),
+                        layer_transition_at if an_lt == layer_transition else 1.0)
         an_target = _target_layer_active(an_lt, lt, an_at)
         src = aa if (an_lt == "cut" and not an_target and aa) else (ab or aa)
         if aa and ab:

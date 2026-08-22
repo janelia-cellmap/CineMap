@@ -132,6 +132,9 @@
   #transEdit .te-row { display:flex; gap:6px; justify-content:flex-end; margin-top:9px; }
   #transEdit .te-hint { color:var(--mut); font-size:10px; margin-top:7px; }
   .msg { font-size:12px; color:var(--mut); }
+  /* a caption that names the group of controls after it (e.g. the arrow settings), so a
+     row of bare number boxes isn't left to be decoded from tooltips alone */
+  .grp { font-size:12px; color:var(--mut); font-weight:600; margin-left:6px; cursor:help; }
   /* hover the before/after strip -> big side-by-side overlay (see #lookZoom) */
   #lookCompare { cursor: zoom-in; }
 </style>
@@ -209,18 +212,19 @@
           <option value="single">single</option>
           <option value="chunk">per-chunk (exp)</option>
         </select></label>
-      <input id="arrowLayers" placeholder="arrows: auto" style="width:104px" list="arrowLayerList"
-        onchange="saveArrowLayers()"
-        title="Annotation layers whose LINE annotations render as 3D arrows — draw a line in neuroglancer (click the tail, click the tip) and it becomes an arrow pointing at the tip. Comma-separated layer names; leave blank to use any layer with &quot;arrow&quot; in its name." />
+      <span class="grp" title="Callout arrows. Draw a LINE annotation in neuroglancer — first click is the tail, second click is the tip — and that layer renders as a 3D arrow pointing at the tip. The three boxes to the right are: which layers, how thick, how big on screen.">➔ arrows:</span>
+      <label title="WHICH LAYERS become arrows. Comma-separated neuroglancer layer names. Blank = automatic: any annotation layer with &quot;arrow&quot; in its name. The text to the right lists every annotation layer and marks the ones that are currently arrows (➔).">layers
+        <input id="arrowLayers" placeholder="auto: named *arrow*" style="width:110px" list="arrowLayerList"
+          onchange="saveArrowLayers()" /></label>
       <datalist id="arrowLayerList"></datalist>
-      <input id="arrowScale" type="number" min="0.1" max="20" step="0.25" value="1" style="width:52px"
-        onchange="saveArrowLayers()"
-        title="Arrow weight — multiplies shaft and head thickness relative to the arrow&#39;s own length (1 = shaft radius 3% of the length; try 2–4 for a bold callout). Independent of &#39;lock&#39;, which sets how much of the frame the arrow spans." />
-      <label class="chk" title="Lock arrows to the VIEW: each frame the arrow is scaled about its tip so it always covers the same fraction of the frame — visible when you're zoomed out, not ginormous when you're zoomed in. Off = literal nm size."><input id="arrowLock" type="checkbox" onchange="saveArrowLayers()" /> lock</label>
-      <input id="arrowFrac" type="number" min="0.02" max="1" step="0.05" value="0.25" style="width:52px"
-        onchange="saveArrowLayers()"
-        title="With &#39;lock&#39; on: the fraction of the FRAME HEIGHT an arrow spans, at every zoom. 0.25 = a quarter of the frame; 0.5 fills half of it." />
-      <span id="arrowStatus" class="msg" title="which annotation layers are currently rendering their lines as arrows"></span>
+      <label title="THICKNESS ONLY — shaft and head weight as a fraction of the arrow&#39;s own length (1 = shaft radius 3% of the length; 2–4 = bold marker; below 0.5 goes hairline). It does NOT change how long the arrow is or how much of the frame it covers — that is &#39;screen size&#39; to the right.">thick
+        <input id="arrowScale" type="number" min="0.1" max="20" step="0.25" value="1" style="width:52px"
+          onchange="saveArrowLayers()" /></label>
+      <label class="chk" title="SAME APPARENT SIZE AT EVERY ZOOM. On: each frame the arrow is rescaled about its tip (so the point stays on the structure) to cover the fraction of the frame set to the right — readable in a wide establishing shot, not ginormous on a close-up. Off: the arrow is exactly as long as the line you drew in neuroglancer, so it shrinks as you pull back."><input id="arrowLock" type="checkbox" onchange="saveArrowLayers()" /> fixed size</label>
+      <label title="How much of the FRAME HEIGHT one arrow spans when &#39;fixed size&#39; is on: 0.25 = a quarter of the frame, 0.5 = half. Lower it for a shot that reveals several arrows at once.">screen
+        <input id="arrowFrac" type="number" min="0.02" max="1" step="0.05" value="0.25" style="width:52px"
+          onchange="saveArrowLayers()" /></label>
+      <span id="arrowStatus" class="msg" title="Every annotation layer on the timeline: ➔ = its lines render as arrows, · = it renders as plain tubes. (n lines) is how many arrows that layer will draw."></span>
       <button id="previewBtn" onclick="startRender('preview')">▷ Preview</button>
       <label title="preview renders at fps ÷ this">1/</label><input id="ratio" value="10" style="width:44px" />
       <button id="cancelBtn" onclick="cancelRender()" style="display:none;background:#7d2e2e;border-color:transparent;color:#fff">■ Cancel</button>
@@ -743,9 +747,9 @@ function openTransEdit(e, id) {
     </select></label>
     <label>layer switch <input id="teLayerAt" type="number" min="0" max="100" step="5" value="${Math.round(la*100)}" />%</label>
     <label>EM slice <select id="teEmTrans">
-      ${[['glide','scroll / rotate'],['fade','cross-fade'],['cut','cut']].map(([v,t])=>`<option value="${v}"${em===v?' selected':''}>${t}</option>`).join('')}
+      ${[['glide','glide — scroll/rotate the plane'],['fade','cross-fade between planes'],['cut','cut — pop on/off, no dissolve']].map(([v,t])=>`<option value="${v}"${em===v?' selected':''}>${t}</option>`).join('')}
     </select></label>
-    <label title="Where in this move an EM cut happens. Blank = automatic: a plane that turns on or off does it the instant the move starts (scan, then rotate away with the slice already gone), a plane-to-plane cut lands on the keyframe.">EM switch <input id="teEmAt" type="number" min="0" max="100" step="5" placeholder="auto" value="${emAt(k)}" />%</label>
+    <label title="Where in this move an EM cut happens, as a percent of the move. Blank = automatic, which is almost always what you want: a plane that turns ON pops on when you arrive at its keyframe, a plane that turns OFF is gone the moment the camera leaves (scan, then rotate away with no slice in tow), and a plane-to-plane cut lands on the keyframe.">EM switch <input id="teEmAt" type="number" min="0" max="100" step="5" placeholder="auto" value="${emAt(k)}" />%</label>
     <label>duration <input id="teDur" type="number" min="0" step="0.1" value="${fmtS(durS(k))}" />s</label>
     <label>easing <select id="teEase">
       ${['ease-in-out','linear','ease-in','ease-out'].map(o=>`<option value="${o}"${(k.easing||'ease-in-out')===o?' selected':''}>${o}</option>`).join('')}
@@ -755,7 +759,7 @@ function openTransEdit(e, id) {
     <label>ortho scale <input id="teOrthoScale" type="number" min="1" step="10" value="${Math.round(k.camera.ortho_scale_nm||1000)}"${k.camera.orthographic?'':' disabled'} />nm</label>
     <div class="te-row"><button onclick="gotoKf('${id}',null); closeTransEdit()">view</button>
       <button class="primary" onclick="applyTransEdit('${id}')">apply</button></div>
-    <div class="te-hint">Layer cut switches at the chosen percent of the camera move. EM "cut" turns the cross-section on/off outright — an EM scan that ends is gone the moment the camera moves on, with no dissolve. EM slice "glide" scrolls/rotates the cross-section from the previous keyframe's plane to this one, like neuroglancer. Orthographic: no perspective foreshortening — a slice moving in depth doesn't change size, like scrolling a flat 2D stack.</div>`;
+    <div class="te-hint">Layer cut switches at the chosen percent of the camera move. A layer that appears pops on when you reach its keyframe; one that leaves is gone as the camera moves off. EM "cut" turns the cross-section on/off outright, with no dissolve. Arrow layers always cut, whatever "layers" says — a callout that fades reads as a glitch. EM slice "glide" scrolls/rotates the cross-section from the previous keyframe's plane to this one, like neuroglancer. Orthographic: no perspective foreshortening — a slice moving in depth doesn't change size, like scrolling a flat 2D stack.</div>`;
   pop.style.left=Math.min(e.clientX, window.innerWidth-252)+'px';
   // show first, THEN clamp: the height depends on the content (KF0 has no camera/EM
   // rows), so a fixed offset pushed Apply off the bottom of the window on tall popovers.
@@ -1447,6 +1451,7 @@ async function saveArrowLayers() {
   if (!PID) return;
   const scale = parseFloat($('arrowScale').value) || 1;
   const frac = parseFloat($('arrowFrac').value) || 0.25;
+  if ($('arrowFrac')) $('arrowFrac').disabled = !$('arrowLock').checked;
   // scale = THICKNESS (relative to the arrow's own length); lock = apparent SIZE.
   // Keeping them separate matters: tying thickness to the view-lock made a locked arrow
   // impossible to fatten, since growing it grew its length by the same factor.
@@ -1468,6 +1473,7 @@ function showArrowStatus(st) {
   if (st.arrow_scale != null && $('arrowScale')) $('arrowScale').value = st.arrow_scale;
   const frac = st.arrow_screen_frac || 0;
   if ($('arrowLock')) $('arrowLock').checked = frac > 0;
+  if ($('arrowFrac')) $('arrowFrac').disabled = !(frac > 0);
   // keep the last locked fraction in the box when the lock is off, so unticking and
   // reticking doesn't silently resize every arrow in the movie
   if (frac > 0 && $('arrowFrac')) $('arrowFrac').value = frac;
