@@ -21,7 +21,8 @@ from ..models import Manifest, Project, RenderJob
 from ..data import ng_shader as _ng_shader
 from ..data.mesh_loader import MeshLoader
 from ..data.slice_loader import EMVolume, get_volume
-from .interpolate import FrameAnnotation, FrameState, build_frames, state_at_time
+from .interpolate import (FrameAnnotation, FrameState, build_frames, plane_normal,
+                          state_at_time)
 
 Progress = Callable[[float, str], None]
 
@@ -261,8 +262,9 @@ class RenderWorker:
             round(float(half)),
             self._em_target_px,
             None if target_nm_per_px is None else round(float(target_nm_per_px), 3),
-            tuple((u, tuple(sorted(int(i) for i in ids)), lc.cache_key())
-                  for u, ids, lc in seg_overlays),
+            # the overlay alpha is baked into the PNG, so it keys the cached image too
+            tuple((u, tuple(sorted(int(i) for i in ids)), lc.cache_key(), round(a, 4))
+                  for u, ids, lc, a in seg_overlays),
         )
 
     def _slice_cache_paths(self, key: tuple, axis: str) -> tuple[Path, Path]:
@@ -303,7 +305,7 @@ class RenderWorker:
     def _slice_png(self, sl, region, seg_overlays, slice_seg=None,
                    target_nm_per_px: float | None = None) -> dict:
         """Render a cross-section of the slice's chosen layer. For an EM/image layer:
-        the grayscale EM with `seg_overlays` [(label_zarr, ids, lc), …] colored on top
+        the grayscale EM with `seg_overlays` [(label_zarr, ids, lc, alpha), …] colored on top
         (like neuroglancer). For a SEGMENTATION layer (resolved via _vol_for): the
         layer's labels rendered in color directly (`slice_seg=(ids, lc)`). Cached per
         (slice, region, overlay)."""
@@ -361,7 +363,7 @@ class RenderWorker:
         rgb = shaded.astype(np.float64)
         H, W = rgb.shape[:2]
 
-        for label_zarr, ids, lc in ([] if normal else seg_overlays):  # seg overlay: axis-aligned only
+        for label_zarr, ids, lc, alpha in ([] if normal else seg_overlays):  # axis-aligned only
             if not ids:
                 continue
             lres = self._label_vol(label_zarr).read_slice(axis, position_nm,
@@ -379,7 +381,7 @@ class RenderWorker:
             color = np.zeros((H, W, 3))
             for u in np.unique(lab_rs[mask]):
                 color[lab_rs == u] = lc.rgb(int(u))         # neuroglancer color
-            a = 0.6                                          # overlay opacity
+            a = alpha                    # this layer's 2D (cross-section) opacity
             m = mask[:, :, None]
             rgb = np.where(m, rgb * (1 - a) + color * 255 * a, rgb)
 
@@ -519,37 +521,75 @@ class RenderWorker:
     # the two can never drift) -------------------------------------------------------
     def _frame_region(self, fr):
         """EM crop around the camera target, sized to what's on screen this frame."""
-        dist = math.dist(fr.position_nm, fr.look_at_nm)
-        half = max(500.0, dist * math.tan(math.radians(fr.fov_deg) / 2) * 1.25)
+        if fr.orthographic and fr.ortho_scale_nm:
+            half = max(500.0, fr.ortho_scale_nm / 2 * 1.25)
+        else:
+            dist = math.dist(fr.position_nm, fr.look_at_nm)
+            half = max(500.0, dist * math.tan(math.radians(fr.fov_deg) / 2) * 1.25)
         return (tuple(fr.look_at_nm), half)
 
     def _frame_nm_per_px(self, fr) -> float:
         """Physical size of one rendered screen pixel at the camera target."""
         height = max(1, self.job.settings.height)
+        if fr.orthographic and fr.ortho_scale_nm:
+            return fr.ortho_scale_nm / height
         dist = math.dist(fr.position_nm, fr.look_at_nm)
         return 2.0 * dist * math.tan(math.radians(fr.fov_deg) / 2) / height
 
+    SLICE_OVERLAY_ALPHA = 0.6      # default strength of labels painted on the EM slice
+
     def _frame_seg_overlays(self, fr):
-        """Visible segmentation layers in this frame to overlay on the EM slice."""
+        """Visible segmentation layers in this frame to overlay on the EM slice, as
+        (label_zarr, ids, colors, alpha).
+
+        `alpha` is the layer's neuroglancer 2D opacity, which is independent of the 3D
+        mesh — a layer set to 0 here keeps its geometry but leaves the cross-section pure
+        EM, instead of the old all-or-nothing 0.6."""
         out = []
         for m in fr.meshes:
             if not self._layer_visible(m):
                 continue
             src = next((s for s in self.manifest.meshes if s.name == m.mesh_name), None)
-            if src and src.label_zarr and m.segment_ids:
-                out.append((src.label_zarr, m.segment_ids, self._frame_colors(m)))
+            if not (src and src.label_zarr and m.segment_ids):
+                continue
+            so = getattr(m, "slice_opacity", None)
+            alpha = self.SLICE_OVERLAY_ALPHA if so is None else max(0.0, min(float(so), 1.0))
+            if alpha <= 0.001:          # 2D opacity 0 -> not drawn on the slice at all
+                continue
+            out.append((src.label_zarr, m.segment_ids, self._frame_colors(m), alpha))
         return out
 
     def _frame_slice_reads(self, fr, t_global):
         """Visible slices in this frame as (FrameSlice, slice_seg) — keyframe slices plus
         any 'slice' sweeps on the global timeline. slice_seg=(ids, colors) when the slice
-        points at a SEGMENTATION layer (so it renders colored labels), else None."""
+        points at a SEGMENTATION layer (so it renders colored labels), else None.
+
+        A layer can legitimately show SEVERAL cross-sections at once (neuroglancer's
+        4-panel layout shows xy/xz/yz of one layer), so these aren't collapsed to one per
+        layer — but two NEAR-PARALLEL planes through the same layer are not a second
+        panel, they're a collision: a keyframe holding its plane while a slice sweep scans
+        almost the same plane reads as one slice whose halves move at different rates.
+        The sweep wins there (it's the explicit timeline clip that says "scan now")."""
+        import numpy as np
+
+        sweeps = self._slices_from_sweeps(t_global)
         out = []
-        for sl in list(fr.slices) + self._slices_from_sweeps(t_global):
+        kept: list[tuple[str, object]] = []
+        for sl in sweeps + list(fr.slices):   # sweeps first: they win a collision
             if not getattr(sl, "visible", True):
                 continue
             if sl.opacity <= 0.001:
                 continue
+            n = plane_normal(sl)
+            dup = next((1 for em, kn in kept
+                        if em == sl.em_name and abs(float(np.dot(n, kn))) > 0.966), None)
+            if dup:                           # within ~15 deg of a plane already shown
+                self._warn_once(
+                    f"dupslice:{sl.em_name}",
+                    f"[worker] {sl.em_name}: two near-parallel cross-sections active at "
+                    f"t={t_global:.2f}s (keyframe plane + slice sweep?); showing one")
+                continue
+            kept.append((sl.em_name, n))
             _, is_label = self._vol_for(sl.em_name)
             slice_seg = None
             if is_label:
@@ -621,8 +661,61 @@ class RenderWorker:
         _export_mesh_npz(combined, out)
         return str(out)
 
-    @staticmethod
-    def _ann_uid(an) -> str:
+    def _ann_arrows(self, an) -> bool:
+        """Whether this annotation layer's lines draw as arrows (see is_arrow_layer)."""
+        from ..data.annotations import is_arrow_layer
+
+        return is_arrow_layer(getattr(an, "name", ""),
+                              getattr(self.project, "arrow_layers", None))
+
+    def _arrow_scale(self) -> float:
+        """Arrow thickness multiplier (project-level), clamped to something buildable."""
+        try:
+            return max(0.05, min(float(getattr(self.project, "arrow_scale", 1.0) or 1.0), 20.0))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _arrow_screen_lock(self, an, fr) -> dict:
+        """Per-frame scale that holds an arrow at a CONSTANT fraction of the frame height.
+
+        A physically-sized arrow is a speck when the camera pulls back and swallows the
+        frame on a close-up — the same arrow can't serve both. With
+        `Project.arrow_screen_frac` set, the arrow is scaled each frame so it always spans
+        that fraction of the view, pivoting on its TIP so the point stays on the structure.
+        Off (0) keeps the literal nm geometry.
+        """
+        frac = float(getattr(self.project, "arrow_screen_frac", 0.0) or 0.0)
+        own = getattr(an, "screen_frac", None)      # per-layer override, e.g. a smaller
+        if own is not None:                         # size on the shot that shows all four
+            frac = float(own)
+        if frac <= 0.0 or not self._ann_arrows(an) or not getattr(an, "lines", None):
+            return {}
+        import numpy as np
+
+        tail, tip = (np.array(v, dtype=float) for v in an.lines[0][:2])
+        length = float(np.linalg.norm(tip - tail))
+        if length < 1e-6:
+            return {}
+        # Frame height in nm AT THE ARROW'S OWN DEPTH, not at the camera target. Under
+        # perspective, apparent size goes as 1/depth: an arrow floating well in front of
+        # the thing the camera is focused on covered far more of the frame than the
+        # requested fraction (a callout sitting near the lens looked enormous in the wide
+        # establishing shot). Measuring at the tip's depth makes the fraction hold no
+        # matter where along the view axis the arrow sits.
+        if getattr(fr, "orthographic", False) and fr.ortho_scale_nm:
+            visible_nm = float(fr.ortho_scale_nm)   # orthographic: size is depth-invariant
+        else:
+            pos = np.array(fr.position_nm, dtype=float)
+            fwd = np.array(fr.look_at_nm, dtype=float) - pos
+            fwd_n = float(np.linalg.norm(fwd))
+            depth = float((tip - pos) @ (fwd / fwd_n)) if fwd_n > 1e-9 else 0.0
+            if depth <= 1e-6:        # tip behind the camera (or degenerate) — fall back
+                depth = fwd_n        # to the target distance rather than exploding
+            visible_nm = 2.0 * depth * math.tan(math.radians(fr.fov_deg) / 2.0)
+        return {"scale": max(1e-3, frac * visible_nm / length),
+                "pivot_bu": _bu(tip.tolist(), self.nm_per_bu)}
+
+    def _ann_uid(self, an) -> str:
         """Stable id per (layer, geometry, color) so an edited annotation layer
         becomes a distinct asset."""
         import hashlib
@@ -635,7 +728,10 @@ class RenderWorker:
                           getattr(an, "shader", ""), getattr(an, "shader_controls", {}),
                           getattr(an, "point_props", {}), getattr(an, "line_props", {}),
                           getattr(an, "box_props", {}),
-                          getattr(an, "ellipsoid_props", {})], sort_keys=True)
+                          getattr(an, "ellipsoid_props", {}),
+                          # arrows vs tubes, and how thick, are baked into the geometry,
+                          # so both key the cached asset
+                          self._ann_arrows(an), self._arrow_scale()], sort_keys=True)
         return f"ann_{hashlib.md5(sig.encode()).hexdigest()[:10]}"
 
     def _extent_for_layer(self, name: str, kfs):
@@ -744,8 +840,13 @@ class RenderWorker:
             return str(out)
         prims = {"points": an.points, "lines": an.lines, "boxes": an.boxes,
                  "ellipsoids": an.ellipsoids}
+        if self._ann_arrows(an):   # say so in the log; a silent mode is unverifiable
+            self._warn_once(f"arrows:{an.name}",
+                            f"[worker] {an.name}: drawing {len(an.lines or [])} line(s) as arrows")
         mesh = annotations_to_mesh(prims, an.color, an.point_radius_nm, an.line_radius_nm,
-                                   styles=self._ann_styles(an))
+                                   styles=self._ann_styles(an),
+                                   arrows=self._ann_arrows(an),
+                                   arrow_scale=self._arrow_scale())
         if mesh is None:
             return None
         os.makedirs(out.parent, exist_ok=True)
@@ -1053,7 +1154,7 @@ class RenderWorker:
                 # occlude=True -> the EM plane renders as a SOLID cross-section (blocks what's
                 # behind it) instead of a see-through additive overlay. opacity still fades it.
                 slices.append({**png, "opacity": sl.opacity, "occlude": True,
-                               "slot": f"{sl.em_name}:{sl.axis}"})
+                               "slot": getattr(sl, "slot", None) or f"{sl.em_name}:{sl.axis}"})
             overrides = {}
             for m in fr.meshes:
                 if frame_layer_uid is not None:           # chunk mode: per-frame selection
@@ -1094,8 +1195,10 @@ class RenderWorker:
             for an in fr.annotations:
                 uid = self._ann_uid(an)
                 if uid in mesh_specs:
-                    overrides[uid] = {"opacity": an.opacity, "visible": an.opacity > 0.001,
-                                      "silhouette": 0.0}
+                    ov = {"opacity": an.opacity, "visible": an.opacity > 0.001,
+                          "silhouette": 0.0}
+                    ov.update(self._arrow_screen_lock(an, fr))
+                    overrides[uid] = ov
             frame_specs.append({
                 "camera": {
                     "position_bu": _bu(fr.position_nm, self.nm_per_bu),
@@ -1103,6 +1206,8 @@ class RenderWorker:
                     "fov_rad": math.radians(fr.fov_deg),
                     "up": fr.up,
                     "flip_handed": self._flip_handed,
+                    **({"type": "ORTHO", "ortho_scale": fr.ortho_scale_nm / self.nm_per_bu}
+                       if getattr(fr, "orthographic", False) else {}),
                 },
                 "slices": slices,
                 "mesh_overrides": overrides,

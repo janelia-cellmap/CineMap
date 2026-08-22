@@ -136,3 +136,49 @@ def test_keyframes_without_the_layer_are_skipped(tmp_path):
     p = _project(tmp_path, [_kf("k0", opacity=1.0), bare, _kf("k2", opacity=1.0)])
     res = ops.propagate_slice_field(p, "k0", "em", "opacity", 0.2, direction="right")
     assert res["changed"] == ["k0", "k2"]
+
+
+# ------------------------------------------- 2D (cross-section) layer opacity
+def test_slice_opacity_zero_keeps_the_mesh_but_clears_the_cross_section():
+    """Neuroglancer's 2D layer opacity is independent of the 3D mesh: a layer set to 0
+    should stop painting labels on the EM slice while its geometry still renders."""
+    from cinemap.models import (Camera as C, Manifest, MeshInstance, MeshSource, Project,
+                                RenderJob, RenderSettings)
+    from cinemap.render.interpolate import state_at_time
+    from cinemap.render.worker import RenderWorker
+
+    def project(slice_opacity):
+        m = MeshInstance(mesh_name="anatomy", segment_ids=[1, 2],
+                         slice_opacity=slice_opacity)
+        kf = Keyframe(id="k", camera=C(position_nm=[0, 0, 100], look_at_nm=[0, 0, 0]),
+                      meshes=[m])
+        return Project(id="p", name="t", keyframes=[kf],
+                       manifest=Manifest(meshes=[MeshSource(name="anatomy",
+                                                            label_zarr="s3://labels/")]))
+
+    for so, expect_overlay, expect_alpha in ((None, True, 0.6), (0.25, True, 0.25),
+                                             (0.0, False, None)):
+        p = project(so)
+        w = RenderWorker(p, RenderJob(id="j", settings=RenderSettings(draft=True)))
+        fr = state_at_time(p.keyframes, 0.0)
+        overlays = w._frame_seg_overlays(fr)
+        assert bool(overlays) is expect_overlay, so
+        if expect_overlay:
+            assert overlays[0][3] == pytest.approx(expect_alpha)
+        # the 3D mesh renders regardless of what the cross-section does
+        assert w._mesh_render_alpha(fr.meshes[0]) == pytest.approx(1.0)
+
+
+def test_slice_overlay_alpha_keys_the_slice_image_cache():
+    """The alpha is baked into the PNG, so changing it must not reuse the old image."""
+    from cinemap.data.colors import LayerColors
+    from cinemap.models import Manifest, Project, RenderJob, RenderSettings
+    from cinemap.render.interpolate import FrameSlice
+    from cinemap.render.worker import RenderWorker
+
+    p = Project(id="p", name="t", manifest=Manifest())
+    w = RenderWorker(p, RenderJob(id="j", settings=RenderSettings(draft=True)))
+    sl = FrameSlice("em", "z", 0.0, None, 1.0)
+    lc = LayerColors()
+    key = lambda a: w._slice_cache_key(sl, ((0, 0, 0), 1000.0), [("s3://l/", [1], lc, a)])
+    assert key(0.6) != key(0.25)

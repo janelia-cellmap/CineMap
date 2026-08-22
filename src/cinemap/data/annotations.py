@@ -37,6 +37,67 @@ def _box_corners(lo, hi) -> np.ndarray:
     ], dtype=np.float64)
 
 
+def is_arrow_layer(name: str, arrow_layers=None) -> bool:
+    """Whether an annotation layer's LINES render as arrows.
+
+    One rule, one place: the renderer decides what to build with it and the UI reports it,
+    so they can't drift. An explicit `arrow_layers` list on the project is the whole answer
+    when set (exact names, case-insensitive); with no list, any layer whose name contains
+    "arrow" qualifies, so naming a neuroglancer layer "arrows" needs no configuration.
+    """
+    listed = [s.strip().lower() for s in (arrow_layers or []) if s and str(s).strip()]
+    nm = (name or "").lower()
+    return nm in listed if listed else "arrow" in nm
+
+
+ARROW_LENGTH_FRAC = 0.03      # shaft RADIUS as a fraction of the arrow's length
+
+
+def _arrow(a, b, rgba, shaft_radius_nm: float, sides: int = 12,
+           scale: float = 1.0) -> trimesh.Trimesh | None:
+    """A capped arrow from `a` (tail) to `b` (tip): cylinder shaft + cone head.
+
+    Everything is sized off the arrow's OWN length, so an arrow drawn across a mitochondrion
+    reads the same as one drawn across a cell — you framed the thing it points at, so the
+    arrow is framed with it. A layer that asks for a thicker line still gets it: the shaft
+    is the larger of the requested radius and a fraction of the length, so a long arrow
+    can't come out as a hairline with a fat head.
+
+    `scale` fattens the whole arrow (shaft and head together, length unchanged — that's the
+    two points you clicked). It exists because neuroglancer's state carries no line width,
+    so `shaft_radius_nm` is always the same 40 nm default and nothing about a given dataset
+    or shot says how heavy an arrow should read on screen.
+    """
+    p0 = np.asarray(a, dtype=np.float64)
+    p1 = np.asarray(b, dtype=np.float64)
+    d = p1 - p0
+    length = float(np.linalg.norm(d))
+    if length < 1e-6:
+        return None
+    d = d / length
+    shaft_r = max(0.05, float(scale)) * max(float(shaft_radius_nm),
+                                            ARROW_LENGTH_FRAC * length)
+    # ...but never so fat that the shaft catches up with the head: the head length is
+    # capped at a third of the arrow, so past this the two read as one lumpy cone
+    # instead of an arrow. A short arrow scaled up gets bolder, not shapeless.
+    shaft_r = min(shaft_r, 0.12 * length)
+    head_len = min(0.35 * length, 3.0 * 2.75 * shaft_r)
+    head_r = min(2.75 * shaft_r, 0.9 * head_len)
+    neck = p1 - d * head_len                    # where the shaft ends and the head begins
+    # the cone is built along +Z with its base at the origin; rotate +Z onto the arrow
+    # direction, then slide the base to the neck (align_vectors handles d == -Z too)
+    rot = trimesh.geometry.align_vectors([0.0, 0.0, 1.0], d)
+    parts = [trimesh.creation.cone(radius=head_r, height=head_len, sections=sides,
+                                   transform=rot)]
+    parts[0].apply_translation(neck)
+    if head_len < length - 1e-6:                # a very short arrow is head-only
+        parts.append(trimesh.creation.cylinder(radius=shaft_r, sections=sides,
+                                               segment=[p0, neck]))
+    for m in parts:
+        m.visual.vertex_colors = np.tile(rgba, (len(m.vertices), 1))
+    return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+
+
 def _sphere(center, radii, rgba, subdivisions: int = 2) -> trimesh.Trimesh:
     """Icosphere at `center` scaled by `radii` (scalar or [rx,ry,rz]), tinted rgba."""
     s = trimesh.creation.icosphere(subdivisions=subdivisions, radius=1.0)
@@ -47,13 +108,19 @@ def _sphere(center, radii, rgba, subdivisions: int = 2) -> trimesh.Trimesh:
 
 def annotations_to_mesh(prims: dict, color_rgb, point_radius_nm: float = DEFAULT_POINT_RADIUS_NM,
                         line_radius_nm: float = DEFAULT_LINE_RADIUS_NM,
-                        styles: dict | None = None) -> trimesh.Trimesh | None:
+                        styles: dict | None = None,
+                        arrows: bool = False,
+                        arrow_scale: float = 1.0) -> trimesh.Trimesh | None:
     """Combine all primitives in `prims` (nm) into one Trimesh, or None if nothing to draw.
 
     `styles` optionally carries the annotation shader's result: {kind: (N, 4) uint8 RGBA}
     for kind in point/line/box/ellipsoid, one row per primitive of that kind, in the same
     order as the geometry lists. Without it every primitive takes the flat `color_rgb`,
     which is what neuroglancer's default shader (`setColor(defaultColor())`) produces.
+
+    `arrows` draws this layer's LINES as arrows (pointA = tail, pointB = tip) instead of
+    plain tubes — a line annotation in neuroglancer is two clicks, which makes it the
+    natural way to author a callout that points at something. Box edges stay tubes.
     """
     r, g, b = color_rgb
     # +0.5 then truncate, exactly as ng_shader quantizes: plain truncation lost a step
@@ -81,6 +148,11 @@ def annotations_to_mesh(prims: dict, color_rgb, point_radius_nm: float = DEFAULT
     # take that box's colour, so the per-edge colour array has to be expanded to match.
     line_verts, line_edges, edge_rgba = [], [], []
     for i, (a, b_) in enumerate(prims.get("lines", [])):
+        if arrows:
+            arw = _arrow(a, b_, color_of("line", i), line_radius_nm, scale=arrow_scale)
+            if arw is not None:
+                parts.append(arw)
+            continue
         base = len(line_verts)
         line_verts.extend([a, b_])
         line_edges.append([base, base + 1])

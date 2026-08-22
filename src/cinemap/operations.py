@@ -147,6 +147,51 @@ def create_project(name: str, data_path: str) -> Project:
 
 
 # ----------------------------- keyframe ops -----------------------------
+def keyframe_times(keyframes) -> list[float]:
+    """Global arrival time (s) of each keyframe — the same walk the renderer does: dwell
+    on a keyframe for its `hold_in_s`, then spend the NEXT keyframe's `duration_in_s`
+    moving into it (see render/interpolate.build_frames)."""
+    t = 0.0
+    out = []
+    for i, k in enumerate(keyframes):
+        if i:
+            t += max(0.0, float(getattr(k, "duration_in_s", 0.0) or 0.0))
+        out.append(t)
+        t += max(0.0, float(getattr(k, "hold_in_s", 0.0) or 0.0))
+    return out
+
+
+def anchor_sweeps(project: Project) -> None:
+    """Pin every un-pinned sweep to the keyframe it currently starts on.
+
+    Called before any keyframe edit so sweeps made before anchoring existed (or before
+    this feature) get adopted with their current timing intact, rather than being left
+    behind on an absolute clock."""
+    if not project.keyframes:
+        return
+    times = keyframe_times(project.keyframes)
+    ids = {k.id for k in project.keyframes}
+    for sw in project.sweeps:
+        if sw.anchor_kf in ids:
+            continue
+        # the latest keyframe that has already arrived when the sweep starts
+        idx = max((i for i, t in enumerate(times) if t <= sw.start_s + 1e-9), default=0)
+        sw.anchor_kf = project.keyframes[idx].id
+        sw.anchor_offset_s = round(float(sw.start_s) - times[idx], 6)
+
+
+def resync_sweeps(project: Project) -> None:
+    """Re-derive each anchored sweep's `start_s` from its keyframe's arrival time, so a
+    sweep stays lined up with the shot it was built for after keyframes are added,
+    deleted, reordered or retimed. A sweep whose keyframe is gone is left where it is."""
+    anchor_sweeps(project)
+    times = dict(zip((k.id for k in project.keyframes), keyframe_times(project.keyframes)))
+    for sw in project.sweeps:
+        t = times.get(sw.anchor_kf)
+        if t is not None:
+            sw.start_s = max(0.0, round(t + float(sw.anchor_offset_s), 6))
+
+
 def add_keyframe(project: Project, keyframe: Keyframe | None = None, label: str = "") -> Keyframe:
     if keyframe is None:
         base = project.keyframes[-1] if project.keyframes else None
@@ -158,12 +203,31 @@ def add_keyframe(project: Project, keyframe: Keyframe | None = None, label: str 
             keyframe = base.model_copy(deep=True)
             keyframe.id = _uid("kf")
             keyframe.label = label or "keyframe"
+    anchor_sweeps(project)          # pin sweeps BEFORE the timeline moves under them
     project.keyframes.append(keyframe)
+    resync_sweeps(project)
     store.save(project)
     return keyframe
 
 
-def duplicate_keyframe(project: Project, source_id: str, after_id: str | None = None) -> Keyframe:
+def _copy_label(label: str, taken) -> str:
+    """"scouted" -> "scouted copy", then "scouted copy 2", "scouted copy 3", …
+
+    Plain concatenation gave "scouted copy copy copy copy copy", which makes the cards
+    indistinguishable exactly when you're pasting a lot and need to tell them apart."""
+    import re
+
+    base = re.sub(r"\s+copy(\s+\d+)?$", "", label).strip() or "keyframe"
+    cand = f"{base} copy"
+    n = 2
+    while cand in taken:
+        cand = f"{base} copy {n}"
+        n += 1
+    return cand
+
+
+def duplicate_keyframe(project: Project, source_id: str, after_id: str | None = None,
+                       with_sweeps: bool = True) -> Keyframe:
     src_idx = next((i for i, k in enumerate(project.keyframes) if k.id == source_id), None)
     if src_idx is None:
         raise ValueError("no such source keyframe")
@@ -176,30 +240,68 @@ def duplicate_keyframe(project: Project, source_id: str, after_id: str | None = 
     src = project.keyframes[src_idx]
     dup = src.model_copy(deep=True)
     dup.id = _uid("kf")
-    dup.label = (src.label or "keyframe") + " copy"
+    dup.label = _copy_label(src.label or "keyframe",
+                            {k.label for k in project.keyframes})
+    # The move INTO a keyframe describes the pair it sat between, which the copy is not
+    # in. Carrying it over imported an unrelated 8s glide from wherever the source lived;
+    # the copy gets the DEFAULT move instead — a real, editable bar you then retime.
+    dup.duration_in_s = Keyframe.model_fields["duration_in_s"].default
     # A pasted frame is a normal manual keyframe, even if copied from a generated orbit/scan.
     dup.group = None
     dup.group_label = ""
+    anchor_sweeps(project)
     project.keyframes.insert(insert_after + 1, dup)
+    # A keyframe is a SHOT: its pose, its layers, the move into it (`duration_in_s`) and
+    # any sweep pinned to it. Copying only the pose left the twin with no editable move
+    # and its scan behind on the original, so the copy wasn't a working shot you could
+    # adjust. Everything pinned to the source comes along, re-pinned to the copy.
+    if with_sweeps:
+        for sw in [s for s in project.sweeps if s.anchor_kf == source_id]:
+            twin = sw.model_copy(deep=True)
+            twin.id = _uid("sw")
+            twin.anchor_kf = dup.id      # same offset -> same beat, now on the copy
+            project.sweeps.append(twin)
+    resync_sweeps(project)
     store.save(project)
     return dup
 
 
 def delete_keyframe(project: Project, keyframe_id: str) -> None:
+    idx = next((i for i, k in enumerate(project.keyframes) if k.id == keyframe_id), None)
+    if idx is None:
+        return
+    anchor_sweeps(project)
+    # Sweeps pinned to the doomed keyframe move onto a neighbour, keeping their position
+    # RELATIVE to it — so deleting a shot pulls its sweeps back with everything downstream
+    # instead of stranding them on whatever now happens to sit at that second.
+    nb = idx - 1 if idx > 0 else (1 if len(project.keyframes) > 1 else None)
+    if nb is not None:
+        times = keyframe_times(project.keyframes)
+        for sw in project.sweeps:
+            if sw.anchor_kf == keyframe_id:
+                sw.anchor_offset_s = round(sw.anchor_offset_s + times[idx] - times[nb], 6)
+                sw.anchor_kf = project.keyframes[nb].id
     project.keyframes = [k for k in project.keyframes if k.id != keyframe_id]
+    resync_sweeps(project)
     store.save(project)
 
 
 def reorder_keyframes(project: Project, order: list[str]) -> None:
     by_id = {k.id: k for k in project.keyframes}
+    anchor_sweeps(project)
     project.keyframes = [by_id[i] for i in order if i in by_id]
+    resync_sweeps(project)      # a sweep follows the shot it was pinned to
     store.save(project)
 
 
 def update_keyframe(project: Project, keyframe_id: str, **fields) -> Keyframe:
     kf = next(k for k in project.keyframes if k.id == keyframe_id)
+    anchor_sweeps(project)
     updated = kf.model_copy(update=fields)
     project.keyframes = [updated if k.id == keyframe_id else k for k in project.keyframes]
+    # retiming a move/hold shifts every later keyframe, so the sweeps ride along
+    if {"duration_in_s", "hold_in_s"} & set(fields):
+        resync_sweeps(project)
     store.save(project)
     return updated
 
@@ -577,6 +679,7 @@ def add_sweep(project: Project, layer: str = "", axis: str = "z", normal=None, s
                duration_s=float(duration_s if duration_s is not None else total),
                easing=easing, mirror=bool(mirror), cap=bool(cap))
     project.sweeps.append(sw)
+    anchor_sweeps(project)     # pin it to the keyframe it starts on, from the outset
     if commit:                 # commit=False -> build the sweep for a preview without saving
         store.save(project)
     return sw
@@ -596,6 +699,9 @@ def update_sweep(project: Project, sweep_id: str, **fields) -> Sweep | None:
     for k, v in fields.items():
         if v is not None and hasattr(sw, k):
             setattr(sw, k, v)
+    if fields.get("start_s") is not None and "anchor_kf" not in fields:
+        sw.anchor_kf = None        # dragged to a new time -> re-pin to whatever is there now
+        anchor_sweeps(project)
     store.save(project)
     return sw
 

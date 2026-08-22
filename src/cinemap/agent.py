@@ -33,6 +33,12 @@ a filled cross-section; open cutaways are faster and do not fill the cut face.
 - Camera transitions (`transition`) are separate from layer visibility/style changes \
 (`layer_transition`). Use `layer_transition="cut"` and `layer_transition_at` when \
 layers should switch at a specific point in a camera move instead of cross-fading.
+- ARROWS: a line annotation drawn in neuroglancer (tail click, tip click) renders as a \
+3D arrow if its layer is in the project's `arrow_layers` (or has "arrow" in its name). \
+Arrows fade in/out with their layer's per-keyframe visibility, like any annotation.
+- The EM cross-section has its own transition (`em_transition`, default "glide"): the \
+plane travels/rotates from one keyframe's cross-section to the next like scrolling in \
+neuroglancer. Use "fade" to dissolve between two planes instead, or "cut" to switch.
 - The user scouts the data in an embedded Neuroglancer viewer. "Bake" captures \
 the current 3D view (camera + visible layers/segments) as a keyframe.
 - Meshes are generated from the label volume; many segments render as one colored \
@@ -100,7 +106,8 @@ TOOLS = [
          "easing": {"type": "string", "enum": ["linear", "ease-in-out", "ease-in", "ease-out"]},
          "transition": {"type": "string", "enum": ["glide", "cut", "fade"]},
          "layer_transition": {"type": "string", "enum": ["fade", "cut"]},
-         "layer_transition_at": {"type": "number"}},
+         "layer_transition_at": {"type": "number"},
+         "em_transition": {"type": "string", "enum": ["glide", "fade", "cut"]}},
          "required": ["index"]}},
     {"name": "set_keyframe_segments", "description": "Set which segment ids of a mesh layer are shown in a keyframe.",
      "input_schema": {"type": "object", "properties": {
@@ -130,6 +137,7 @@ def _kf_summary(p: Project) -> list[dict]:
             "hold_in_s": k.hold_in_s, "transition": getattr(k, "transition", "glide"),
             "layer_transition": getattr(k, "layer_transition", "fade"),
             "layer_transition_at": getattr(k, "layer_transition_at", 1.0),
+            "em_transition": getattr(k, "em_transition", "glide"),
             "look_at_nm": [round(x) for x in k.camera.look_at_nm],
             "slices": [{"axis": s.axis, "position_nm": round(s.position_nm), "visible": s.visible} for s in k.slices],
             "meshes": [{"layer": m.mesh_name, "n_segments": len(m.segment_ids), "visible": m.visible} for m in k.meshes],
@@ -228,7 +236,7 @@ def _dispatch(name: str, args: dict, p: Project, render_fn: Callable | None) -> 
     if name == "set_keyframe":
         fields = {k: args[k] for k in (
             "duration_in_s", "hold_in_s", "easing", "transition", "layer_transition",
-            "layer_transition_at")
+            "layer_transition_at", "em_transition")
             if k in args}
         if "layer_transition_at" in fields:
             fields["layer_transition_at"] = max(0.0, min(1.0, float(fields["layer_transition_at"])))

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 Axis = Literal["x", "y", "z"]
 TransitionStyle = Literal["glide", "cut", "fade"]
 LayerTransitionStyle = Literal["fade", "cut"]
+EMTransitionStyle = Literal["glide", "fade", "cut"]
 
 
 # ----------------------------- data sources -----------------------------
@@ -57,6 +58,12 @@ class Camera(BaseModel):
     look_at_nm: list[float]
     fov_deg: float = 40.0
     up: list[float] = Field(default_factory=lambda: [0.0, 0.0, 1.0])
+    # Orthographic: no perspective foreshortening, so moving a slice plane along its
+    # normal (a depth scan) doesn't change its apparent size -> reads as a flat 2D
+    # scroll through a stack rather than a 3D dolly. ortho_scale_nm = view width (nm)
+    # at any distance; None while `orthographic` is False (perspective, uses fov_deg).
+    orthographic: bool = False
+    ortho_scale_nm: Optional[float] = None
 
 
 class SlicePlane(BaseModel):
@@ -105,6 +112,10 @@ class MeshInstance(BaseModel):
     saturation: float = 1.0     # NG layer saturation (0 = grayscale meshes)
     # neuroglancer 3D mesh render state (per keyframe -> can change frame to frame)
     object_alpha: float = 1.0   # NG "Opacity (3d)"  (objectAlpha)
+    # How strongly this layer's labels paint onto the EM cross-section — neuroglancer's
+    # 2D layer opacity, which is INDEPENDENT of the 3D mesh (objectAlpha). 0 keeps the 3D
+    # geometry while leaving the cross-section pure EM. None = the renderer's default (0.6).
+    slice_opacity: Optional[float] = None
     silhouette: float = 0.0     # NG "Silhouette (3d)" (meshSilhouetteRendering)
     clip: Optional[ClipPlane] = None   # cutaway plane (render-only; per layer)
     # per-keyframe material override (render-only) so the look can CHANGE over the movie
@@ -138,6 +149,18 @@ class AnnotationInstance(BaseModel):
     line_props: dict[str, list] = Field(default_factory=dict)
     box_props: dict[str, list] = Field(default_factory=dict)
     ellipsoid_props: dict[str, list] = Field(default_factory=dict)
+    # Per-layer override of the keyframe's `layer_transition`. A callout arrow reads as a
+    # graphic, not as scenery: dissolving one arrow into another looks like a mistake, so
+    # an arrow layer can cut while the meshes around it keep cross-fading. None = follow
+    # the keyframe. `layer_transition_at` is the normalized time in the move where an
+    # override cut switches; None = 0.0 for an override (the arrow you are travelling
+    # TOWARD is the one you want to see during the move).
+    layer_transition: Optional[LayerTransitionStyle] = None
+    layer_transition_at: Optional[float] = None
+    # Per-layer override of Project.arrow_screen_frac (fraction of the frame an arrow
+    # spans). One global size is right for a single arrow on a close-up and too loud for
+    # a wide shot showing all of them at once. None = the project setting.
+    screen_frac: Optional[float] = None
 
 
 class Lighting(BaseModel):
@@ -166,6 +189,21 @@ class Keyframe(BaseModel):
     # Normalized time in the transition where cut layer changes switch from source to target:
     # 0.0 = start of move, 0.5 = halfway, 1.0 = at keyframe arrival.
     layer_transition_at: float = 1.0
+    # The EM cross-section gets its OWN transition, because neuroglancer has exactly one
+    # cross-section per image layer and moving between two views SCROLLS/ROTATES that one
+    # plane (position lerp + crossSectionOrientation slerp) instead of dissolving between
+    # two planes:
+    #   glide = one plane travels from the previous keyframe's plane to this one (default,
+    #           matches neuroglancer — a tilted plane rotates about the camera target),
+    #   fade  = cross-fade: the old plane stays put and fades out while the new one fades
+    #           in (two planes on screen at once mid-transition),
+    #   cut   = hold the source plane, then switch at `layer_transition_at`.
+    em_transition: EMTransitionStyle = "glide"
+    # Where in the move an EM "cut" switches, independent of layer_transition_at: killing
+    # the cross-section for a rotation is a different edit from fading the meshes. None =
+    # 0.0 when the plane is arriving or leaving (an EM scan that ends should be gone the
+    # moment the camera moves on, not dissolve across the move), else layer_transition_at.
+    em_transition_at: Optional[float] = None
     ng_state: Optional[dict] = None  # originating scouting state (round-trip)
     thumbnail_path: Optional[str] = None
     # keyframes produced together by a generated move (plane scan, orbit, …) share a
@@ -255,6 +293,13 @@ class Sweep(BaseModel):
     to_nm: float = 0.0
     start_s: float = 0.0                   # global-timeline start (seconds)
     duration_s: float = 2.0
+    # A sweep is timed in absolute seconds, but what it's FOR is a moment in the movie
+    # ("scan while we're on the pore"). Inserting, deleting, reordering or retiming a
+    # keyframe moves that moment, so the sweep is pinned to a keyframe: `start_s` is
+    # re-derived as that keyframe's arrival time + `anchor_offset_s` whenever the keyframe
+    # timeline changes. None on a sweep that predates this (adopted on the next edit).
+    anchor_kf: Optional[str] = None
+    anchor_offset_s: float = 0.0
     easing: Literal["linear", "ease-in-out", "ease-in", "ease-out"] = "linear"
     opacity: float = 1.0                   # EM slice overlay strength (slice kind)
     mirror: bool = False                   # ping-pong: sweep from->to then back to->from
@@ -293,6 +338,21 @@ class Project(BaseModel):
     # independent animated effects (cutaway sweeps) overlaid on the camera timeline
     sweeps: list[Sweep] = Field(default_factory=list)
     renders: list[RenderJob] = Field(default_factory=list)
+    # Annotation layers whose LINE annotations render as arrows (pointA = tail, pointB =
+    # tip) instead of plain tubes. Kept on the project, not the keyframe, so it survives
+    # re-baking a keyframe from neuroglancer. A layer whose name contains "arrow" is
+    # treated as arrows by default, so the common case needs no configuration at all.
+    arrow_layers: list[str] = Field(default_factory=list)
+    # How heavy an arrow reads: multiplies shaft + head thickness (length is the two points
+    # you clicked). Needed because neuroglancer's state has no line width, so nothing in the
+    # data says whether an arrow should be a needle or a bold graphic.
+    arrow_scale: float = 1.0
+    # Hold arrows at a constant ON-SCREEN size: each frame the arrow is scaled (about its
+    # tip, so the point stays put) to span this fraction of the frame height. One physical
+    # size cannot serve both a wide establishing shot and a 3 um close-up, so this is on by
+    # default. 0 = off, use the literal nm geometry. A quarter of the frame reads as a
+    # callout; half of it swallows the shot.
+    arrow_screen_frac: float = 0.25
     look: dict[str, Any] = Field(default_factory=dict)  # render look overrides (preset +
     # glow/roughness/specular/ng_shader/view) — the look-experiment panel writes this.
     render_prefs: Optional[RenderPrefs] = None  # last-used render-control settings (UI)

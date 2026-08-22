@@ -840,6 +840,26 @@ def _geometric_clip(obj, clip) -> None:
     bm.free()
 
 
+def _apply_pivot_scale(obj, ov) -> None:
+    """Uniformly scale an object about a fixed world point (`pivot_bu`).
+
+    Used to hold a callout arrow at a CONSTANT ON-SCREEN size: the renderer sends a scale
+    per frame and the pivot is the arrow's tip, so the arrow grows and shrinks with the
+    zoom while its point stays nailed to the structure it marks.
+
+    This goes through the DELTA transform, never `obj.scale`/`obj.location`. Mesh vertices
+    are baked in nanometres and the importer puts the nm->Blender-unit conversion in
+    `obj.scale`; writing that field here (even with 1.0) threw the conversion away and
+    every mesh in the scene exploded off-camera. Blender combines the two as
+    scale*delta_scale and location+delta_location, so a delta composes safely — including
+    on objects recovered from the warm-scene cache, which never pass through the importer.
+    """
+    s = float((ov or {}).get("scale", 1.0) or 1.0)
+    piv = Vector(tuple((ov or {}).get("pivot_bu") or (0.0, 0.0, 0.0)))
+    obj.delta_scale = (s, s, s)
+    obj.delta_location = piv * (1.0 - s)   # p -> s*p + p*(1-s) = p, the pivot holds still
+
+
 def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> None:
     for mid, (obj, mat) in meshes.items():
         ov = overrides.get(mid)
@@ -848,6 +868,7 @@ def _set_mesh_state(meshes: dict, overrides: dict, base_emit: float = 0.15) -> N
             continue
         if obj.name in _orig_mesh:
             _geometric_clip(obj, ov.get("clip"))   # solid cutaway, rebuilt per frame
+        _apply_pivot_scale(obj, ov)
         opacity = ov.get("opacity", 1.0)            # effective alpha = fade * Opacity(3d)
         visible = ov.get("visible", True) and opacity > 0.001
         obj.hide_render = not visible
@@ -1238,6 +1259,10 @@ def _keyframe_meshes(meshes: dict, overrides: dict, f: int) -> None:
         obj.hide_viewport = not visible
         obj.keyframe_insert("hide_render", frame=f)
         obj.keyframe_insert("hide_viewport", frame=f)
+        # screen-locked arrows scale per frame, so the .blend needs those animated too
+        _apply_pivot_scale(obj, ov)
+        obj.keyframe_insert("delta_scale", frame=f)
+        obj.keyframe_insert("delta_location", frame=f)
         nt = mat.node_tree
         av, sv = nt.nodes.get("cm_alpha"), nt.nodes.get("cm_silh")
         if av is not None:

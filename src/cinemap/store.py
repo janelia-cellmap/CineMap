@@ -107,6 +107,22 @@ def load(project_id: str) -> Project:
     return project
 
 
+def patch_render_job(project_id: str, job) -> None:
+    """Persist ONE render job's record (status/progress/output_path) onto whatever the
+    project looks like on disk right now.
+
+    A render runs in its own process, so it holds a snapshot of the project taken when it
+    STARTED. Saving that whole snapshot at the end silently reverted every edit made while
+    it rendered — a paste, a retime, a re-bake — and, going the other way, the parent's
+    later saves reverted the job's own status (which is why finished movies sat in
+    project.json as "pending" with no output_path). Read-modify-write just the job.
+    """
+    invalidate(project_id)              # this process's cache predates the other writer
+    fresh = load(project_id)
+    fresh.renders = [j for j in fresh.renders if j.id != job.id] + [job]
+    save(fresh)
+
+
 def invalidate(project_id: str) -> None:
     """Drop a project from the in-memory cache (forces a fresh disk read next load)."""
     _cache.pop(project_id, None)

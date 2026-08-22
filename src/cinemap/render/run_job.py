@@ -80,8 +80,10 @@ def main(argv: list[str]) -> int:
     # Persist the job's final state on disk so the parent doesn't need to mirror
     # job mutations across the process boundary (it would race the subprocess if it
     # tried). The next /api/projects/<pid> read will see status=done + output_path.
+    # ONLY the job record: saving this process's whole project snapshot would revert
+    # every keyframe edit the user made while the render was running.
     try:
-        store.save(worker.project)
+        store.patch_render_job(pid, job)
     except Exception as e:  # noqa: BLE001
         _emit({"final": "error", "message": f"save project failed: {e}"})
         return 1

@@ -124,6 +124,21 @@ def slice_from_layer(em_name: str, layer: dict | None, st: dict | None = None,
     )
 
 
+def _slice_plane_from_view(em_name: str, st: dict, voxel_nm) -> SlicePlane:
+    """A SlicePlane matching the live 2D cross-section panel's actual plane (position
+    AND orientation), not just a flat Z-axis guess -- so a rotated or xy/yz-panel view
+    bakes the plane that was really on screen instead of always the wrong one."""
+    from .data.ng_camera import ng_cross_section_plane
+
+    point, normal = ng_cross_section_plane(st, voxel_nm)
+    axis_i = max(range(3), key=lambda i: abs(normal[i]))
+    axis = ("x", "y", "z")[axis_i]
+    position_nm = sum(point[i] * normal[i] for i in range(3))
+    return slice_from_layer(em_name, _layer_by_name(st, em_name), st,
+                            axis=axis, position_nm=position_nm,
+                            normal=(None if abs(normal[axis_i]) >= 0.999 else normal))
+
+
 def _layer_by_name(st: dict, name: str) -> dict | None:
     return next((l for l in st.get("layers", []) if l.get("name") == name), None)
 
@@ -188,7 +203,7 @@ def _scene_from_view(project: Project, st: dict | None = None):
     """Capture a scene as (camera, slices, meshes, annotations, ng_state) from a
     neuroglancer state dict. `st` defaults to the live scouting viewer; importing
     passes the saved state directly so capture never races the viewer's async load."""
-    from .data.ng_camera import ng_to_camera
+    from .data.ng_camera import ng_cross_section_plane, ng_to_camera
 
     if st is None:
         st = get_viewer().state.to_json()  # serialize the live viewer ONCE; reuse below
@@ -196,10 +211,14 @@ def _scene_from_view(project: Project, st: dict | None = None):
     em_name = project.manifest.em.name if project.manifest.em else "em"
     layer_vis = {l.get("name"): l.get("visible", True) is not False
                  for l in st.get("layers", [])}
-    # a "3d" layout shows no cross-section in neuroglancer, so bake no EM slice
-    show_slice = layer_vis.get(em_name, True) and st.get("layout") != "3d"
-    slices = ([slice_from_layer(em_name, _layer_by_name(st, em_name), st,
-                                axis="z", position_nm=cam.look_at_nm[2])]
+    # neuroglancer's slice comes from crossSectionOrientation/position, which exist
+    # regardless of layout ("3d" included) -- so bake it whenever the EM layer is on AND
+    # the 3d panel is actually drawing cross-sections. `showSlices: false` is the viewer's
+    # "Show cross sections in 3-d" checkbox: with it off the user is looking at meshes
+    # alone, and baking the plane anyway put an EM sheet in the render that was nowhere
+    # on screen when they hit Bake.
+    show_slice = layer_vis.get(em_name, True) and st.get("showSlices", True) is not False
+    slices = ([_slice_plane_from_view(em_name, st, project.manifest.voxel_size_nm)]
               if show_slice else [])
     prev = project.keyframes[-1].meshes if project.keyframes else None
     meshes = _meshes_from_visible(project, prev=prev, st=st)   # inherit material from last kf
@@ -250,7 +269,12 @@ def _annotations_from_view(project: Project, st: dict) -> list[AnnotationInstanc
         if not _ann.has_geometry(prims):
             continue
         props = prims.get("props") or {}
+        # Arrows are a graphic overlay, not scenery: cross-dissolving one callout into
+        # the next reads as a glitch, so they cut by default (per-layer, so the meshes
+        # and slices around them keep whatever the keyframe asks for).
+        arrow = _ann.is_arrow_layer(layer.get("name", ""), project.arrow_layers)
         out.append(AnnotationInstance(
+            layer_transition="cut" if arrow else None,
             name=layer.get("name", "annotations"),
             color=_hex_to_rgb(layer.get("annotationColor", "#ffff4d")),
             visible=layer.get("visible", True) is not False,
@@ -412,8 +436,7 @@ def sync_segments(project: Project, keyframe_id: str) -> Keyframe | None:
                                     else dict(s.shader_controls)),
             }))
     elif vis.get(em_name, True):  # EM turned on but keyframe had no slice -> add one
-        slices = [slice_from_layer(em_name, _layer_by_name(st, em_name), st,
-                                   axis="z", position_nm=kf.camera.look_at_nm[2])]
+        slices = [_slice_plane_from_view(em_name, st, project.manifest.voxel_size_nm)]
     else:
         slices = []
 

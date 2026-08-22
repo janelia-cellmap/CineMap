@@ -9,6 +9,7 @@ import asyncio
 import os
 import shutil
 import threading
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -308,6 +309,57 @@ def set_render_prefs(pid: str, body: dict):
     return p.render_prefs.model_dump()
 
 
+@app.get("/api/projects/{pid}/arrow_layers")
+def get_arrow_layers(pid: str):
+    """Every annotation layer captured on this project's keyframes, and whether it
+    currently counts as an arrow layer — so "is my layer an arrow layer?" is answerable
+    without rendering. `n_lines` is how many line annotations that layer actually has
+    (arrows only come from lines; a layer of points renders nothing as an arrow)."""
+    from .data.annotations import is_arrow_layer
+
+    if not store.exists(pid):
+        raise HTTPException(404, "no such project")
+    p = store.load(pid)
+    seen: dict[str, int] = {}
+    for kf in p.keyframes:
+        for an in kf.annotations:
+            seen[an.name] = max(seen.get(an.name, 0), len(an.lines or []))
+    layers = [{"name": n, "n_lines": c, "arrows": is_arrow_layer(n, p.arrow_layers)}
+              for n, c in sorted(seen.items())]
+    return {"arrow_layers": p.arrow_layers, "layers": layers,
+            "arrow_scale": p.arrow_scale, "arrow_screen_frac": p.arrow_screen_frac,
+            "mode": "explicit" if p.arrow_layers else "auto"}
+
+
+@app.put("/api/projects/{pid}/arrow_layers")
+def set_arrow_layers(pid: str, body: dict):
+    """Which annotation layers draw their LINE annotations as arrows (tail = pointA,
+    tip = pointB). Empty list => the default convention: any layer with "arrow" in its
+    name. Lives on the project so re-baking a keyframe can't lose it."""
+    if not store.exists(pid):
+        raise HTTPException(404, "no such project")
+    p = store.load(pid)
+    layers = body.get("layers")
+    if isinstance(layers, str):     # accept a comma-separated string from the UI
+        layers = [s for s in (x.strip() for x in layers.split(",")) if s]
+    if layers is not None:
+        if not isinstance(layers, list):
+            raise HTTPException(400, "layers must be a list of layer names (or a csv string)")
+        p.arrow_layers = [str(s).strip() for s in layers if str(s).strip()]
+    if body.get("scale") is not None:
+        try:
+            p.arrow_scale = max(0.05, min(float(body["scale"]), 20.0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "scale must be a number") from None
+    if body.get("screen_frac") is not None:
+        try:    # 0 = physical size; >0 = hold the arrow at that fraction of the frame
+            p.arrow_screen_frac = max(0.0, min(float(body["screen_frac"]), 3.0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "screen_frac must be a number") from None
+    store.save(p)
+    return get_arrow_layers(pid)   # echo back which layers this actually turned into arrows
+
+
 def _ng_url_for(request: Request) -> str:
     """The neuroglancer viewer URL with its host rewritten to whatever host the
     browser used to reach this app. NG binds to 0.0.0.0 and would otherwise hand
@@ -456,6 +508,8 @@ def update_from_ng(pid: str, kid: str):
 # ----------------------------- keyframes -----------------------------
 class DuplicateKeyframeReq(BaseModel):
     after_id: str | None = None
+    # a copy is a whole shot by default: pose + layers + move + any sweep pinned to it
+    with_sweeps: bool = True
 
 
 @app.post("/api/projects/{pid}/keyframes")
@@ -468,7 +522,13 @@ def add_keyframe(pid: str):
 def duplicate_keyframe(pid: str, kid: str, req: DuplicateKeyframeReq):
     p = store.load(pid)
     try:
-        return ops.duplicate_keyframe(p, kid, after_id=req.after_id).model_dump()
+        dup = ops.duplicate_keyframe(p, kid, after_id=req.after_id,
+                                     with_sweeps=req.with_sweeps)
+        ids = [k.id for k in p.keyframes]
+        # Echo WHERE it landed, so the UI can state the outcome instead of assuming it —
+        # "pasted after KF7 -> now KF8" makes a wrong click target visible immediately.
+        return {**dup.model_dump(), "index": ids.index(dup.id),
+                "after_index": ids.index(req.after_id or kid) if (req.after_id or kid) in ids else None}
     except ValueError as e:
         raise HTTPException(404, str(e)) from e
 
@@ -631,6 +691,8 @@ class DurationReq(BaseModel):
     transition: str | None = None
     layer_transition: str | None = None
     layer_transition_at: float | None = None
+    em_transition: str | None = None
+    em_transition_at: float | None = None   # <0 clears it back to automatic
 
 
 @app.put("/api/projects/{pid}/keyframes/{kid}/duration")
@@ -658,7 +720,42 @@ def set_keyframe_duration(pid: str, kid: str, req: DurationReq):
         fields["layer_transition"] = req.layer_transition
     if req.layer_transition_at is not None:
         fields["layer_transition_at"] = max(0.0, min(1.0, float(req.layer_transition_at)))
+    if req.em_transition:
+        if req.em_transition not in ("glide", "fade", "cut"):
+            raise HTTPException(400, "em_transition must be glide, fade, or cut")
+        fields["em_transition"] = req.em_transition
+    if req.em_transition_at is not None:
+        # negative = "auto": a plane arriving or leaving cuts at the start of the move,
+        # a plane-to-plane cut follows layer_transition_at
+        fields["em_transition_at"] = (None if req.em_transition_at < 0 else
+                                      max(0.0, min(1.0, float(req.em_transition_at))))
     ops.update_keyframe(p, kid, **fields)
+    return {"ok": True, **fields}
+
+
+class CameraReq(BaseModel):
+    orthographic: bool | None = None
+    ortho_scale_nm: float | None = None
+
+
+@app.put("/api/projects/{pid}/keyframes/{kid}/camera")
+def set_keyframe_camera(pid: str, kid: str, req: CameraReq):
+    """Toggle a keyframe's camera between perspective and orthographic. Orthographic
+    has no perspective foreshortening, so moving a slice plane along its normal (e.g. a
+    depth scan) doesn't change its apparent size — useful for a flat 2D scroll-through-a-
+    stack look instead of a 3D dolly."""
+    p = store.load(pid)
+    kf = next((k for k in p.keyframes if k.id == kid), None)
+    if kf is None:
+        raise HTTPException(404, "no such keyframe")
+    fields = {}
+    if req.orthographic is not None:
+        fields["orthographic"] = bool(req.orthographic)
+    if req.ortho_scale_nm is not None:
+        fields["ortho_scale_nm"] = max(1.0, float(req.ortho_scale_nm))
+    if fields:
+        new_camera = kf.camera.model_copy(update=fields)
+        ops.update_keyframe(p, kid, camera=new_camera)
     return {"ok": True, **fields}
 
 
@@ -1091,7 +1188,7 @@ def render_status(job_id: str):
 
 
 @app.get("/api/projects/{pid}/renders/{job_id}/output")
-def render_output(pid: str, job_id: str):
+def render_output(pid: str, job_id: str, hq: bool = False):
     st = _render_state.get(job_id, {})
     out = st.get("output")
     if not out:
@@ -1100,13 +1197,57 @@ def render_output(pid: str, job_id: str):
         j = next((j for j in p.renders if j.id == job_id), None)
         out = j.output_path if j else None
     if not out:
+        # ...and then to the file on disk. An older render's in-memory state is evicted
+        # and its project record can have been overwritten with a stale "pending" copy
+        # (see render_history), but the output is still sitting there — which is exactly
+        # what the "last render" panel asks for after a reload.
+        d = config.PROJECTS_DIR / pid / "renders" / job_id
+        f = next((d / n for n in ("output.mp4", "output.png", "scene.blend")
+                  if (d / n).exists()), None)
+        out = str(f) if f else None
+    if not out:
         raise HTTPException(404, "no output yet")
+    if hq and out.endswith("output.mp4"):
+        alt = Path(out).with_name("output_hq.mp4")   # full-chroma near-lossless encode
+        if alt.exists():
+            out = str(alt)
     if out.endswith(".mp4"):
         return FileResponse(out, media_type="video/mp4")  # large, not overwritten
     if out.endswith(".blend"):
         return FileResponse(out, media_type="application/octet-stream",
                             filename=f"{pid}.blend")  # Content-Disposition -> download
     return _image_response(out)  # PNG output may be overwritten by a re-render
+
+
+@app.get("/api/projects/{pid}/renders/history")
+def render_history(pid: str, limit: int = 20):
+    """Finished render outputs for this project, newest first.
+
+    Read from DISK, not from `project.renders`: the render runs in its own process and
+    saves its `status`/`output_path` there, but the parent can overwrite that record with
+    its own (older) copy on the next project write — so the job list says "pending" for
+    videos that finished fine. The files are the truth. Lets the UI restore the last movie
+    after a reload or after the preview pane is used for something else.
+    """
+    root = config.PROJECTS_DIR / pid / "renders"
+    if not root.is_dir():
+        return {"renders": []}
+    out = []
+    for d in root.iterdir():
+        # thumbnail jobs write a single still per keyframe; not movies, skip them
+        if not d.is_dir() or d.name.startswith("thumb"):
+            continue
+        f = next((d / n for n in ("output.mp4", "output.png", "scene.blend")
+                  if (d / n).exists()), None)
+        if f is None:
+            continue
+        st = f.stat()
+        out.append({"job_id": d.name, "file": f.name, "size": st.st_size,
+                    "mtime": st.st_mtime, "kind": f.suffix.lstrip("."),
+                    "hq": (d / "output_hq.mp4").exists(),
+                    "url": f"/api/projects/{pid}/renders/{d.name}/output"})
+    out.sort(key=lambda r: r["mtime"], reverse=True)
+    return {"renders": out[:max(1, int(limit))]}
 
 
 @app.get("/api/renders/{job_id}/latest_frame")

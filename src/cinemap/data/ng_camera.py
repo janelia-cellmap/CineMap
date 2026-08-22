@@ -109,6 +109,34 @@ def ng_to_camera(state: dict, voxel_nm, fov_deg: float = NG_FOV_DEG) -> Camera:
                   fov_deg=fov_deg, up=up.tolist())
 
 
+# Named single-panel layouts ("xy", "xz", "yz", optionally suffixed "-3d") all share the
+# one `crossSectionOrientation` quaternion, but each looks along a DIFFERENT local axis --
+# the one missing from its name (xy -> local Z is depth, xz -> local Y, yz -> local X).
+# Empirically confirmed against this project's own data: for an "xz" keyframe, only the
+# local-Y-as-depth normal matched a nearby keyframe's camera view direction; local-Z (the
+# "xy" assumption) did not. Layouts with no single dedicated 2D panel ("3d", "4panel", …)
+# fall back to the "xy" convention, matching neuroglancer's own default.
+_PANEL_DEPTH_LOCAL = {"xy": [0.0, 0.0, 1.0], "xz": [0.0, 1.0, 0.0], "yz": [1.0, 0.0, 0.0]}
+
+
+def ng_cross_section_plane(state: dict, voxel_nm) -> tuple[list[float], list[float]]:
+    """The live 2D cross-section panel's plane, as (point_nm, normal_xyz).
+
+    Baking must read `crossSectionOrientation` (+ which named panel is showing) instead of
+    assuming a flat Z-axis plane, or a rotated/xz/yz-panel view gets silently flattened to
+    the wrong plane on bake."""
+    perm = _xyz_perm(state)
+    vox = _vox(_voxel_nm_from_state(state, voxel_nm))
+    pos_vox = np.array(state.get("position") or [0, 0, 0], dtype=float)
+    point = (pos_vox * vox)[perm]
+    q = state.get("crossSectionOrientation") or [0.0, 0.0, 0.0, 1.0]
+    layout = state.get("layout")
+    panel = layout.split("-")[0] if isinstance(layout, str) else "xy"
+    depth_local = _PANEL_DEPTH_LOCAL.get(panel, _PANEL_DEPTH_LOCAL["xy"])
+    normal = Rotation.from_quat(q).apply(depth_local)[perm]
+    return point.tolist(), normal.tolist()
+
+
 def camera_to_ng(camera: Camera, voxel_nm, base_state: dict | None = None) -> dict:
     state = dict(base_state or {})
     perm = _xyz_perm(state)

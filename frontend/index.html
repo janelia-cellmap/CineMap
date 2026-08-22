@@ -44,6 +44,14 @@
   #ngWrap { flex:1; min-height:0; }
   #preview { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; background:#000; }
   #preview img, #preview video { max-width:100%; max-height:100%; }
+  /* the persistent finished-render pane (see #lastRender in the markup) */
+  #lastRender { flex:0 0 200px; min-height:0; display:flex; align-items:center;
+                justify-content:center; background:#000; }
+  #lastRender.collapsed { display:none; }
+  #lastRender img, #lastRender video { max-width:100%; max-height:100%; }
+  .lrlink { color:var(--mut); text-decoration:none; font-size:11px; }
+  .lrlink:hover { color:var(--accent); }
+  .lrlink.off { opacity:.3; pointer-events:none; }
   .controls { padding:8px 10px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; border-top:1px solid var(--line); }
   .controls label { font-size:12px; color:var(--mut); }
   .controls input:not([type=checkbox]) { width:64px; }
@@ -69,6 +77,10 @@
   .kfmark { position:absolute; top:0; width:92px; height:60px; border:1px solid var(--line); border-radius:6px; background:linear-gradient(#1b2430,#10161e); background-size:cover; background-position:center; font-size:11px; cursor:pointer; overflow:hidden; z-index:2; }
   .kfmark:hover { border-color:#5a6473; }
   .kfmark.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); z-index:4; }
+  /* nudged off its true time because it shares an instant with the frame before it
+     (a 0s move) — sits above so the stack stays clickable, with a visible left edge */
+  .kfmark.stacked { z-index:3; box-shadow:-2px 0 0 #5a6473; }
+  .kfmark.stacked.active { z-index:4; }
   .kfmark.drop { border-color:#5aff7a; box-shadow:-3px 0 0 #5aff7a; }
   .kfmark .lbl { font-weight:600; cursor:grab; padding:2px 5px; background:linear-gradient(#000a,#0000); text-shadow:0 1px 2px #000; border-radius:6px 6px 0 0; }
   .kfmark .kftools { position:absolute; top:2px; right:3px; display:flex; gap:2px; opacity:0; transition:opacity .1s; }
@@ -103,9 +115,13 @@
   .swsnap { position:absolute; top:4px; height:22px; width:2px; background:#8a8fff; pointer-events:none; box-shadow:0 0 4px #8a8fff; }
   #swHover .swhovcap { font-size:10px; color:#aab0ff; margin-bottom:4px; }
   /* click-to-edit popover for a transition (duration + easing) */
+  /* max-height + scroll: the popover grew (camera / layers / EM slice / timing) and a
+     click near the bottom of the window used to push the Apply button off-screen. */
   #transEdit { position:fixed; z-index:80; display:none; width:228px; background:#1a1d22;
                border:1px solid #3a3f47; border-radius:8px; padding:10px 12px; font-size:12px;
-               box-shadow:0 6px 24px rgba(0,0,0,.55); }
+               box-shadow:0 6px 24px rgba(0,0,0,.55);
+               max-height:calc(100vh - 20px); overflow-y:auto; }
+  #transEdit label { white-space:nowrap; }     /* "EM slice" must not wrap to 2 lines */
   #transEdit .te-hd { display:flex; justify-content:space-between; align-items:center; font-weight:600; margin-bottom:8px; }
   #transEdit .te-x { cursor:pointer; opacity:.7; }
   #transEdit .te-x:hover { opacity:1; }
@@ -150,6 +166,21 @@
   <div class="col right">
     <div class="pane-title">⬡ Render preview</div>
     <div id="preview"><span class="msg">render output appears here</span></div>
+    <!-- The finished movie lives in its OWN pane: #preview above is reused for live
+         frames, keyframe thumbnails and sweep snapshots, so clicking anything used to
+         throw the movie away. This one only ever holds finished renders, and reloads
+         the newest one from disk on open (so a page refresh doesn't lose it either). -->
+    <div class="pane-title" style="border-top:1px solid var(--line)">🎬 Last render
+      <select id="lrSel" onchange="showLastRender(this.value)" style="max-width:132px"
+              title="pick an earlier render of this project"></select>
+      <span class="grow"></span>
+      <a id="lrDl" class="lrlink" href="#" download title="download this file">⬇</a>
+      <a id="lrDlHq" class="lrlink" href="#" download
+         title="download the near-lossless yuv444p encode (Chrome/VLC, not QuickTime)">hq</a>
+      <span id="lrToggle" onclick="toggleLastRender()" style="cursor:pointer"
+            title="collapse / expand this pane">▾</span>
+    </div>
+    <div id="lastRender"><span class="msg">no finished render yet</span></div>
     <div class="controls">
       <label title="output width in pixels">w</label><input id="w" value="1280" />
       <label title="output height in pixels">h</label><input id="h" value="720" />
@@ -178,6 +209,18 @@
           <option value="single">single</option>
           <option value="chunk">per-chunk (exp)</option>
         </select></label>
+      <input id="arrowLayers" placeholder="arrows: auto" style="width:104px" list="arrowLayerList"
+        onchange="saveArrowLayers()"
+        title="Annotation layers whose LINE annotations render as 3D arrows — draw a line in neuroglancer (click the tail, click the tip) and it becomes an arrow pointing at the tip. Comma-separated layer names; leave blank to use any layer with &quot;arrow&quot; in its name." />
+      <datalist id="arrowLayerList"></datalist>
+      <input id="arrowScale" type="number" min="0.1" max="20" step="0.25" value="1" style="width:52px"
+        onchange="saveArrowLayers()"
+        title="Arrow weight — multiplies shaft and head thickness relative to the arrow&#39;s own length (1 = shaft radius 3% of the length; try 2–4 for a bold callout). Independent of &#39;lock&#39;, which sets how much of the frame the arrow spans." />
+      <label class="chk" title="Lock arrows to the VIEW: each frame the arrow is scaled about its tip so it always covers the same fraction of the frame — visible when you're zoomed out, not ginormous when you're zoomed in. Off = literal nm size."><input id="arrowLock" type="checkbox" onchange="saveArrowLayers()" /> lock</label>
+      <input id="arrowFrac" type="number" min="0.02" max="1" step="0.05" value="0.25" style="width:52px"
+        onchange="saveArrowLayers()"
+        title="With &#39;lock&#39; on: the fraction of the FRAME HEIGHT an arrow spans, at every zoom. 0.25 = a quarter of the frame; 0.5 fills half of it." />
+      <span id="arrowStatus" class="msg" title="which annotation layers are currently rendering their lines as arrows"></span>
       <button id="previewBtn" onclick="startRender('preview')">▷ Preview</button>
       <label title="preview renders at fps ÷ this">1/</label><input id="ratio" value="10" style="width:44px" />
       <button id="cancelBtn" onclick="cancelRender()" style="display:none;background:#7d2e2e;border-color:transparent;color:#fff">■ Cancel</button>
@@ -529,6 +572,8 @@ async function openProject(pid) {
   const p = await api('GET', `/api/projects/${pid}`);
   clearFrameSelection();
   applyRenderPrefs(p); await loadNg(); renderKeyframes(p); setStatus('opened ' + p.name);
+  restoreLastRenderCollapsed(); loadLastRenders();   // bring back this project's last movie
+  loadArrowStatus();
 }
 
 async function loadNg() {
@@ -544,6 +589,7 @@ async function reload() {
     KF_DIFFS = {}; (d.diffs || []).forEach(x => KF_DIFFS[x.keyframe_id] = x.changes);
   } catch (e) { KF_DIFFS = {}; }
   renderKeyframes(p);
+  loadArrowStatus();   // a fresh bake can bring in new annotation layers
 }
 let KF_DIFFS = {};
 // a small "Δn" badge per keyframe showing how many layer settings changed vs the
@@ -583,6 +629,8 @@ const holdS = k => Math.max(0, +(k && k.hold_in_s) || 0);
 const transStyle = k => (k && ['glide','cut','fade'].includes(k.transition)) ? k.transition : 'glide';
 const layerTrans = k => (k && ['fade','cut'].includes(k.layer_transition)) ? k.layer_transition : 'fade';
 const layerAt = k => Math.max(0, Math.min(1, +(k && k.layer_transition_at != null ? k.layer_transition_at : 1)));
+const emTrans = k => (k && ['glide','fade','cut'].includes(k.em_transition)) ? k.em_transition : 'glide';
+const emAt = k => (k && k.em_transition_at != null) ? Math.round(k.em_transition_at*100) : '';
 const transIcon = s => s === 'cut' ? '⏭' : (s === 'fade' ? '◐' : '▶');
 function keyframeTimes(kfs) {
   const tAt = [0];
@@ -614,8 +662,17 @@ function renderKeyframes(p) {
   const swEnd = Math.max(0, ...(p.sweeps||[]).map(s=>s.start_s+s.duration_s));
   const Tm = Math.max(T, swEnd, 0.1);
   TL_XOF = (t)=>t*TL_PX + MARKER/2;             // shift right by half a marker so KF0 fits
+  // Card x, with coincident frames fanned out. A 0s move (e.g. a duplicate pasted next to
+  // its source) puts two keyframes at the SAME instant, and two cards at the same x hide
+  // each other — the paste looks like it did nothing. Cascade them just enough to grab.
+  const CASCADE = 26;
+  const xAt = [];
+  for (let i=0;i<kfs.length;i++){
+    const x = TL_XOF(tAt[i]) - MARKER/2;
+    xAt.push(i ? Math.max(x, xAt[i-1] + CASCADE) : x);
+  }
   TL_BAR_X = (t)=>t*TL_PX;
-  TL_WIDTH = TL_BAR_X(Tm) + MARKER;
+  TL_WIDTH = Math.max(TL_BAR_X(Tm) + MARKER, xAt[kfs.length-1] + MARKER + 8);
   let html='';
   // hold blocks after keyframes
   for (let i=0;i<kfs.length;i++){
@@ -627,7 +684,9 @@ function renderKeyframes(p) {
   }
   // transition blocks between consecutive keyframes
   for (let i=1;i<kfs.length;i++){
-    const k=kfs[i], st=transStyle(k), lt=layerTrans(k), la=layerAt(k), x0=TL_BAR_X(tAt[i-1] + holdS(kfs[i-1])), w=Math.max(2,durS(k)*TL_PX);
+    // min width 18px: a 0s (or very short) move still needs a bar you can click to edit
+    // and a grip you can drag — at 2px it was there but unusable.
+    const k=kfs[i], st=transStyle(k), lt=layerTrans(k), la=layerAt(k), x0=TL_BAR_X(tAt[i-1] + holdS(kfs[i-1])), w=Math.max(18,durS(k)*TL_PX);
     const hold = JSON.stringify(kfs[i-1].camera)===JSON.stringify(k.camera);   // identical pose = a dwell
     html += `<div class="tltrans ${hold?'hold ':''}${st}${lt==='cut'?' layercut':''}" style="left:${x0}px;width:${w}px"
         title="camera: ${hold?'hold pose':st} · layers: ${lt}${lt==='cut'?' @ '+Math.round(la*100)+'%':''} · into KF${i} · ${fmtS(durS(k))}s · click to edit · drag the right edge to resize" onclick="openTransEdit(event,'${k.id}')">
@@ -637,13 +696,14 @@ function renderKeyframes(p) {
   // keyframe markers (instants) — thumbnails centered on their time
   for (let i=0;i<kfs.length;i++){
     const k=kfs[i];
-    html += `<div class="kfmark${k.thumbnail_path?' hasthumb':''}${k.id===ACTIVE_KF?' active':''}" draggable="true" data-id="${k.id}"
-        style="${thumbBg(k)}left:${TL_XOF(tAt[i])-MARKER/2}px"
-        title="KF${i} · click to view · drag to reorder"
+    const stacked = xAt[i] > TL_XOF(tAt[i]) - MARKER/2 + 0.5;   // nudged off its true time
+    html += `<div class="kfmark${k.thumbnail_path?' hasthumb':''}${k.id===ACTIVE_KF?' active':''}${stacked?' stacked':''}" draggable="true" data-id="${k.id}"
+        style="${thumbBg(k)}left:${xAt[i]}px"
+        title="KF${i} · ${fmtS(tAt[i])}s${i && durS(k) <= 0 ? ' · same instant as KF'+(i-1) : ''} · click to view · drag to reorder"
         onclick="gotoKf('${k.id}',this)" ondragstart="kfDragStart(event,'${k.id}')" ondragover="kfDragOver(event,this)" ondragleave="this.classList.remove('drop')" ondrop="kfDrop(event,'${k.id}')">
       <span class="kftools" onclick="event.stopPropagation()" onmousedown="event.stopPropagation()">
         <button class="kfbtn${k.id===KF_CLIPBOARD_ID?' on':''}" draggable="false" onclick="copyKf('${k.id}',event)" title="Copy this keyframe">⧉</button>
-        <button class="kfbtn" draggable="false" onclick="pasteKf('${k.id}',event)" title="Paste copied keyframe after this one">✚</button>
+        <button class="kfbtn" draggable="false" onclick="pasteKf('${k.id}',event)" title="Paste the copied keyframe directly after THIS card (KF${i}) — it becomes KF${i+1}">✚</button>
         <button class="kfbtn danger" draggable="false" onclick="delKf('${k.id}',event)" title="Delete this keyframe">✕</button>
       </span>
       ${diffBadge(k.id)}<div class="lbl">KF${i}</div></div>`;
@@ -670,6 +730,7 @@ function openTransEdit(e, id) {
   const st = transStyle(k);
   const lt = layerTrans(k);
   const la = layerAt(k);
+  const em = emTrans(k);
   let pop=$('transEdit');
   if(!pop){ pop=document.createElement('div'); pop.id='transEdit'; document.body.appendChild(pop); }
   pop.innerHTML=`
@@ -681,17 +742,27 @@ function openTransEdit(e, id) {
       ${[['fade','fade layer changes'],['cut','cut layer changes']].map(([v,t])=>`<option value="${v}"${lt===v?' selected':''}>${t}</option>`).join('')}
     </select></label>
     <label>layer switch <input id="teLayerAt" type="number" min="0" max="100" step="5" value="${Math.round(la*100)}" />%</label>
+    <label>EM slice <select id="teEmTrans">
+      ${[['glide','scroll / rotate'],['fade','cross-fade'],['cut','cut']].map(([v,t])=>`<option value="${v}"${em===v?' selected':''}>${t}</option>`).join('')}
+    </select></label>
+    <label title="Where in this move an EM cut happens. Blank = automatic: a plane that turns on or off does it the instant the move starts (scan, then rotate away with the slice already gone), a plane-to-plane cut lands on the keyframe.">EM switch <input id="teEmAt" type="number" min="0" max="100" step="5" placeholder="auto" value="${emAt(k)}" />%</label>
     <label>duration <input id="teDur" type="number" min="0" step="0.1" value="${fmtS(durS(k))}" />s</label>
     <label>easing <select id="teEase">
       ${['ease-in-out','linear','ease-in','ease-out'].map(o=>`<option value="${o}"${(k.easing||'ease-in-out')===o?' selected':''}>${o}</option>`).join('')}
     </select></label>` : ''}
     <label>hold after <input id="teHold" type="number" min="0" step="0.1" value="${fmtS(holdS(k))}" />s</label>
+    <label><input id="teOrtho" type="checkbox"${k.camera.orthographic?' checked':''} onchange="$('teOrthoScale').disabled=!this.checked" /> orthographic camera</label>
+    <label>ortho scale <input id="teOrthoScale" type="number" min="1" step="10" value="${Math.round(k.camera.ortho_scale_nm||1000)}"${k.camera.orthographic?'':' disabled'} />nm</label>
     <div class="te-row"><button onclick="gotoKf('${id}',null); closeTransEdit()">view</button>
       <button class="primary" onclick="applyTransEdit('${id}')">apply</button></div>
-    <div class="te-hint">Layer cut switches at the chosen percent of the camera move.</div>`;
+    <div class="te-hint">Layer cut switches at the chosen percent of the camera move. EM "cut" turns the cross-section on/off outright — an EM scan that ends is gone the moment the camera moves on, with no dissolve. EM slice "glide" scrolls/rotates the cross-section from the previous keyframe's plane to this one, like neuroglancer. Orthographic: no perspective foreshortening — a slice moving in depth doesn't change size, like scrolling a flat 2D stack.</div>`;
   pop.style.left=Math.min(e.clientX, window.innerWidth-252)+'px';
-  pop.style.top=Math.max(10, e.clientY-210)+'px';
+  // show first, THEN clamp: the height depends on the content (KF0 has no camera/EM
+  // rows), so a fixed offset pushed Apply off the bottom of the window on tall popovers.
+  pop.style.top='0px';
   pop.style.display='block';
+  const h=pop.offsetHeight;
+  pop.style.top=Math.max(10, Math.min(e.clientY-210, window.innerHeight-h-10))+'px';
   const focusEl = $('teDur') || $('teHold');
   if (focusEl) { focusEl.focus(); focusEl.select(); }
   setTimeout(()=>document.addEventListener('mousedown', _teOutside), 0);
@@ -705,8 +776,18 @@ async function applyTransEdit(id){
   if ($('teTrans')) fields.transition = $('teTrans').value;
   if ($('teLayerTrans')) fields.layer_transition = $('teLayerTrans').value;
   if ($('teLayerAt')) fields.layer_transition_at = Math.max(0, Math.min(100, parseFloat($('teLayerAt').value)||0)) / 100;
+  if ($('teEmTrans')) fields.em_transition = $('teEmTrans').value;
+  // blank clears it back to automatic (the server reads <0 as "unset")
+  if ($('teEmAt')) { const v = $('teEmAt').value.trim();
+                     fields.em_transition_at = v === '' ? -1 : Math.max(0, Math.min(100, parseFloat(v)||0)) / 100; }
+  const orthographic = $('teOrtho') ? $('teOrtho').checked : null;
+  const ortho_scale_nm = $('teOrthoScale') ? Math.max(1, parseFloat($('teOrthoScale').value)||1000) : null;
   closeTransEdit();
   await setKfTiming(id, fields);
+  if (orthographic !== null) {
+    await api('PUT', `/api/projects/${PID}/keyframes/${id}/camera`, {orthographic, ortho_scale_nm});
+    reload();
+  }
 }
 // the time (s) on the timeline of the keyframe you're currently on — anchors new sweeps "here"
 function activeKfTime(){ const id=ACTIVE_KF||LAST_KF_ID; return (id!=null && KF_TIME[id]!=null) ? KF_TIME[id] : 0; }
@@ -897,7 +978,10 @@ function copyKf(id, e) {
   if (e) { e.preventDefault(); e.stopPropagation(); }
   if (!PID || !id) return;
   KF_CLIPBOARD_ID = id;
-  setStatus(`copied ${kfLabel(id)}`);
+  // also SELECT what you copied: ctrl+V pastes after the selected frame, and copying
+  // without selecting made it paste after whatever card you happened to click last.
+  ACTIVE_KF = id;
+  setStatus(`copied ${kfLabel(id)} — ✚ on a card (or ctrl+V) pastes right after it`);
   if (CUR) renderKeyframes(CUR);
 }
 async function pasteKf(afterId, e) {
@@ -913,7 +997,8 @@ async function pasteKf(afterId, e) {
     ACTIVE_KF = kf.id;
     await reload();
     showKeyframeThumb(kf.id);
-    setStatus(`pasted ${sourceLabel} after ${afterLabel}`);
+    // report where it ACTUALLY landed (from the server), not where we asked
+    setStatus(`pasted ${sourceLabel} after ${afterLabel} → now KF${kf.index}`);
   } catch (err) { setStatus('paste failed: ' + err.message); }
 }
 async function duplicateCurrentKeyframe() {
@@ -1356,6 +1441,48 @@ function rgb01ToHex(rgb) {
   const h = v => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
   return Array.isArray(rgb) && rgb.length >= 3 ? `#${h(rgb[0])}${h(rgb[1])}${h(rgb[2])}` : '#9ea8bd';
 }
+// Arrow layers live on the PROJECT (not render_prefs): they change what geometry is
+// built, and must survive re-baking a keyframe from neuroglancer.
+async function saveArrowLayers() {
+  if (!PID) return;
+  const scale = parseFloat($('arrowScale').value) || 1;
+  const frac = parseFloat($('arrowFrac').value) || 0.25;
+  // scale = THICKNESS (relative to the arrow's own length); lock = apparent SIZE.
+  // Keeping them separate matters: tying thickness to the view-lock made a locked arrow
+  // impossible to fatten, since growing it grew its length by the same factor.
+  try { showArrowStatus(await api('PUT', `/api/projects/${PID}/arrow_layers`,
+                                  { layers: $('arrowLayers').value, scale,
+                                    screen_frac: $('arrowLock').checked ? frac : 0 })); }
+  catch (e) {}
+}
+// Answer "is my layer an arrow layer?" without rendering: list every annotation layer
+// on the keyframes, marking the ones whose lines currently render as arrows.
+async function loadArrowStatus() {
+  if (!PID) return;
+  try { showArrowStatus(await api('GET', `/api/projects/${PID}/arrow_layers`)); } catch (e) {}
+}
+function showArrowStatus(st) {
+  const el = $('arrowStatus'), dl = $('arrowLayerList');
+  if (!el || !st) return;
+  const layers = st.layers || [];
+  if (st.arrow_scale != null && $('arrowScale')) $('arrowScale').value = st.arrow_scale;
+  const frac = st.arrow_screen_frac || 0;
+  if ($('arrowLock')) $('arrowLock').checked = frac > 0;
+  // keep the last locked fraction in the box when the lock is off, so unticking and
+  // reticking doesn't silently resize every arrow in the movie
+  if (frac > 0 && $('arrowFrac')) $('arrowFrac').value = frac;
+  dl.innerHTML = layers.map(l => `<option value="${l.name}"></option>`).join('');
+  const on = layers.filter(l => l.arrows);
+  // a layer can be marked and still draw nothing — arrows come from LINE annotations
+  const empty = on.filter(l => !l.n_lines).map(l => l.name);
+  const detail = layers.map(l => `${l.arrows ? '➔' : '·'} ${l.name} (${l.n_lines} line${l.n_lines === 1 ? '' : 's'})`).join('\n');
+  el.title = (layers.length ? detail : 'no annotation layers on any keyframe')
+    + `\n\nmode: ${st.mode === 'explicit' ? 'explicit list' : 'auto — any layer named *arrow*'}`;
+  el.textContent = !layers.length ? '' :
+    on.length ? `➔ ${on.map(l => l.name).join(', ')}${empty.length ? ' (no lines!)' : ''}`
+              : '➔ none';
+  el.style.color = on.length && !empty.length ? 'var(--accent)' : 'var(--mut)';
+}
 // persist the render controls on the project so they survive reload + travel with export
 function saveRenderPrefs() {
   if (!PID) return;
@@ -1369,6 +1496,7 @@ function saveRenderPrefs() {
 }
 // apply a project's saved render controls back onto the UI (only if it has any)
 function applyRenderPrefs(p) {
+  if ($('arrowLayers')) $('arrowLayers').value = ((p && p.arrow_layers) || []).join(', ');
   const rp = p && p.render_prefs;
   if (!rp) return;
   const set = (id, v) => { const el = $(id); if (el != null && v != null) el.value = v; };
@@ -1453,16 +1581,70 @@ async function cancelRender() {
   }, 8000);
 }
 
+// ------------------- persistent "last render" pane -------------------
+// Finished renders are read from DISK (/renders/history), not from the project's job
+// list: the render subprocess owns that record and the parent can overwrite it with an
+// older copy, so a finished movie often still says "pending" there.
+let LAST_RENDERS = [];
+function fmtBytes(n) { return n > 1e6 ? (n/1e6).toFixed(1)+' MB' : Math.round(n/1e3)+' kB'; }
+function fmtWhen(ts) {
+  const d = new Date(ts*1000);
+  const same = d.toDateString() === new Date().toDateString();
+  return (same ? '' : d.toLocaleDateString([], {month:'short', day:'numeric'}) + ' ')
+    + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+async function loadLastRenders(prefer_job) {
+  if (!PID) return;
+  try { LAST_RENDERS = (await api('GET', `/api/projects/${PID}/renders/history`)).renders || []; }
+  catch (e) { LAST_RENDERS = []; }
+  const sel = $('lrSel');
+  sel.innerHTML = LAST_RENDERS.map(r =>
+    `<option value="${r.job_id}">${fmtWhen(r.mtime)} · ${r.kind} · ${fmtBytes(r.size)}</option>`).join('');
+  if (!LAST_RENDERS.length) {
+    $('lastRender').innerHTML = '<span class="msg">no finished render yet</span>';
+    $('lrDl').classList.add('off'); $('lrDlHq').classList.add('off');
+    return;
+  }
+  const pick = LAST_RENDERS.some(r => r.job_id === prefer_job) ? prefer_job : LAST_RENDERS[0].job_id;
+  sel.value = pick;
+  showLastRender(pick);
+}
+function showLastRender(job_id) {
+  const r = LAST_RENDERS.find(x => x.job_id === job_id);
+  const pane = $('lastRender');
+  if (!r) { pane.innerHTML = '<span class="msg">no finished render yet</span>'; return; }
+  $('lrDl').href = r.url; $('lrDl').classList.remove('off');
+  $('lrDlHq').href = r.url + '?hq=1';
+  $('lrDlHq').classList.toggle('off', !r.hq);
+  // no autoplay: this pane persists across clicks, and a movie that restarts itself
+  // every time the project reloads is worse than one you press play on.
+  pane.innerHTML = r.kind === 'mp4' ? `<video src="${r.url}" controls loop preload="metadata"></video>`
+    : r.kind === 'png' ? `<img src="${r.url}" />`
+    : `<span class="msg">.blend ready — <a class="lrlink" href="${r.url}" download style="color:var(--accent)">download</a></span>`;
+}
+function toggleLastRender() {
+  const pane = $('lastRender'), on = pane.classList.toggle('collapsed');
+  $('lrToggle').textContent = on ? '▸' : '▾';
+  try { localStorage.setItem('cinemap.lastRenderCollapsed', on ? '1' : ''); } catch (e) {}
+}
+function restoreLastRenderCollapsed() {
+  let on = false;
+  try { on = !!localStorage.getItem('cinemap.lastRenderCollapsed'); } catch (e) {}
+  if (on) { $('lastRender').classList.add('collapsed'); $('lrToggle').textContent = '▸'; }
+}
+
 function showOutput(job_id, out) {
   const prev = $('preview');
   const url = `/api/projects/${PID}/renders/${job_id}/output?t=${Date.now()}`;
   if (out && out.endsWith('.blend')) {            // not previewable — offer the download
     prev.innerHTML = `<span class="msg">.blend ready — <a href="${url}" download style="color:var(--accent)">download scene.blend</a></span>`;
+    loadLastRenders(job_id);
     return;
   }
   prev.innerHTML = (out && out.endsWith('.mp4'))
     ? `<video src="${url}" controls autoplay loop></video>`
     : `<img src="${url}" />`;
+  loadLastRenders(job_id);   // and keep it in the pane that survives clicking away
 }
 
 // ----------------------------- Claude chat -----------------------------
