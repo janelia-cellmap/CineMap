@@ -206,6 +206,10 @@
       <label class="chk" title="Draw a thin wireframe box around each data source's extent (the EM volume and/or each rendered layer's label volume), like neuroglancer's bounding box. Falls back to a tight box around the rendered meshes when a layer has no volume source."><input id="showBbox" type="checkbox" /> bbox</label>
       <input id="bboxColor" type="color" value="#9ea8bd" title="bounding-box wireframe color" style="width:24px;height:20px;padding:0;border:1px solid var(--line);background:none;cursor:pointer" />
       <select id="bboxSource" title="Which layer the bounding box is drawn from (its data/mesh extent) — works even if that layer is hidden. Auto = the EM volume, or all visible meshes." style="max-width:120px"><option value="">bbox: auto</option></select>
+      <label class="chk" title="Neuroglancer-style scale bar in the bottom-left corner (e.g. '500 nm', '2 µm') — snaps to a round number and switches SI unit as the camera zooms. Exact for orthographic frames; anchored to the camera's look-at depth (like the fixed-size arrows) for perspective ones."><input id="showScaleBar" type="checkbox" onchange="saveRenderPrefs()" /> scale bar</label>
+      <label title="Scale-bar SIZE: scales the label text, the bar's thickness and its length together (neuroglancer's own scaleFactor), so it keeps its proportions instead of growing spindly, and it keeps the same on-screen size whatever resolution you render at. Default 1.">size
+        <input id="scaleBarScale" type="number" min="0.2" max="10" step="0.25" value="1" style="width:52px"
+          onchange="saveRenderPrefs()" /></label>
       <label title="Mesh level-of-detail strategy (how fine the meshes are): Single = one resolution for the whole shot (used automatically when cutting away). Per-frame = coarser when a layer is far/small, finer on close-ups, like neuroglancer (free on orbits). Per-chunk = different detail within one mesh by on-screen size (experimental).">lod
         <select id="lodMode">
           <option value="frame" selected>per-frame</option>
@@ -223,6 +227,11 @@
       <label class="chk" title="SAME APPARENT SIZE AT EVERY ZOOM. On: each frame the arrow is rescaled about its tip (so the point stays on the structure) to cover the fraction of the frame set to the right — readable in a wide establishing shot, not ginormous on a close-up. Off: the arrow is exactly as long as the line you drew in neuroglancer, so it shrinks as you pull back."><input id="arrowLock" type="checkbox" onchange="saveArrowLayers()" /> fixed size</label>
       <label title="How much of the FRAME HEIGHT one arrow spans when &#39;fixed size&#39; is on: 0.25 = a quarter of the frame, 0.5 = half. Lower it for a shot that reveals several arrows at once.">screen
         <input id="arrowFrac" type="number" min="0.02" max="1" step="0.05" value="0.25" style="width:52px"
+          onchange="saveArrowLayers()" /></label>
+      <label class="chk" title="Draw a text tag past each arrow's tail. Default is the layer name with &#39;arrow(s)&#39; stripped — e.g. a layer named &#39;pore arrows&#39; labels itself &#39;pore&#39;. Rides the arrow's own screen-lock scale and stays a small, constant on-screen size."><input id="arrowLabels" type="checkbox" onchange="saveArrowLayers()" /> labels</label>
+      <label class="chk" title="Draw arrows FLAT on the screen (a 2D callout) instead of as 3D objects in the scene. A 3D arrow's apparent length depends on how squarely it faces the camera, so two arrows set to the same size come out different lengths, and it can be hidden behind the EM plane. Flat arrows read identically every time and nothing can cover them."><input id="arrows2d" type="checkbox" onchange="saveArrowLayers()" /> flat</label>
+      <label title="Label TEXT SIZE, as a multiple of the base height (3.5% of the frame). Default 3 ≈ a tenth of the frame height; 6 is twice that. Labels are always kept fully inside the frame and clear of each other, so a bigger one gets nudged further from the edge.">size
+        <input id="arrowLabelScale" type="number" min="0.2" max="10" step="0.25" value="3" style="width:52px"
           onchange="saveArrowLayers()" /></label>
       <span id="arrowStatus" class="msg" title="Every annotation layer on the timeline: ➔ = its lines render as arrows, · = it renders as plain tubes. (n lines) is how many arrows that layer will draw."></span>
       <button id="previewBtn" onclick="startRender('preview')">▷ Preview</button>
@@ -1457,7 +1466,10 @@ async function saveArrowLayers() {
   // impossible to fatten, since growing it grew its length by the same factor.
   try { showArrowStatus(await api('PUT', `/api/projects/${PID}/arrow_layers`,
                                   { layers: $('arrowLayers').value, scale,
-                                    screen_frac: $('arrowLock').checked ? frac : 0 })); }
+                                    screen_frac: $('arrowLock').checked ? frac : 0,
+                                    labels: $('arrowLabels').checked,
+                                    label_scale: parseFloat($('arrowLabelScale').value) || 1,
+                                    flat: $('arrows2d').checked })); }
   catch (e) {}
 }
 // Answer "is my layer an arrow layer?" without rendering: list every annotation layer
@@ -1477,6 +1489,10 @@ function showArrowStatus(st) {
   // keep the last locked fraction in the box when the lock is off, so unticking and
   // reticking doesn't silently resize every arrow in the movie
   if (frac > 0 && $('arrowFrac')) $('arrowFrac').value = frac;
+  if ($('arrowLabels')) $('arrowLabels').checked = !!st.arrow_labels;
+  if ($('arrows2d')) $('arrows2d').checked = !!st.arrows_2d;
+  if (st.arrow_label_scale != null && $('arrowLabelScale'))
+    $('arrowLabelScale').value = st.arrow_label_scale;
   dl.innerHTML = layers.map(l => `<option value="${l.name}"></option>`).join('');
   const on = layers.filter(l => l.arrows);
   // a layer can be marked and still draw nothing — arrows come from LINE annotations
@@ -1496,8 +1512,9 @@ function saveRenderPrefs() {
     samples: +$('samples').value, mesh_detail: +$('detail').value || 1,
     auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
     show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
-    bbox_source: $('bboxSource').value, preview_ratio: +$('ratio').value || 10,
-    fast_sample: $('fastSample').checked };
+    bbox_source: $('bboxSource').value, show_scale_bar: $('showScaleBar').checked,
+    scale_bar_scale: +$('scaleBarScale').value || 1,
+    preview_ratio: +$('ratio').value || 10, fast_sample: $('fastSample').checked };
   api('PUT', `/api/projects/${PID}/render_prefs`, prefs).catch(() => {});
 }
 // apply a project's saved render controls back onto the UI (only if it has any)
@@ -1512,6 +1529,8 @@ function applyRenderPrefs(p) {
   if (rp.show_bbox != null) $('showBbox').checked = !!rp.show_bbox;
   if (rp.bbox_color) $('bboxColor').value = rgb01ToHex(rp.bbox_color);
   if (rp.bbox_source != null) $('bboxSource').value = rp.bbox_source;
+  if (rp.show_scale_bar != null) $('showScaleBar').checked = !!rp.show_scale_bar;
+  set('scaleBarScale', rp.scale_bar_scale);
   if (rp.fast_sample != null) $('fastSample').checked = !!rp.fast_sample;
 }
 async function startRender(mode) {
@@ -1535,7 +1554,8 @@ async function startRender(mode) {
                  draft: mode === 'preview', mesh_detail: +$('detail').value || 1,
                  auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
                  show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
-                 bbox_source: $('bboxSource').value };
+                 bbox_source: $('bboxSource').value, show_scale_bar: $('showScaleBar').checked,
+                 scale_bar_scale: +$('scaleBarScale').value || 1 };
   if (mode === 'blend') body.export_blend = true;   // bake an animated .blend, no video
   let job_id;
   try { ({ job_id } = await api('POST', `/api/projects/${PID}/render`, body)); }

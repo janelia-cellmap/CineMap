@@ -997,6 +997,210 @@ def _build_slices(frame: dict) -> None:
         _slice_objs.append(_make_slice(sl, str(i)))
 
 
+# Depth the scale-bar quad sits at, in the camera's near-plane units. Placed slightly
+# FARTHER than the fade overlay's z=-1 so a fade-to-black (same depth, full-screen)
+# always composites over it instead of the two coplanar quads z-fighting.
+_SCALE_BAR_DEPTH = 1.01
+# Arrow labels sit just BEHIND the scale bar (which is itself behind the fade overlay), so
+# a fade to black covers both and the scale bar wins if a label is pushed into its corner.
+_ARROW_LABEL_DEPTH = 1.02
+def _unlit_image_material(name: str, image_path: str):
+    """Unlit (emission) material sampling an RGBA PNG with straight alpha — shared by
+    the scale-bar HUD quad and arrow-label billboards, both 'just show this picture,
+    unaffected by scene lighting' overlays."""
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    tex = nt.nodes.new("ShaderNodeTexImage")
+    img = bpy.data.images.load(image_path, check_existing=True)
+    img.colorspace_settings.name = "sRGB"
+    img.alpha_mode = "STRAIGHT"
+    tex.image = img
+    emit = nt.nodes.new("ShaderNodeEmission")
+    emit.inputs["Strength"].default_value = 1.0
+    nt.links.new(tex.outputs["Color"], emit.inputs["Color"])
+    transp = nt.nodes.new("ShaderNodeBsdfTransparent")
+    mix = nt.nodes.new("ShaderNodeMixShader")
+    nt.links.new(tex.outputs["Alpha"], mix.inputs[0])
+    nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
+    nt.links.new(emit.outputs["Emission"], mix.inputs[2])
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+    mat.blend_method = "BLEND"
+    mat.show_transparent_back = False
+    return mat
+
+
+_scale_bar_obj = None
+_arrow_label_objs: list = []
+
+
+def _make_scale_bar_quad(frame: dict, name: str):
+    """Camera-relative HUD quad showing the scale-bar PNG the worker already sized and
+    labeled (neuroglancer-style: round number + SI unit) — anchored to the bottom-left
+    corner of the frame, unlit so scene lighting/exposure can't shift its brightness."""
+    sb = frame["scale_bar"]
+    cam = bpy.context.scene.camera
+    render_w = max(1, bpy.context.scene.render.resolution_x)
+    render_h = max(1, bpy.context.scene.render.resolution_y)
+    aspect = render_w / render_h
+    if cam and cam.data.type == "ORTHO":
+        frame_h = float(cam.data.ortho_scale) * _SCALE_BAR_DEPTH
+    else:
+        frame_h = 2.0 * math.tan(float(frame["camera"]["fov_rad"]) / 2.0) * _SCALE_BAR_DEPTH
+    px_to_local = frame_h / render_h
+
+    from PIL import Image as _PILImage
+    with _PILImage.open(sb["image_path"]) as im:
+        img_w, img_h = im.size
+    quad_w, quad_h = img_w * px_to_local, img_h * px_to_local
+    margin = 10.0 * px_to_local
+    x0 = -frame_h * aspect / 2.0 + margin
+    y0 = -frame_h / 2.0 + margin
+    z = -_SCALE_BAR_DEPTH
+    verts = [(x0, y0, z), (x0 + quad_w, y0, z), (x0 + quad_w, y0 + quad_h, z), (x0, y0 + quad_h, z)]
+    mesh = bpy.data.meshes.new(f"scalebar_{name}")
+    mesh.from_pydata(verts, [], [[0, 1, 2, 3]])
+    mesh.update()
+    mesh.uv_layers.new(name="UVMap")
+    uvs = [(0, 0), (1, 0), (1, 1), (0, 1)]   # bottom of the PNG (the bar) -> bottom of the quad
+    for li in range(len(mesh.loops)):
+        mesh.uv_layers.active.data[li].uv = uvs[li % 4]
+    obj = bpy.data.objects.new(f"scalebar_{name}", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    obj.parent = cam
+    obj.matrix_parent_inverse = Matrix.Identity(4)
+    obj.visible_shadow = False
+    obj.data.materials.append(_unlit_image_material(f"scalebar_mat_{name}", sb["image_path"]))
+    return obj
+
+
+def _make_arrow_label_quad(frame: dict, lbl: dict, name: str):
+    """Camera-locked overlay for one arrow's text tag, at the screen position the worker
+    computed (already clamped inside the frame).
+
+    Locked to the camera rather than placed in the scene for two reasons: the text stays
+    horizontal and legible under any camera roll, and — since it sits just past the near
+    plane — no geometry can ever be in front of it. A label the EM plane hides is a label
+    that isn't doing its job. Sits just BEHIND the scale bar, so the two never fight over
+    a corner, and behind the fade overlay, so a fade to black still covers it."""
+    cam = bpy.context.scene.camera
+    render_w = max(1, bpy.context.scene.render.resolution_x)
+    render_h = max(1, bpy.context.scene.render.resolution_y)
+    aspect = render_w / render_h
+    if cam and cam.data.type == "ORTHO":
+        frame_h = float(cam.data.ortho_scale) * _ARROW_LABEL_DEPTH
+    else:
+        frame_h = 2.0 * math.tan(float(frame["camera"]["fov_rad"]) / 2.0) * _ARROW_LABEL_DEPTH
+
+    from PIL import Image as _PILImage
+    with _PILImage.open(lbl["image_path"]) as im:
+        img_w, img_h = im.size
+    height = frame_h * float(lbl["height_frac"])
+    width = height * (img_w / max(1, img_h))
+    ndc_x, ndc_y = lbl["ndc"]
+    cx = float(ndc_x) * frame_h * aspect / 2.0
+    cy = float(ndc_y) * frame_h / 2.0
+    z = -_ARROW_LABEL_DEPTH
+    hw, hh = width / 2.0, height / 2.0
+    verts = [(cx - hw, cy - hh, z), (cx + hw, cy - hh, z),
+             (cx + hw, cy + hh, z), (cx - hw, cy + hh, z)]
+    mesh = bpy.data.meshes.new(f"arrowlabel_{name}")
+    mesh.from_pydata(verts, [], [[0, 1, 2, 3]])
+    mesh.update()
+    mesh.uv_layers.new(name="UVMap")
+    uvs = [(0, 0), (1, 0), (1, 1), (0, 1)]
+    for li in range(len(mesh.loops)):
+        mesh.uv_layers.active.data[li].uv = uvs[li % 4]
+    obj = bpy.data.objects.new(f"arrowlabel_{name}", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    obj.parent = cam
+    obj.matrix_parent_inverse = Matrix.Identity(4)
+    obj.visible_shadow = False
+    obj.data.materials.append(_unlit_image_material(f"arrowlabel_mat_{name}", lbl["image_path"]))
+    return obj
+
+
+def _make_arrow_2d(frame: dict, spec: dict, name: str):
+    """Flat, camera-locked arrow polygon (shaft + head) drawn at the same depth as the
+    labels, so it can't be occluded and its on-screen size never varies with orientation.
+
+    Coordinates arrive as NDC (-1..1 across the frame); the maths is done in frame-HEIGHT
+    units so the arrow keeps its proportions instead of shearing with the aspect ratio."""
+    cam = bpy.context.scene.camera
+    render_w = max(1, bpy.context.scene.render.resolution_x)
+    render_h = max(1, bpy.context.scene.render.resolution_y)
+    aspect = render_w / render_h
+    if cam and cam.data.type == "ORTHO":
+        frame_h = float(cam.data.ortho_scale) * _ARROW_LABEL_DEPTH
+    else:
+        frame_h = 2.0 * math.tan(float(frame["camera"]["fov_rad"]) / 2.0) * _ARROW_LABEL_DEPTH
+    half = frame_h / 2.0
+
+    tip = Vector((spec["tip"][0] * aspect, spec["tip"][1]))     # -> frame-height units
+    tail = Vector((spec["tail"][0] * aspect, spec["tail"][1]))
+    d = tip - tail
+    if d.length < 1e-9:
+        return None
+    d.normalize()
+    perp = Vector((-d.y, d.x))
+    hl, hw, sw = spec["head_len"], spec["head_w"] / 2.0, spec["shaft_w"] / 2.0
+    neck = tip - d * hl                       # where the head meets the shaft
+    pts2 = [tail + perp * sw, neck + perp * sw, neck + perp * hw, tip,
+            neck - perp * hw, neck - perp * sw, tail - perp * sw]
+    z = -_ARROW_LABEL_DEPTH
+    verts = [(p.x * half, p.y * half, z) for p in pts2]
+    faces = [[0, 1, 5, 6], [2, 3, 4]]         # shaft quad + head triangle
+    mesh = bpy.data.meshes.new(f"arrow2d_{name}")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(f"arrow2d_{name}", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    obj.parent = cam
+    obj.matrix_parent_inverse = Matrix.Identity(4)
+    obj.visible_shadow = False
+
+    mat = bpy.data.materials.new(f"arrow2d_mat_{name}")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    emit = nt.nodes.new("ShaderNodeEmission")
+    rgb = [_srgb_to_linear(c) for c in spec.get("color", [1.0, 1.0, 1.0])]
+    emit.inputs["Color"].default_value = (*rgb, 1.0)
+    emit.inputs["Strength"].default_value = 1.0
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    nt.links.new(emit.outputs["Emission"], out.inputs["Surface"])
+    obj.data.materials.append(mat)
+    return obj
+
+
+def _build_scale_bar(frame: dict) -> None:
+    """Live per-frame renderer: rebuild the HUD quad each frame (bar length + label
+    change with zoom), same rebuild-from-scratch approach as the EM slice quads."""
+    global _scale_bar_obj
+    if _scale_bar_obj is not None and _scale_bar_obj.name in bpy.data.objects:
+        bpy.data.objects.remove(_scale_bar_obj, do_unlink=True)
+    _scale_bar_obj = _make_scale_bar_quad(frame, "live") if frame.get("scale_bar") else None
+
+
+def _build_arrow_labels(frame: dict) -> None:
+    """Live per-frame renderer: rebuild every arrow's label overlay from scratch, same
+    rebuild-from-scratch approach as the EM slice quads and scale bar."""
+    global _arrow_label_objs
+    for o in _arrow_label_objs:
+        if o.name in bpy.data.objects:
+            bpy.data.objects.remove(o, do_unlink=True)
+    objs = []
+    for i, lbl in enumerate(frame.get("arrow_labels", [])):
+        objs.append(_make_arrow_label_quad(frame, lbl, f"live{i}"))
+        if lbl.get("arrow"):
+            a = _make_arrow_2d(frame, lbl["arrow"], f"live{i}")
+            if a is not None:
+                objs.append(a)
+    _arrow_label_objs = objs
+
+
 def _set_camera(frame: dict) -> None:
     scene = bpy.context.scene
     cam = scene.objects.get("Camera")
@@ -1197,6 +1401,8 @@ def main(scene_path: str) -> None:
         _build_slices(frame)
         _set_mesh_state(meshes, frame.get("mesh_overrides", {}), base_emit)
         _set_fade_overlay(frame)
+        _build_scale_bar(frame)
+        _build_arrow_labels(frame)
         idx = frame.get("index", fi)  # global frame index (for split cluster jobs)
         scene.render.filepath = f"{out_dir}/frame_{idx:05d}.png"
         print(f"[blender] frame {fi + 1}/{len(spec['frames'])}", flush=True)
@@ -1274,6 +1480,37 @@ def _keyframe_meshes(meshes: dict, overrides: dict, f: int) -> None:
         _apply_clip(nt, ov.get("clip") if ov else None, f)
 
 
+def _keyframe_scale_bar(frame: dict, f: int) -> None:
+    """Export bake: one quad per frame (like the EM slice quads), shown only on its own
+    timeline frame — the camera's type/FOV must already be set for this frame (see
+    `_keyframe_camera`), since the quad's placement math reads it live."""
+    sb = frame.get("scale_bar")
+    if not sb:
+        return
+    obj = _make_scale_bar_quad(frame, f"f{f:05d}")
+    for kf, hidden in ((f - 1, True), (f, False), (f + 1, True)):
+        obj.hide_render = obj.hide_viewport = hidden
+        obj.keyframe_insert("hide_render", frame=kf)
+        obj.keyframe_insert("hide_viewport", frame=kf)
+
+
+def _keyframe_arrow_labels(frame: dict, f: int) -> None:
+    """Export bake: one quad per (frame, label), same visibility-keyframe pattern as
+    the scale bar and EM slice quads — the camera's type/FOV must already be set for this
+    frame (see `_keyframe_camera`), since the overlay's placement math reads it live."""
+    for i, lbl in enumerate(frame.get("arrow_labels", [])):
+        objs = [_make_arrow_label_quad(frame, lbl, f"f{f:05d}_{i}")]
+        if lbl.get("arrow"):
+            a = _make_arrow_2d(frame, lbl["arrow"], f"f{f:05d}_{i}")
+            if a is not None:
+                objs.append(a)
+        for obj in objs:
+            for kf, hidden in ((f - 1, True), (f, False), (f + 1, True)):
+                obj.hide_render = obj.hide_viewport = hidden
+                obj.keyframe_insert("hide_render", frame=kf)
+                obj.keyframe_insert("hide_viewport", frame=kf)
+
+
 def export_blend(spec: dict) -> None:
     blend_path = spec["export_blend"]
     _clear()
@@ -1295,6 +1532,8 @@ def export_blend(spec: dict) -> None:
         _keyframe_camera(frame, f)
         _keyframe_meshes(meshes, frame.get("mesh_overrides", {}), f)
         _set_fade_overlay(frame, f)
+        _keyframe_scale_bar(frame, f)
+        _keyframe_arrow_labels(frame, f)
         print(f"[blender] frame {fi + 1}/{n}", flush=True)
 
     scene.frame_set(1)

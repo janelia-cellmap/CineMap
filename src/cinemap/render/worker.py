@@ -153,6 +153,8 @@ class RenderWorker:
         self._show_bbox = bool(getattr(job.settings, "show_bbox", False))
         self._bbox_color = list(getattr(job.settings, "bbox_color", None) or [0.62, 0.66, 0.74])
         self._bbox_source = getattr(job.settings, "bbox_source", "") or ""   # "" = auto
+        # neuroglancer-style scale bar readout (bottom-left corner)
+        self._show_scale_bar = bool(getattr(job.settings, "show_scale_bar", False))
 
     # ---- asset preparation ----
     def _em_vol(self) -> EMVolume:
@@ -536,6 +538,124 @@ class RenderWorker:
         dist = math.dist(fr.position_nm, fr.look_at_nm)
         return 2.0 * dist * math.tan(math.radians(fr.fov_deg) / 2) / height
 
+    # neuroglancer's preferred SI prefixes (src/util/si_units.ts), base unit meters.
+    _SI_PREFIXES = ((24, "Y"), (21, "Z"), (18, "E"), (15, "P"), (12, "T"), (9, "G"),
+                    (6, "M"), (3, "k"), (0, ""), (-3, "m"), (-6, "µ"), (-9, "n"),
+                    (-12, "p"), (-15, "f"), (-18, "a"), (-21, "z"), (-24, "y"))
+    # neuroglancer's allowed significands (ScaleBarDimensions); 1 is implicit
+    _SCALE_BAR_SIGNIFICANDS = (1.5, 2.0, 3.0, 5.0, 7.5, 10.0)
+
+    @classmethod
+    def _pick_si_prefix(cls, size_m: float) -> tuple[int, str]:
+        for exponent, prefix in cls._SI_PREFIXES:
+            if exponent <= math.log10(size_m):
+                return exponent, prefix
+        return cls._SI_PREFIXES[-1]
+
+    def _scale_bar_dims(self, nm_per_px: float) -> dict | None:
+        """Neuroglancer-style scale bar readout: snap the displayed length to a 'nice'
+        round number and pick the SI unit, so it stays legible as the camera zooms.
+        Mirrors ScaleBarDimensions.update() in neuroglancer's src/widget/scale_bar.ts."""
+        if not nm_per_px or nm_per_px <= 0:
+            return None
+        m_per_px = nm_per_px * 1e-9
+        width_px = max(1, self.job.settings.width)
+        # neuroglancer's target bar length, scaled: maxWidthInPixels grows with the size
+        # setting (its own `scaleFactor` does the same) so a bigger font gets a
+        # proportionally longer bar instead of a long bar under giant text.
+        target_len_m = min(0.25 * width_px, 100.0 * self._scale_bar_px()) * m_per_px
+        if target_len_m <= 0:
+            return None
+        exponent = math.floor(math.log10(target_len_m))
+        base = 10.0 ** exponent
+        target_sig = target_len_m / base
+        best = 1.0
+        for sig in self._SCALE_BAR_SIGNIFICANDS:
+            if abs(sig - target_sig) < abs(best - target_sig):
+                best = sig
+            else:            # distances only grow from here (sorted ascending)
+                break
+        physical_len_m = best * base
+        si_exp, prefix = self._pick_si_prefix(physical_len_m)
+        significand = best * 10.0 ** (exponent - si_exp)
+        return {"length_px": physical_len_m / m_per_px,
+                "label": f"{significand:g} {prefix}m"}
+
+    _SCALE_BAR_FONTS = ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf")
+
+    def _scale_bar_scale(self) -> float:
+        """Scale-bar size multiplier — neuroglancer's own `ScaleBarOptions.scaleFactor`,
+        which scales the text, the bar's thickness and its target length together, so the
+        readout keeps its proportions instead of growing spindly as the font grows."""
+        try:
+            return max(0.2, min(float(getattr(self.job.settings, "scale_bar_scale", 1.0)
+                                      or 1.0), 10.0))
+        except (TypeError, ValueError):
+            return 1.0
+
+    SCALE_BAR_REF_HEIGHT = 720   # resolution the base pixel sizes below are tuned for
+
+    def _scale_bar_px(self) -> float:
+        """Pixel multiplier for the scale bar: the size setting, scaled by how tall this
+        render is against a 720p reference.
+
+        Neuroglancer sizes its bar in absolute screen pixels because its viewport IS the
+        screen. Here the same overlay is drawn into renders of different sizes, so absolute
+        pixels make the bar twice as prominent in a 640x480 bake preview as in a 1280x720
+        final — you cannot judge from the preview what the movie will look like. Scaling
+        with frame height makes the two agree.
+        """
+        return self._scale_bar_scale() * (max(1, self.job.settings.height)
+                                          / self.SCALE_BAR_REF_HEIGHT)
+
+    def _scale_bar_png(self, dims: dict) -> str:
+        """Render the bar + label to a small RGBA PNG (cached by content, like the EM
+        slice textures), for the Blender side to place as a camera-locked HUD quad."""
+        import hashlib
+
+        from PIL import Image, ImageDraw, ImageFont
+
+        sc = self._scale_bar_px()
+        length_px = max(1, round(dims["length_px"]))
+        digest = hashlib.md5(f"{length_px}:{dims['label']}:{sc}".encode()).hexdigest()[:16]
+        path = self.assets_dir / f"scale_bar_{digest}.png"
+        if path.exists():
+            return str(path)
+
+        # neuroglancer's defaults (barHeight 8, barTopMargin 5, textHeight 15, padding 2),
+        # all multiplied by the size setting exactly as its scaleFactor does.
+        bar_h = max(1, round(8 * sc))
+        top_margin = max(1, round(5 * sc))
+        text_h = max(6, round(15 * sc))
+        pad = max(1, round(3 * sc))
+        font = None
+        for fp in self._SCALE_BAR_FONTS:
+            if os.path.exists(fp):
+                try:
+                    font = ImageFont.truetype(fp, text_h)
+                except Exception:  # noqa: BLE001
+                    font = None
+                break
+        font = font or ImageFont.load_default()
+        probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        text_w = probe.textbbox((0, 0), dims["label"], font=font)[2]
+        inner_w = max(length_px, text_w)
+        w, h = inner_w + 2 * pad, bar_h + top_margin + text_h + 2 * pad
+        img = Image.new("RGBA", (int(w), int(h)), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, w, h], fill=(0, 0, 0, 90))
+        d.text((w / 2, pad), dims["label"], font=font, fill=(255, 255, 255, 255), anchor="ma")
+        bar_y0 = h - pad - bar_h
+        d.rectangle([pad, bar_y0, pad + length_px, bar_y0 + bar_h], fill=(255, 255, 255, 255))
+        self.assets_dir.mkdir(parents=True, exist_ok=True)
+        self._atomic_save(img, path)
+        return str(path)
+
+    def _scale_bar_spec(self, fr) -> dict | None:
+        dims = self._scale_bar_dims(self._frame_nm_per_px(fr))
+        return {"image_path": self._scale_bar_png(dims)} if dims else None
+
     SLICE_OVERLAY_ALPHA = 0.6      # default strength of labels painted on the EM slice
 
     def _frame_seg_overlays(self, fr):
@@ -675,6 +795,31 @@ class RenderWorker:
         except (TypeError, ValueError):
             return 1.0
 
+    def _visible_nm_at(self, point_nm, fr) -> float:
+        """Frame height in nm AT POINT's OWN DEPTH along the view axis (not the camera
+        target's). Under perspective, apparent size goes as 1/depth: measuring at the
+        target's depth instead would make an arrow/label well in front of (or behind) it
+        read too large or too small. Depth-invariant for orthographic frames. Shared by
+        the arrow screen-lock, arrow labels, and the scale bar's nm-per-pixel calc."""
+        if getattr(fr, "orthographic", False) and fr.ortho_scale_nm:
+            return float(fr.ortho_scale_nm)
+        import numpy as np
+
+        pos = np.array(fr.position_nm, dtype=float)
+        fwd = np.array(fr.look_at_nm, dtype=float) - pos
+        fwd_n = float(np.linalg.norm(fwd))
+        depth = float((np.asarray(point_nm, dtype=float) - pos) @ (fwd / fwd_n)) if fwd_n > 1e-9 else 0.0
+        if depth <= 1e-6:            # point behind the camera (or degenerate) — fall back
+            depth = fwd_n            # to the target distance rather than exploding
+        return 2.0 * depth * math.tan(math.radians(fr.fov_deg) / 2.0)
+
+    def _arrow_label_scale(self) -> float:
+        """Label size multiplier on the default on-screen text height (project-level)."""
+        try:
+            return max(0.2, min(float(getattr(self.project, "arrow_label_scale", 3.0) or 3.0), 10.0))
+        except (TypeError, ValueError):
+            return 3.0
+
     def _arrow_screen_lock(self, an, fr) -> dict:
         """Per-frame scale that holds an arrow at a CONSTANT fraction of the frame height.
 
@@ -696,24 +841,389 @@ class RenderWorker:
         length = float(np.linalg.norm(tip - tail))
         if length < 1e-6:
             return {}
-        # Frame height in nm AT THE ARROW'S OWN DEPTH, not at the camera target. Under
-        # perspective, apparent size goes as 1/depth: an arrow floating well in front of
-        # the thing the camera is focused on covered far more of the frame than the
-        # requested fraction (a callout sitting near the lens looked enormous in the wide
-        # establishing shot). Measuring at the tip's depth makes the fraction hold no
-        # matter where along the view axis the arrow sits.
-        if getattr(fr, "orthographic", False) and fr.ortho_scale_nm:
-            visible_nm = float(fr.ortho_scale_nm)   # orthographic: size is depth-invariant
-        else:
-            pos = np.array(fr.position_nm, dtype=float)
-            fwd = np.array(fr.look_at_nm, dtype=float) - pos
-            fwd_n = float(np.linalg.norm(fwd))
-            depth = float((tip - pos) @ (fwd / fwd_n)) if fwd_n > 1e-9 else 0.0
-            if depth <= 1e-6:        # tip behind the camera (or degenerate) — fall back
-                depth = fwd_n        # to the target distance rather than exploding
-            visible_nm = 2.0 * depth * math.tan(math.radians(fr.fov_deg) / 2.0)
+        visible_nm = self._visible_nm_at(tip, fr)
         return {"scale": max(1e-3, frac * visible_nm / length),
                 "pivot_bu": _bu(tip.tolist(), self.nm_per_bu)}
+
+    _ARROW_LABEL_FRAC = 0.035   # label text height as a fraction of frame height
+
+    def _arrow_label_text(self, an) -> str:
+        """Default arrow label, derived from the layer name: strip 'arrow(s)', split a
+        trailing number off the word it's stuck to, and capitalise for on-screen use —
+        'pore1 arrow' -> 'Pore 1', 'ER ladder arrow' -> 'ER Ladder'.
+
+        Derived rather than stored so it survives re-baking a keyframe, which overwrites
+        layer names from neuroglancer and would undo any rename made here. Capitalisation
+        only ever raises the FIRST letter, so an acronym the user typed in caps ('ER')
+        stays that way instead of being mangled to 'Er'.
+        """
+        import re
+
+        name = getattr(an, "name", "") or ""
+        s = re.sub(r"arrows?", "", name, flags=re.IGNORECASE)
+        s = re.sub(r"[\s_-]+", " ", s).strip(" _-")
+        s = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", s)          # 'pore1' -> 'pore 1'
+        s = " ".join(w[:1].upper() + w[1:] for w in s.split() if w)
+        return s or name
+
+    def _arrow_label_png(self, text: str) -> tuple[str, int, int]:
+        """Render one text tag to a small RGBA PNG (cached by content, like the scale
+        bar and EM slice textures) for the Blender side to place as a billboard. Returns
+        (path, width_px, height_px) — the caller needs the aspect to know how wide the
+        tag will be on screen, which is what keeps it clamped inside the frame."""
+        import hashlib
+
+        from PIL import Image, ImageDraw, ImageFont
+
+        digest = hashlib.md5(text.encode()).hexdigest()[:16]
+        path = self.assets_dir / f"arrow_label_{digest}.png"
+        if path.exists():
+            with Image.open(path) as im:
+                return str(path), im.size[0], im.size[1]
+
+        text_h, pad = 28, 6
+        font = None
+        for fp in self._SCALE_BAR_FONTS:
+            if os.path.exists(fp):
+                try:
+                    font = ImageFont.truetype(fp, text_h)
+                except Exception:  # noqa: BLE001
+                    font = None
+                break
+        font = font or ImageFont.load_default()
+        probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        text_w = probe.textbbox((0, 0), text, font=font)[2]
+        w, h = int(text_w + 2 * pad), int(text_h + 2 * pad)
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, w, h], fill=(0, 0, 0, 110))
+        d.text((w / 2, h / 2), text, font=font, fill=(255, 255, 255, 255), anchor="mm")
+        self.assets_dir.mkdir(parents=True, exist_ok=True)
+        self._atomic_save(img, path)
+        return str(path), w, h
+
+    def _cam_axes(self, fr):
+        """Orthonormal (position, forward, right, up) for this frame's camera, in nm.
+
+        Used to decompose a world point into SCREEN axes, so `right` has to be the one the
+        renderer actually uses: on a z,y,x dataset the Blender camera is mirrored (see
+        `flip_handed` in blender_script._set_camera), and a basis that ignores that puts
+        every label at minus its true x — the far side of the frame from its own arrow.
+        """
+        import numpy as np
+
+        pos = np.array(fr.position_nm, dtype=float)
+        fwd = np.array(fr.look_at_nm, dtype=float) - pos
+        n = float(np.linalg.norm(fwd))
+        fwd = fwd / n if n > 1e-9 else np.array([0.0, 0.0, 1.0])
+        up = np.array(getattr(fr, "up", None) or [0.0, 0.0, 1.0], dtype=float)
+        up = up - float(up @ fwd) * fwd                 # orthogonalize against forward
+        n = float(np.linalg.norm(up))
+        if n <= 1e-9:                                   # up parallel to view -> any perp
+            up = np.array([0.0, 0.0, 1.0]) - float(np.array([0.0, 0.0, 1.0]) @ fwd) * fwd
+            n = float(np.linalg.norm(up)) or 1.0
+        up = up / n
+        right = np.cross(fwd, up)
+        n = float(np.linalg.norm(right))
+        right = right / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
+        if getattr(self, "_flip_handed", False):
+            right = -right
+        return pos, fwd, right, up
+
+    ARROW_LABEL_MARGIN_FRAC = 0.02   # keep-out border, as a fraction of frame height
+    # Where along the shaft the label may sit: 0 = the head (the tip, what the arrow points
+    # at), 1 = the base (the tail). Tried in order, so the tag settles as far back toward
+    # the base as it can and only creeps toward the head when the far end won't fit on
+    # screen — covering the structure being pointed at defeats the arrow. Overlapping the
+    # shaft itself is fine and intended: it keeps the name ON its arrow rather than floating
+    # off to one side where you have to guess which arrow it belongs to.
+    ARROW_LABEL_SHAFT_POS = (0.95, 0.85, 0.75, 0.65, 0.55, 0.45)
+
+    def _arrow_on_screen(self, tip, eff_tail, fr) -> bool:
+        """Is any part of this (screen-locked) arrow inside the frame?
+
+        Decides whether the label gets pinned into view. Holding a label on screen is what
+        keeps it readable, but doing that for an arrow that has left the frame entirely
+        strands the text against an edge next to nothing — so in that case the label is
+        left to travel with its arrow and slide off with it.
+        """
+        import numpy as np
+
+        pos, fwd, right, up = self._cam_axes(fr)
+        aspect = self.job.settings.width / max(1, self.job.settings.height)
+        a, b = np.asarray(tip, float), np.asarray(eff_tail, float)
+        for t in np.linspace(0.0, 1.0, 33):          # sample the shaft; perspective-safe
+            p = a + (b - a) * t
+            d = p - pos
+            if float(d @ fwd) <= 1e-6:               # behind the camera
+                continue
+            visible_nm = self._visible_nm_at(p, fr)
+            if visible_nm <= 0:
+                continue
+            half_h = visible_nm / 2.0
+            if abs(float(d @ right)) <= half_h * aspect and abs(float(d @ up)) <= half_h:
+                return True
+        return False
+
+    def _arrow_label_spec(self, an, fr, lock: dict) -> dict | None:
+        """Where + how big to draw this arrow's label: ON the (possibly screen-locked)
+        shaft, between head and base, sized as a constant fraction of the frame — a small,
+        always-legible tag rather than a physically-sized object.
+
+        Emitted in SCREEN space (normalized -1..1 plus a height as a fraction of the frame)
+        rather than as a world point, because a label has to be readable to be worth
+        drawing and world placement broke that two ways: on a close-up it falls outside the
+        view (the text naming the structure was exactly what got cropped), and a tag
+        sitting deep in the scene is hidden by whatever geometry is in front of it. So the
+        position is clamped into the frame and the renderer draws it as a camera-locked
+        overlay.
+        """
+        if not getattr(an, "lines", None):
+            return None
+        text = self._arrow_label_text(an)
+        if not text:
+            return None
+        import numpy as np
+
+        tail, tip = (np.array(v, dtype=float) for v in an.lines[0][:2])
+        eff_tail = tip + float(lock.get("scale", 1.0)) * (tail - tip)
+        path, img_w, img_h = self._arrow_label_png(text)
+        pos, fwd, right, up = self._cam_axes(fr)
+        aspect = self.job.settings.width / max(1, self.job.settings.height)
+
+        def place(f):
+            """Screen geometry for a label sitting fraction `f` along tip -> base."""
+            p = tip + (eff_tail - tip) * f
+            visible_nm = self._visible_nm_at(p, fr)
+            if visible_nm <= 0:
+                return None
+            label_h = visible_nm * self._ARROW_LABEL_FRAC * self._arrow_label_scale()
+            label_w = label_h * (img_w / max(1, img_h))
+            half_h = visible_nm / 2.0
+            d = p - pos
+            margin = visible_nm * self.ARROW_LABEL_MARGIN_FRAC
+            return {"x": float(d @ right), "y": float(d @ up),
+                    "half_w": half_h * aspect, "half_h": half_h,
+                    "label_w": label_w, "label_h": label_h, "visible_nm": visible_nm,
+                    # max offset from centre that still fits the whole tag; a tag wider
+                    # than the frame has no valid offset, so that axis pins to the centre.
+                    "lim_x": max(0.0, half_h * aspect - label_w / 2.0 - margin),
+                    "lim_y": max(0.0, half_h - label_h / 2.0 - margin)}
+
+        # Settle as far toward the base as fits on screen (see ARROW_LABEL_SHAFT_POS).
+        chosen = None
+        for f in self.ARROW_LABEL_SHAFT_POS:
+            c = place(f)
+            if c is None:
+                continue
+            chosen = chosen or c                       # first valid = preferred fallback
+            if abs(c["x"]) <= c["lim_x"] and abs(c["y"]) <= c["lim_y"]:
+                chosen = c
+                break
+        if chosen is None:
+            return None
+
+        x, y = chosen["x"], chosen["y"]
+        pinned = not self._arrow_on_screen(tip, eff_tail, fr)
+        if not pinned:      # hold it in view only while its arrow is actually in shot
+            x = min(max(x, -chosen["lim_x"]), chosen["lim_x"])
+            y = min(max(y, -chosen["lim_y"]), chosen["lim_y"])
+        half_w, half_h = chosen["half_w"], chosen["half_h"]
+        return {"image_path": path,
+                "ndc": [x / half_w, y / half_h],               # -1..1 across the frame
+                "height_frac": chosen["label_h"] / chosen["visible_nm"],
+                # half-extents in the same -1..1 units, for the de-overlap pass
+                "_half_ndc": [(chosen["label_w"] / 2.0) / half_w,
+                              (chosen["label_h"] / 2.0) / half_h],
+                "_pinned": pinned}
+
+    # 2D callout geometry. Length is a fraction of the frame HEIGHT (so the arrow is the
+    # same size on screen at any resolution or depth); the rest is expressed as a fraction
+    # of that length, so a longer arrow gets a proportionally bigger head instead of a long
+    # shaft with a pinhead on the end.
+    ARROW_2D_LEN = 0.25          # fallback when the screen-size box is off
+    ARROW_2D_HEAD_LEN = 0.30     # of the arrow's length
+    ARROW_2D_SHAFT_W = 0.060     # of the arrow's length (before the thickness knob)
+    ARROW_2D_HEAD_W = 0.220      # of the arrow's length (before the thickness knob)
+    ARROW_2D_LABEL_GAP = 0.015   # between the tail and the label box
+
+    def _arrow_2d_len(self) -> float:
+        """Flat arrow length as a fraction of frame height — the same `screen` setting that
+        sizes a screen-locked 3D arrow, since it means exactly this."""
+        try:
+            frac = float(getattr(self.project, "arrow_screen_frac", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            frac = 0.0
+        return max(0.02, min(frac if frac > 0 else self.ARROW_2D_LEN, 1.0))
+
+    def _arrows_2d(self) -> bool:
+        return bool(getattr(self.project, "arrows_2d", False))
+
+    def _arrow_callout_spec(self, an, fr) -> dict | None:
+        """A flat, screen-space arrow + label pointing at this annotation's tip.
+
+        Drawn in 2D rather than as scene geometry because it is a callout ABOUT the
+        picture, not a thing in it. As a 3D object its apparent length depended on how
+        squarely it happened to face the camera — measured across this movie, arrows set to
+        the same size rendered anywhere from 58% to 80% of their length, so two identical
+        callouts looked different — and it could be swallowed by the EM plane or lit like
+        part of the specimen. Flat on the screen, every arrow reads identically and nothing
+        can cover it. The 3D tip is still projected per frame, so it stays nailed to the
+        structure it marks.
+        """
+        if not getattr(an, "lines", None):
+            return None
+        text = self._arrow_label_text(an)
+        if not text:
+            return None
+        import numpy as np
+
+        tail3, tip3 = (np.array(v, dtype=float) for v in an.lines[0][:2])
+        pos, fwd, right, up = self._cam_axes(fr)
+        aspect = self.job.settings.width / max(1, self.job.settings.height)
+        visible_nm = self._visible_nm_at(tip3, fr)
+        if visible_nm <= 0:
+            return None
+        half_h = visible_nm / 2.0
+        d = tip3 - pos
+        # frame-height units: y spans -1..1, x spans -aspect..aspect (isotropic, so the
+        # arrow keeps its proportions instead of shearing with the aspect ratio)
+        tip = np.array([float(d @ right) / half_h, float(d @ up) / half_h])
+
+        # Point the callout the way the author's 3D arrow pointed, flattened to the screen.
+        v = tail3 - tip3
+        dirn = np.array([float(v @ right), float(v @ up)])
+        n = float(np.linalg.norm(dirn))
+        # Straight down the view axis it has no on-screen direction left; come from above.
+        dirn = dirn / n if n > 1e-9 else np.array([0.0, 1.0])
+
+        arrow_len = self._arrow_2d_len()
+        weight = self._arrow_scale()          # THICKNESS knob (see _arrow_scale)
+        tail = tip + dirn * arrow_len
+        path, img_w, img_h = self._arrow_label_png(text)
+        label_h = self._ARROW_LABEL_FRAC * self._arrow_label_scale()
+        label_w = label_h * (img_w / max(1, img_h))
+        centre = tail + dirn * (self.ARROW_2D_LABEL_GAP + label_h / 2.0)
+
+        # Keep the label in frame while the structure it names is in frame; once the tip
+        # leaves, let the whole callout travel off with it (see _arrow_on_screen).
+        pinned = not (abs(tip[0]) <= aspect and abs(tip[1]) <= 1.0)
+        if not pinned:
+            m = 2.0 * self.ARROW_LABEL_MARGIN_FRAC
+            lim_x = max(0.0, aspect - label_w / 2.0 - m)
+            lim_y = max(0.0, 1.0 - label_h / 2.0 - m)
+            centre = np.array([min(max(centre[0], -lim_x), lim_x),
+                               min(max(centre[1], -lim_y), lim_y)])
+        return {"image_path": path,
+                "ndc": [centre[0] / aspect, centre[1]],
+                "height_frac": label_h,
+                "arrow": {"tip": [tip[0] / aspect, tip[1]],
+                          "tail": [tail[0] / aspect, tail[1]],
+                          "shaft_w": self.ARROW_2D_SHAFT_W * arrow_len * weight,
+                          "head_len": self.ARROW_2D_HEAD_LEN * arrow_len,
+                          "head_w": self.ARROW_2D_HEAD_W * arrow_len * weight,
+                          "color": list(getattr(an, "color", None) or [1.0, 1.0, 1.0])[:3]},
+                "_half_ndc": [(label_w / 2.0) / aspect, label_h / 2.0],
+                "_pinned": pinned}
+
+    def _box_label_spec(self, an, fr) -> dict | None:
+        """Label for a BOX annotation, sat just above the box's projected top edge.
+
+        A region box says "we are going in here" but not what "here" is; the name is the
+        half that teaches anything. Uses the same text image and screen-space placement as
+        the arrow callouts so the two read as one annotation style.
+        """
+        boxes = getattr(an, "boxes", None)
+        if not boxes:
+            return None
+        text = self._arrow_label_text(an)
+        if not text:
+            return None
+        import itertools
+
+        import numpy as np
+
+        lo, hi = (np.array(v, dtype=float) for v in boxes[0][:2])
+        corners = np.array(list(itertools.product(*zip(lo, hi))))
+        pos, fwd, right, up = self._cam_axes(fr)
+        aspect = self.job.settings.width / max(1, self.job.settings.height)
+        pts = []
+        for c in corners:
+            visible_nm = self._visible_nm_at(c, fr)
+            if visible_nm <= 0:
+                continue
+            half_h = visible_nm / 2.0
+            d = c - pos
+            pts.append((float(d @ right) / half_h, float(d @ up) / half_h))
+        if not pts:
+            return None
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        path, img_w, img_h = self._arrow_label_png(text)
+        label_h = self._ARROW_LABEL_FRAC * self._arrow_label_scale()
+        label_w = label_h * (img_w / max(1, img_h))
+        cx = (min(xs) + max(xs)) / 2.0
+        cy = max(ys) + self.ARROW_2D_LABEL_GAP + label_h / 2.0     # clear of the top edge
+        m = 2.0 * self.ARROW_LABEL_MARGIN_FRAC
+        lim_x = max(0.0, aspect - label_w / 2.0 - m)
+        lim_y = max(0.0, 1.0 - label_h / 2.0 - m)
+        cx = min(max(cx, -lim_x), lim_x)
+        cy = min(max(cy, -lim_y), lim_y)
+        return {"image_path": path, "ndc": [cx / aspect, cy], "height_frac": label_h,
+                "_half_ndc": [(label_w / 2.0) / aspect, label_h / 2.0], "_pinned": False}
+
+    def _spread_arrow_labels(self, labels: list[dict]) -> list[dict]:
+        """Nudge overlapping label tags apart so every one stays readable.
+
+        Clamping labels into the frame makes two arrows that point off the same edge land
+        on the same spot, and two tags drawn on top of each other are worse than one — the
+        overlap renders as mixed-up glyphs ("pore1"+"pore2" reading as "pqpofe2"). Placing
+        top-down and dropping each tag clear of the ones already placed keeps them legible
+        while staying near the arrow each one names.
+
+        Labels riding an off-screen arrow sit this out entirely: they aren't visible, so
+        moving them (or letting them shove a visible label around) would only disturb the
+        tags the viewer can actually read.
+        """
+        margin = 2.0 * self.ARROW_LABEL_MARGIN_FRAC     # frame-height frac -> -1..1 units
+        placed: list[tuple[float, float, float, float]] = []   # (x, y, half_w, half_h)
+        out, onscreen = [], []
+        for lbl in labels:
+            if lbl.pop("_pinned", False):
+                lbl.pop("_half_ndc", None)
+                out.append(lbl)         # rides an off-screen arrow: leave it alone
+            else:
+                onscreen.append(lbl)
+        for lbl in sorted(onscreen, key=lambda l: -l["ndc"][1]):  # topmost first
+            hx, hy = lbl.pop("_half_ndc")
+            x, y0 = lbl["ndc"]
+            lim = max(0.0, 1.0 - hy - margin)
+
+            def free_at(yy, hx=hx, hy=hy, x=x):
+                return not any(abs(x - px) < hx + phw and abs(yy - py) < hy + phh
+                               for px, py, phw, phh in placed)
+
+            y = y0
+            for _ in range(len(placed)):                # drop below whatever we hit
+                if free_at(y):
+                    break
+                hit = max((p for p in placed
+                           if abs(x - p[0]) < hx + p[2] and abs(y - p[1]) < hy + p[3]),
+                          key=lambda p: -p[1])
+                y = hit[1] - (hy + hit[3])
+            if y < -lim:                                # out of room below -> stack upward
+                y = y0
+                for _ in range(len(placed)):
+                    if free_at(y):
+                        break
+                    hit = min((p for p in placed
+                               if abs(x - p[0]) < hx + p[2] and abs(y - p[1]) < hy + p[3]),
+                              key=lambda p: p[1])
+                    y = hit[1] + (hy + hit[3])
+            y = min(max(y, -lim), lim)
+            placed.append((x, y, hx, hy))
+            lbl["ndc"] = [x, y]
+            out.append(lbl)
+        return out
 
     def _ann_uid(self, an) -> str:
         """Stable id per (layer, geometry, color) so an edited annotation layer
@@ -1192,13 +1702,31 @@ class RenderWorker:
                             cl.get("cap", True)
                         )
                     overrides[uid] = ov
+            arrow_labels = []
+            flat = self._arrows_2d()
             for an in fr.annotations:
                 uid = self._ann_uid(an)
                 if uid in mesh_specs:
                     ov = {"opacity": an.opacity, "visible": an.opacity > 0.001,
                           "silhouette": 0.0}
-                    ov.update(self._arrow_screen_lock(an, fr))
+                    lock = self._arrow_screen_lock(an, fr)
+                    ov.update(lock)
+                    is_arrow = self._ann_arrows(an)
+                    shown = an.opacity > 0.001
+                    if flat and is_arrow:
+                        # drawn as a 2D overlay instead — hide the scene geometry, or the
+                        # same arrow renders twice
+                        ov["visible"] = False
+                        ov["opacity"] = 0.0
                     overrides[uid] = ov
+                    if shown and getattr(self.project, "arrow_labels", False):
+                        if is_arrow:
+                            lbl = (self._arrow_callout_spec(an, fr) if flat
+                                   else self._arrow_label_spec(an, fr, lock))
+                        else:                      # region box -> name what it contains
+                            lbl = self._box_label_spec(an, fr)
+                        if lbl:
+                            arrow_labels.append(lbl)
             frame_specs.append({
                 "camera": {
                     "position_bu": _bu(fr.position_nm, self.nm_per_bu),
@@ -1212,6 +1740,8 @@ class RenderWorker:
                 "slices": slices,
                 "mesh_overrides": overrides,
                 "fade_alpha": max(0.0, min(1.0, float(getattr(fr, "fade_alpha", 0.0) or 0.0))),
+                "scale_bar": self._scale_bar_spec(fr) if self._show_scale_bar else None,
+                "arrow_labels": self._spread_arrow_labels(arrow_labels),
                 "index": index_offset + fi,   # global frame index (split cluster jobs)
             })
             self._progress(0.45 + 0.15 * (fi + 1) / len(frames),

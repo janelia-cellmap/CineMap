@@ -244,6 +244,13 @@ class RenderSettings(BaseModel):
     # which layer the box is drawn from: "" = auto (EM / all visible meshes), or a layer
     # NAME (EM image or a mesh/seg layer) — drawn even if that layer is currently hidden.
     bbox_source: str = ""
+    # neuroglancer-style scale bar: bottom-left readout ("500 nm", "2 µm", ...) that
+    # snaps to a round number and switches SI unit as the camera zooms. Approximated at
+    # the camera's look-at depth for perspective frames (exact for orthographic ones).
+    show_scale_bar: bool = False
+    # Scale-bar size multiplier (neuroglancer's ScaleBarOptions.scaleFactor): scales the
+    # label text, the bar's thickness and its target length together.
+    scale_bar_scale: float = 1.0
     # By default a layer's precomputed meshes are downloaded (fast, LOD-adaptive,
     # matches neuroglancer). Set this to instead regenerate watertight meshes from
     # the OME-Zarr label volume via marching cubes when one is available.
@@ -324,6 +331,8 @@ class RenderPrefs(BaseModel):
     show_bbox: bool = False
     bbox_color: list[float] = Field(default_factory=lambda: [0.62, 0.66, 0.74])
     bbox_source: str = ""
+    show_scale_bar: bool = False
+    scale_bar_scale: float = 1.0
     preview_ratio: int = 10
     fast_sample: bool = True    # ⚡ fast (default on): 32 samples + 0.06 noise threshold + denoiser
 
@@ -353,6 +362,18 @@ class Project(BaseModel):
     # default. 0 = off, use the literal nm geometry. A quarter of the frame reads as a
     # callout; half of it swallows the shot.
     arrow_screen_frac: float = 0.25
+    # Draw a text tag past each arrow's tail — default is the layer name with "arrow(s)"
+    # stripped (e.g. "pore arrows" -> "pore"), so naming a layer is the only labeling a
+    # user has to do. Rides the same screen-lock transform as the arrow (see
+    # arrow_screen_frac) and stays a small, constant on-screen size, like a callout tag.
+    arrow_labels: bool = False
+    # Draw arrows flat on the screen (a 2D callout) instead of as scene geometry. A 3D
+    # arrow's apparent length depends on how squarely it faces the camera, so two arrows
+    # set to the same size render different lengths; it can also be hidden by the EM plane.
+    arrows_2d: bool = False
+    # Label text size, as a multiplier on the base on-screen height (3.5% of the frame),
+    # so the default renders at ~10% of frame height — readable on a laptop or a projector.
+    arrow_label_scale: float = 3.0
     look: dict[str, Any] = Field(default_factory=dict)  # render look overrides (preset +
     # glow/roughness/specular/ng_shader/view) — the look-experiment panel writes this.
     render_prefs: Optional[RenderPrefs] = None  # last-used render-control settings (UI)

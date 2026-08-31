@@ -46,6 +46,22 @@ def _mat_lerp(av, bv, t: float, default: float):
     return a * (1 - t) + b * t
 
 
+def _hold_lerp(av, bv, t: float):
+    """Interpolate a knob whose unset state means "nobody said", not "use the default".
+
+    An unset side HOLDS the side that is set instead of ramping toward the renderer
+    fallback: a shot that paints nothing on the EM cross-section, moving to a shot that
+    never mentions the cross-section, should stay clean — ramping to the 0.6 fallback put
+    the anatomy back on the slice for the length of the move."""
+    if av is None and bv is None:
+        return None
+    if av is None:
+        return bv
+    if bv is None:
+        return av
+    return av * (1 - t) + bv * t
+
+
 def _cam_basis(cam):
     """(center, world<-view Rotation, eye->center distance) for a Camera. The
     rotation R maps view axes to world: forward = R@[0,0,-1], up = R@[0,1,0], the
@@ -432,10 +448,11 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
             mtl_t = 1.0 if target_layer else (0.0 if layer_transition == "cut" else t)
             mtl = _mat_lerp(getattr(ma, "metallic", None), getattr(mb, "metallic", None), mtl_t, 0.0)
             rgh = _mat_lerp(getattr(ma, "roughness", None), getattr(mb, "roughness", None), mtl_t, 0.5)
-            # the 2D cross-section opacity lerps like the 3D one (0.6 = renderer default
-            # when a side leaves it unset), so fading labels off the slice is animatable
-            so = _mat_lerp(getattr(ma, "slice_opacity", None),
-                           getattr(mb, "slice_opacity", None), mtl_t, 0.6)
+            # the 2D cross-section opacity lerps like the 3D one, so fading labels off the
+            # slice is animatable — but an unset side holds rather than ramping to the 0.6
+            # fallback, since keyframes that never touch the slice don't mean "0.6 please".
+            so = _hold_lerp(getattr(ma, "slice_opacity", None),
+                            getattr(mb, "slice_opacity", None), mtl_t)
             fs.meshes.append(FrameMesh(name, ids, src.color, op, src.render_3d,
                                        object_alpha=oa, silhouette=si, clip=clip,
                                        metallic=mtl, roughness=rgh,

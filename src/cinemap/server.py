@@ -183,6 +183,8 @@ class RenderReq(BaseModel):
     show_bbox: bool = False     # draw a wireframe box around each data source's extent
     bbox_color: list[float] | None = None   # wireframe rgb (0–1); None = default gray
     bbox_source: str = ""       # layer name to box (even if hidden); "" = auto
+    show_scale_bar: bool = False  # neuroglancer-style scale bar readout, bottom-left
+    scale_bar_scale: float = 1.0  # scale-bar size (text + bar thickness + length)
 
 
 class ChatReq(BaseModel):
@@ -328,6 +330,8 @@ def get_arrow_layers(pid: str):
               for n, c in sorted(seen.items())]
     return {"arrow_layers": p.arrow_layers, "layers": layers,
             "arrow_scale": p.arrow_scale, "arrow_screen_frac": p.arrow_screen_frac,
+            "arrow_labels": p.arrow_labels, "arrow_label_scale": p.arrow_label_scale,
+            "arrows_2d": p.arrows_2d,
             "mode": "explicit" if p.arrow_layers else "auto"}
 
 
@@ -356,6 +360,15 @@ def set_arrow_layers(pid: str, body: dict):
             p.arrow_screen_frac = max(0.0, min(float(body["screen_frac"]), 3.0))
         except (TypeError, ValueError):
             raise HTTPException(400, "screen_frac must be a number") from None
+    if body.get("labels") is not None:
+        p.arrow_labels = bool(body["labels"])
+    if body.get("flat") is not None:
+        p.arrows_2d = bool(body["flat"])
+    if body.get("label_scale") is not None:
+        try:
+            p.arrow_label_scale = max(0.2, min(float(body["label_scale"]), 10.0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "label_scale must be a number") from None
     store.save(p)
     return get_arrow_layers(pid)   # echo back which layers this actually turned into arrows
 
@@ -469,7 +482,12 @@ def render_thumbnail(pid: str, kid: str):
     idx = next((i for i, k in enumerate(p.keyframes) if k.id == kid), None)
     if idx is None:
         raise HTTPException(404, "no such keyframe")
-    settings = RenderSettings(width=640, height=480, samples=24, fps=1, draft=True, still=True)
+    # Size/quality are fixed (it's a thumbnail), but OVERLAY choices must come from the
+    # project's saved render prefs — the preview is how you judge the shot, so a scale bar
+    # you switched on has to appear here too, not only in the full render.
+    settings = RenderSettings(width=640, height=480, samples=24, fps=1, draft=True, still=True,
+                              show_scale_bar=bool(getattr(p.render_prefs, "show_scale_bar", False)),
+                              scale_bar_scale=float(getattr(p.render_prefs, "scale_bar_scale", 1.0) or 1.0))
     job_id = _start_render(pid, settings, kf_range=[idx, idx], thumbnail_for=kid)
     return {"job_id": job_id}
 
@@ -1154,7 +1172,9 @@ def render(pid: str, req: RenderReq):
                               auto_direct=req.auto_direct, lod_mode=req.lod_mode,
                               show_bbox=req.show_bbox,
                               bbox_color=req.bbox_color or [0.62, 0.66, 0.74],
-                              bbox_source=req.bbox_source or "")
+                              bbox_source=req.bbox_source or "",
+                              show_scale_bar=req.show_scale_bar,
+                              scale_bar_scale=req.scale_bar_scale)
     return {"job_id": _start_render(pid, settings, kf_range=req.kf_range)}
 
 
@@ -1212,7 +1232,11 @@ def render_output(pid: str, job_id: str, hq: bool = False):
         if alt.exists():
             out = str(alt)
     if out.endswith(".mp4"):
-        return FileResponse(out, media_type="video/mp4")  # large, not overwritten
+        # Content-Disposition filename: name the download after the PROJECT, not the
+        # generic on-disk "output.mp4"/"output_hq.mp4" (every job on every project is
+        # named that internally, so a browser download otherwise collides/overwrites).
+        suffix = "_hq" if out.endswith("_hq.mp4") else ""
+        return FileResponse(out, media_type="video/mp4", filename=f"{pid}{suffix}.mp4")
     if out.endswith(".blend"):
         return FileResponse(out, media_type="application/octet-stream",
                             filename=f"{pid}.blend")  # Content-Disposition -> download
