@@ -609,25 +609,32 @@ class MeshLoader:
     def load_many(self, seg_ids, colorize=None, target_voxels_single: int = 8_000_000,
                   target_voxels_union: int = 20_000_000, nm_per_px: float | None = None,
                   draft: bool = False, prefer_labels: bool = False,
-                  total_budget: int | None = None) -> trimesh.Trimesh:
+                  total_budget: int | None = None, label_smooth_iters: int = 0,
+                  label_decimate_fraction: float = 0.0,
+                  label_blockwise: bool | str = "auto") -> trimesh.Trimesh:
         """One mesh for a set of segments. By default downloads the precomputed
         meshes (LOD picked from on-screen scale `nm_per_px`); with `prefer_labels`
-        it regenerates watertight meshes from the label volume (a cheap whole-volume
-        union when a coarse pyramid level fits, else per-segment). `colorize(seg_id)`
-        gives the neuroglancer-matched colors."""
+        it regenerates meshes from the label volume with zmesh at the finest scale
+        that fits the voxel/vertex budget. `colorize(seg_id)` gives the
+        neuroglancer-matched colors."""
         seg_ids = list(seg_ids)
         if not seg_ids:
             raise ValueError("no segment ids")
         if prefer_labels and self.label_zarr:
-            if len(seg_ids) > 1 and self._label_union_fits(target_voxels_union):
-                from .mesh_from_labels import generate_union
+            from .mesh_from_labels import generate_zmesh_auto
 
-                return generate_union(self.label_zarr, seg_ids,
-                                      target_voxels=target_voxels_union, colorize=colorize)
-            # per-segment watertight (single seg, or no coarse pyramid level)
-            parts = [self.load(s, colorize=colorize, target_voxels=target_voxels_single,
-                               prefer_labels=True) for s in seg_ids]
-            return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+            target_voxels = target_voxels_single if len(seg_ids) == 1 else target_voxels_union
+            return generate_zmesh_auto(
+                self.label_zarr,
+                seg_ids,
+                bbox_xyz_nm=None,
+                target_voxels=target_voxels,
+                target_vertices=int(total_budget) if total_budget else None,
+                smooth_iters=max(0, int(label_smooth_iters)),
+                decimate_fraction=max(0.0, float(label_decimate_fraction)),
+                blockwise=label_blockwise,
+                colorize=colorize,
+            )
         # default: precomputed meshes (LOD-adaptive, total vertex budget per layer so
         # a many-segment layer can't balloon when one frame zooms in)
         if self.mesh_url:

@@ -119,7 +119,7 @@ class RenderWorker:
         # Resolution budgets. Draft (bake/update/preview thumbnails) trades detail
         # for speed: a coarse EM level and low-voxel meshes. EM scale is selected
         # per frame from physical nm/pixel, matching Neuroglancer's multiscale choice;
-        # meshes use marching-cubes voxel budgets (per-segment / union).
+        # meshes use zmesh voxel/vertex budgets for label-derived geometry.
         draft = bool(getattr(job.settings, "draft", False))
         self._draft = draft
         # Fallback/cap for paths that still request an explicit resampled image size
@@ -127,9 +127,25 @@ class RenderWorker:
         self._em_target_px = 768 if draft else min(2560, max(1280, int(job.settings.width * 1.25)))
         self._mesh_voxels_single = 1_500_000 if draft else 8_000_000
         self._mesh_voxels_union = 3_000_000 if draft else 20_000_000
-        # mesh sourcing: precomputed (LOD-adaptive) by default; opt in to watertight
-        # marching-cubes-from-labels via the render setting.
+        # mesh sourcing: precomputed (LOD-adaptive) by default; opt in to zmesh
+        # meshing from labels via the render setting.
         self._prefer_labels = bool(getattr(job.settings, "mesh_from_labels", False))
+        self._label_smooth_iters = max(
+            0,
+            min(8, int(getattr(job.settings, "label_mesh_smooth_iters", 0) or 0)),
+        )
+        # Decimation keep-fraction (0 disables): after loading up to the vertex budget,
+        # decimate each segment to ~this fraction of its faces, so the final mesh lands
+        # below the budget (e.g. 0.25 keeps ~a quarter). Quality knob, not a read driver.
+        self._label_decimate_fraction = max(
+            0.0,
+            min(1.0, float(getattr(job.settings, "label_mesh_decimate_fraction", 0.0) or 0.0)),
+        )
+        # Blockwise label meshing (read+mesh per cubic block, then weld) — bounds peak
+        # memory so sparse-but-huge bboxes don't OOM. "auto" (default) decides per layer
+        # from the planned read size; "on"/"off" force it.
+        _bw = str(getattr(job.settings, "label_mesh_blockwise", "auto") or "auto").lower()
+        self._label_blockwise = {"on": True, "off": False}.get(_bw, "auto")
         # Per-layer vertex budget = base * mesh_detail, hard-capped so a too-high
         # setting can't recreate the multi-GB mesh that stalled asset prep / OOM'd the
         # GPU. The OOM-retry loop in run() halves this and rebuilds if Cycles runs out.
@@ -400,8 +416,11 @@ class RenderWorker:
     def _lod_tag_for(self, nmpp) -> str:
         """Cache-key component for a mesh built at on-screen scale `nmpp` (nm/px):
         re-framing, draft, source, budget, or a different LOD bucket each rebuild."""
+        lab_tag = (f"lab-zmesh-v1-s{self._label_smooth_iters}"
+                   f"-d{self._label_decimate_fraction:.3g}-b{self._label_blockwise}"
+                   if self._prefer_labels else "pre")
         return (f"npp{nmpp:.3g}|{'draft' if self._draft else 'full'}"
-                f"|{'lab' if self._prefer_labels else 'pre'}|b{self._mesh_budget}"
+                f"|{lab_tag}|b{self._mesh_budget}"
                 if nmpp else f"b{self._mesh_budget}")
 
     def _lod_bucket_nmpp(self, nmpps, max_buckets: int = 4) -> list:
@@ -773,7 +792,10 @@ class RenderWorker:
                     target_voxels_single=self._mesh_voxels_single,
                     target_voxels_union=self._mesh_voxels_union,
                     nm_per_px=nmpp, draft=self._draft,
-                    prefer_labels=self._prefer_labels, total_budget=self._mesh_budget)
+                    prefer_labels=self._prefer_labels, total_budget=self._mesh_budget,
+                    label_smooth_iters=self._label_smooth_iters,
+                    label_decimate_fraction=self._label_decimate_fraction,
+                    label_blockwise=self._label_blockwise)
         except Exception as e:  # noqa: BLE001
             print(f"[worker] mesh {mesh_name} ({len(ids)} segs) failed: {e}")
             return None

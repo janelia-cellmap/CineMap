@@ -202,6 +202,22 @@
           <option value="2">high (~10M/layer)</option>
           <option value="3">max (~15M/layer)</option>
         </select></label>
+      <label class="chk" title="Build meshes from the label voxels with zmesh instead of downloading precomputed Neuroglancer meshes. Enables the smooth + decimate options to its right. (Reads blockwise automatically when the region is too large to load at once.)"><input id="labelMeshes" type="checkbox" onchange="syncMeshSourceControls(); saveRenderPrefs()" /> from labels</label>
+      <label title="Taubin smoothing passes for label-derived meshes — rounds off the blocky voxel staircase. Off by default; 1–2 is usually enough.">smooth
+        <select id="labelSmooth" onchange="saveRenderPrefs()">
+          <option value="0" selected>0</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="4">4</option>
+        </select></label>
+      <label title="Decimate label meshes after meshing — keep this fraction of the faces (lower = lighter mesh, less VRAM, slightly softer detail). Redundant-topology cleanup always runs regardless; this is the lossy reduction on top.">decimate
+        <select id="labelDecimate" onchange="saveRenderPrefs()">
+          <option value="0" selected>none</option>
+          <option value="0.75">light (keep 75%)</option>
+          <option value="0.5">medium (keep 50%)</option>
+          <option value="0.25">heavy (keep 25%)</option>
+          <option value="0.1">extreme (keep 10%)</option>
+        </select></label>
       <label class="chk" title="Director: a non-destructive presentation pass that enhances the look WITHOUT changing your neuroglancer data — camera-relative key/fill/rim lighting, publication-quality materials, and subtle depth-of-field on the framed subject. Uncheck for the plain neuroglancer-faithful render."><input id="autoDirect" type="checkbox" checked /> director</label>
       <label class="chk" title="Draw a thin wireframe box around each data source's extent (the EM volume and/or each rendered layer's label volume), like neuroglancer's bounding box. Falls back to a tight box around the rendered meshes when a layer has no volume source."><input id="showBbox" type="checkbox" /> bbox</label>
       <input id="bboxColor" type="color" value="#9ea8bd" title="bounding-box wireframe color" style="width:24px;height:20px;padding:0;border:1px solid var(--line);background:none;cursor:pointer" />
@@ -1054,13 +1070,24 @@ function showKeyframeThumb(id) {
   img.src = `/api/projects/${PID}/keyframes/${id}/thumbnail?v=${THUMB_VER[id] || TVER}`;
 }
 
+// mesh-source options a thumbnail/preview render should pick up LIVE from the UI,
+// so a preview always matches the mesh source you're about to commit to a full render.
+function draftRenderSettings() {
+  return {
+    mesh_detail: +$('detail').value || 1,
+    mesh_from_labels: $('labelMeshes').checked,
+    label_mesh_smooth_iters: +$('labelSmooth').value || 0,
+    label_mesh_decimate_fraction: +$('labelDecimate').value || 0,
+  };
+}
+
 // render the single keyframe to a still; show it live and keep it as the frame thumbnail
 let THUMB_JOB = null;
 async function renderThumbnail(id) {
   AUTO_THUMBS = false;   // a manual single-thumbnail render stops the auto sweep
   if (THUMB_JOB) { api('POST', `/api/renders/${THUMB_JOB}/cancel`).catch(() => {}); }  // don't pile up
   try {
-    const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`);
+    const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`, draftRenderSettings());
     THUMB_JOB = job_id;
     attachRender(job_id, () => {
       if (THUMB_JOB === job_id) THUMB_JOB = null;
@@ -1076,7 +1103,7 @@ let AUTO_THUMBS = false;
 function renderThumbAwait(id) {
   return new Promise(async (resolve) => {
     try {
-      const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`);
+      const { job_id } = await api('POST', `/api/projects/${PID}/keyframes/${id}/thumbnail`, draftRenderSettings());
       THUMB_JOB = job_id;
       attachRender(job_id, () => { if (THUMB_JOB === job_id) THUMB_JOB = null; THUMB_VER[id] = Date.now(); resolve(); }, true);
     } catch (e) { resolve(); }   // one failure shouldn't stall the rest
@@ -1505,11 +1532,20 @@ function showArrowStatus(st) {
               : '➔ none';
   el.style.color = on.length && !empty.length ? 'var(--accent)' : 'var(--mut)';
 }
+// smooth/decimate only matter when meshing from labels, so gray them out otherwise
+function syncMeshSourceControls() {
+  const useLabels = $('labelMeshes').checked;
+  $('labelSmooth').disabled = !useLabels;
+  $('labelDecimate').disabled = !useLabels;
+}
 // persist the render controls on the project so they survive reload + travel with export
 function saveRenderPrefs() {
   if (!PID) return;
   const prefs = { width: +$('w').value, height: +$('h').value, fps: +$('fps').value,
     samples: +$('samples').value, mesh_detail: +$('detail').value || 1,
+    mesh_from_labels: $('labelMeshes').checked,
+    label_mesh_smooth_iters: +$('labelSmooth').value || 0,
+    label_mesh_decimate_fraction: +$('labelDecimate').value || 0,
     auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
     show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
     bbox_source: $('bboxSource').value, show_scale_bar: $('showScaleBar').checked,
@@ -1525,6 +1561,9 @@ function applyRenderPrefs(p) {
   const set = (id, v) => { const el = $(id); if (el != null && v != null) el.value = v; };
   set('w', rp.width); set('h', rp.height); set('fps', rp.fps); set('samples', rp.samples);
   set('detail', rp.mesh_detail); set('lodMode', rp.lod_mode); set('ratio', rp.preview_ratio);
+  set('labelSmooth', rp.label_mesh_smooth_iters); set('labelDecimate', rp.label_mesh_decimate_fraction);
+  if (rp.mesh_from_labels != null) $('labelMeshes').checked = !!rp.mesh_from_labels;
+  syncMeshSourceControls();
   if (rp.auto_direct != null) $('autoDirect').checked = !!rp.auto_direct;
   if (rp.show_bbox != null) $('showBbox').checked = !!rp.show_bbox;
   if (rp.bbox_color) $('bboxColor').value = rgb01ToHex(rp.bbox_color);
@@ -1552,6 +1591,9 @@ async function startRender(mode) {
                  noise_threshold: fast ? 0.06 : 0.01,
                  engine: $('engine').value,
                  draft: mode === 'preview', mesh_detail: +$('detail').value || 1,
+                 mesh_from_labels: $('labelMeshes').checked,
+                 label_mesh_smooth_iters: +$('labelSmooth').value || 0,
+                 label_mesh_decimate_fraction: +$('labelDecimate').value || 0,
                  auto_direct: $('autoDirect').checked, lod_mode: $('lodMode').value,
                  show_bbox: $('showBbox').checked, bbox_color: hexToRgb01($('bboxColor').value),
                  bbox_source: $('bboxSource').value, show_scale_bar: $('showScaleBar').checked,

@@ -252,13 +252,26 @@ class RenderSettings(BaseModel):
     # label text, the bar's thickness and its target length together.
     scale_bar_scale: float = 1.0
     # By default a layer's precomputed meshes are downloaded (fast, LOD-adaptive,
-    # matches neuroglancer). Set this to instead regenerate watertight meshes from
-    # the OME-Zarr label volume via marching cubes when one is available.
+    # matches neuroglancer). Set this to instead regenerate higher-quality meshes
+    # from the OME-Zarr label volume with zmesh when one is available.
     mesh_from_labels: bool = False
     # Mesh detail multiplier on the per-layer vertex budget (1.0 = default 5M full /
     # 1.2M draft). Higher = crisper meshes but more VRAM; the worker hard-caps the
     # budget and auto-retries at lower detail if the GPU runs out of memory.
     mesh_detail: float = 1.0
+    # Label-mesh postprocessing: exact cleanup always runs. Smoothing and lossy
+    # simplification are opt-in because we usually want the label mesh to stay as
+    # representative of the voxel data as possible.
+    label_mesh_smooth_iters: int = 0
+    # Label-mesh decimation keep-fraction (0 disables; 0<f<1 keeps that fraction of
+    # faces). Applied after blockwise assembly, so target_vertices governs how much is
+    # loaded and this reduces the result from there (e.g. load 20M, 0.5 -> ~10M).
+    label_mesh_decimate_fraction: float = 0.0
+    # Read+mesh the label volume one cubic block at a time and weld the seams, instead
+    # of one whole-ROI read. "auto" (default) does this only when the single read would
+    # exceed a memory threshold (sparse-but-huge bboxes that would otherwise OOM); "on"
+    # forces blockwise, "off" forces the single read.
+    label_mesh_blockwise: Literal["auto", "on", "off"] = "auto"
     # Auto-direction: a non-destructive presentation pass (camera-relative key/fill/
     # rim lighting, publication materials, subtle depth-of-field on the framed
     # subject). On by default; off renders the plain neuroglancer-faithful scene.
@@ -326,6 +339,9 @@ class RenderPrefs(BaseModel):
     samples: int = 48
     mesh_detail: float = 1.0
     mesh_from_labels: bool = False
+    # Label-mesh build options (persist with the project so they survive reload).
+    label_mesh_smooth_iters: int = 0
+    label_mesh_decimate_fraction: float = 0.0
     auto_direct: bool = True
     lod_mode: str = "frame"
     show_bbox: bool = False

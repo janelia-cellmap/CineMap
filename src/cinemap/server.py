@@ -177,7 +177,9 @@ class RenderReq(BaseModel):
     export_blend: bool = False  # produce a self-contained .blend instead of a video
     draft: bool = False         # fast low-res preview (coarse EM + low-voxel meshes)
     mesh_detail: float = 1.0    # per-layer vertex-budget multiplier (hard-capped)
-    mesh_from_labels: bool = False  # regenerate watertight meshes from labels vs precomputed
+    mesh_from_labels: bool = False  # regenerate higher-quality meshes from labels vs precomputed
+    label_mesh_smooth_iters: int = 0        # Taubin smoothing passes for label-derived meshes
+    label_mesh_decimate_fraction: float = 0.0  # keep-fraction after meshing (0 = no decimation)
     auto_direct: bool = True    # non-destructive presentation pass (lighting/material/DOF)
     lod_mode: str = "frame"     # mesh LOD: "single" | "frame" (per-frame adaptive) | "chunk"
     show_bbox: bool = False     # draw a wireframe box around each data source's extent
@@ -475,8 +477,15 @@ def goto_keyframe(pid: str, kid: str):
     return {"ok": True}
 
 
+class ThumbnailReq(BaseModel):
+    mesh_detail: float = 1.0
+    mesh_from_labels: bool = False
+    label_mesh_smooth_iters: int = 0
+    label_mesh_decimate_fraction: float = 0.0
+
+
 @app.post("/api/projects/{pid}/keyframes/{kid}/thumbnail")
-def render_thumbnail(pid: str, kid: str):
+def render_thumbnail(pid: str, kid: str, req: ThumbnailReq | None = None):
     """Render this single keyframe to a still and keep it as the frame's thumbnail."""
     p = store.load(pid)
     idx = next((i for i, k in enumerate(p.keyframes) if k.id == kid), None)
@@ -484,8 +493,14 @@ def render_thumbnail(pid: str, kid: str):
         raise HTTPException(404, "no such keyframe")
     # Size/quality are fixed (it's a thumbnail), but OVERLAY choices must come from the
     # project's saved render prefs — the preview is how you judge the shot, so a scale bar
-    # you switched on has to appear here too, not only in the full render.
+    # you switched on has to appear here too, not only in the full render. Mesh-source
+    # choices (from-labels + smoothing/decimation) come from the caller instead, since the
+    # UI sends its LIVE control values so a preview always matches what you're about to render.
+    req = req or ThumbnailReq()
     settings = RenderSettings(width=640, height=480, samples=24, fps=1, draft=True, still=True,
+                              mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels,
+                              label_mesh_smooth_iters=req.label_mesh_smooth_iters,
+                              label_mesh_decimate_fraction=req.label_mesh_decimate_fraction,
                               show_scale_bar=bool(getattr(p.render_prefs, "show_scale_bar", False)),
                               scale_bar_scale=float(getattr(p.render_prefs, "scale_bar_scale", 1.0) or 1.0))
     job_id = _start_render(pid, settings, kf_range=[idx, idx], thumbnail_for=kid)
@@ -1169,6 +1184,8 @@ def render(pid: str, req: RenderReq):
                               engine=req.engine,
                               export_blend=req.export_blend, draft=req.draft,
                               mesh_detail=req.mesh_detail, mesh_from_labels=req.mesh_from_labels,
+                              label_mesh_smooth_iters=req.label_mesh_smooth_iters,
+                              label_mesh_decimate_fraction=req.label_mesh_decimate_fraction,
                               auto_direct=req.auto_direct, lod_mode=req.lod_mode,
                               show_bbox=req.show_bbox,
                               bbox_color=req.bbox_color or [0.62, 0.66, 0.74],
