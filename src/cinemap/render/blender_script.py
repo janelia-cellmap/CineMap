@@ -425,7 +425,19 @@ def _load_npz_mesh(path: str, name: str, calc_edges: bool = False):
     dominant cost of cold-starting a render with many large meshes."""
     import numpy as np
 
-    arrs = np.load(path)
+    # Read everything up front, retrying a stale NFS handle: parallel render tasks
+    # share the asset cache, and another task atomically replacing this same file
+    # mid-read invalidates the open handle (ESTALE) — the new copy is identical.
+    for attempt in range(4):
+        try:
+            with np.load(path) as z:
+                arrs = {k: z[k] for k in z.files}
+            break
+        except OSError as e:
+            if getattr(e, "errno", None) != 116 or attempt == 3:
+                raise
+            print(f"[blender] stale file handle on {path}; retrying", flush=True)
+            time.sleep(2.0 * (attempt + 1))
     v = np.ascontiguousarray(arrs["v"], dtype=np.float32)
     f = np.ascontiguousarray(arrs["f"], dtype=np.int32)
     Nv, Nf = int(len(v)), int(len(f))
@@ -438,7 +450,7 @@ def _load_npz_mesh(path: str, name: str, calc_edges: bool = False):
     mesh.polygons.foreach_set("loop_start",
                               (np.arange(Nf, dtype=np.int32) * 3))
     mesh.polygons.foreach_set("loop_total", np.full(Nf, 3, dtype=np.int32))
-    if "c" in arrs.files:                 # per-vertex (per-segment) colors
+    if "c" in arrs:                       # per-vertex (per-segment) colors
         c = np.ascontiguousarray(arrs["c"], dtype=np.uint8)
         if c.ndim == 2 and c.shape[1] == 3:    # add opaque alpha
             c = np.concatenate([c, np.full((len(c), 1), 255, dtype=np.uint8)], axis=1)
@@ -959,9 +971,16 @@ def _make_slice(sl: dict, name: str):
     emit.inputs["Strength"].default_value = 1.0
     op = float(sl.get("opacity", 1.0))
     if sl.get("occlude"):
-        # opaque cross-section: the EM plane blocks geometry behind it (old behavior)
+        # opaque cross-section: the EM plane blocks geometry behind it (old behavior).
+        # The texture's alpha (1 unless the worker marked "no data" see-through) scales
+        # the layer opacity, so no-data pixels show whatever is behind the plane.
         mix = nt.nodes.new("ShaderNodeMixShader")
-        mix.inputs[0].default_value = op
+        img.alpha_mode = "STRAIGHT"
+        amul = nt.nodes.new("ShaderNodeMath")
+        amul.operation = "MULTIPLY"
+        amul.inputs[1].default_value = op
+        nt.links.new(tex.outputs["Alpha"], amul.inputs[0])
+        nt.links.new(amul.outputs["Value"], mix.inputs[0])
         nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
         nt.links.new(emit.outputs["Emission"], mix.inputs[2])
         nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
@@ -981,6 +1000,12 @@ def _make_slice(sl: dict, name: str):
         nt.links.new(transp.outputs["BSDF"], add.inputs[1])
         nt.links.new(add.outputs["Shader"], out.inputs["Surface"])
     mat.blend_method = "BLEND"
+    if sl.get("occlude") and hasattr(mat, "surface_render_method"):
+        # Eevee (the draft engine) sorts BLENDED surfaces per object, so a plane with
+        # real texture alpha (see-through no-data) can be drawn over a translucent mesh
+        # in front of it — the mesh vanishes. DITHERED writes depth like a solid, so
+        # what's in front of the plane stays in front (Cycles is unaffected either way).
+        mat.surface_render_method = "DITHERED"
     obj.data.materials.append(mat)
     return obj
 
@@ -1004,10 +1029,11 @@ _SCALE_BAR_DEPTH = 1.01
 # Arrow labels sit just BEHIND the scale bar (which is itself behind the fade overlay), so
 # a fade to black covers both and the scale bar wins if a label is pushed into its corner.
 _ARROW_LABEL_DEPTH = 1.02
-def _unlit_image_material(name: str, image_path: str):
+def _unlit_image_material(name: str, image_path: str, alpha: float = 1.0):
     """Unlit (emission) material sampling an RGBA PNG with straight alpha — shared by
     the scale-bar HUD quad and arrow-label billboards, both 'just show this picture,
-    unaffected by scene lighting' overlays."""
+    unaffected by scene lighting' overlays. `alpha` < 1 fades the whole picture (a
+    callout fading with its annotation layer)."""
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
     nt = mat.node_tree
@@ -1022,7 +1048,14 @@ def _unlit_image_material(name: str, image_path: str):
     nt.links.new(tex.outputs["Color"], emit.inputs["Color"])
     transp = nt.nodes.new("ShaderNodeBsdfTransparent")
     mix = nt.nodes.new("ShaderNodeMixShader")
-    nt.links.new(tex.outputs["Alpha"], mix.inputs[0])
+    if alpha < 0.999:
+        fade = nt.nodes.new("ShaderNodeMath")
+        fade.operation = "MULTIPLY"
+        fade.inputs[1].default_value = max(0.0, float(alpha))
+        nt.links.new(tex.outputs["Alpha"], fade.inputs[0])
+        nt.links.new(fade.outputs["Value"], mix.inputs[0])
+    else:
+        nt.links.new(tex.outputs["Alpha"], mix.inputs[0])
     nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
     nt.links.new(emit.outputs["Emission"], mix.inputs[2])
     out = nt.nodes.new("ShaderNodeOutputMaterial")
@@ -1118,7 +1151,8 @@ def _make_arrow_label_quad(frame: dict, lbl: dict, name: str):
     obj.parent = cam
     obj.matrix_parent_inverse = Matrix.Identity(4)
     obj.visible_shadow = False
-    obj.data.materials.append(_unlit_image_material(f"arrowlabel_mat_{name}", lbl["image_path"]))
+    obj.data.materials.append(_unlit_image_material(f"arrowlabel_mat_{name}", lbl["image_path"],
+                                                    lbl.get("opacity", 1.0)))
     return obj
 
 
@@ -1160,18 +1194,80 @@ def _make_arrow_2d(frame: dict, spec: dict, name: str):
     obj.parent = cam
     obj.matrix_parent_inverse = Matrix.Identity(4)
     obj.visible_shadow = False
+    obj.data.materials.append(_flat_emission_material(f"arrow2d_mat_{name}",
+                                                      spec.get("color", [1.0, 1.0, 1.0]),
+                                                      spec.get("opacity", 1.0)))
+    return obj
 
-    mat = bpy.data.materials.new(f"arrow2d_mat_{name}")
+
+def _flat_emission_material(name: str, color, alpha: float = 1.0):
+    """Unlit flat colour for the 2D callout graphics (arrows, brackets); `alpha` < 1
+    fades it (a callout fading with its annotation layer)."""
+    mat = bpy.data.materials.new(name)
     mat.use_nodes = True
     nt = mat.node_tree
     nt.nodes.clear()
     emit = nt.nodes.new("ShaderNodeEmission")
-    rgb = [_srgb_to_linear(c) for c in spec.get("color", [1.0, 1.0, 1.0])]
+    rgb = [_srgb_to_linear(c) for c in color]
     emit.inputs["Color"].default_value = (*rgb, 1.0)
     emit.inputs["Strength"].default_value = 1.0
     out = nt.nodes.new("ShaderNodeOutputMaterial")
-    nt.links.new(emit.outputs["Emission"], out.inputs["Surface"])
-    obj.data.materials.append(mat)
+    if alpha < 0.999:
+        transp = nt.nodes.new("ShaderNodeBsdfTransparent")
+        mix = nt.nodes.new("ShaderNodeMixShader")
+        mix.inputs[0].default_value = max(0.0, float(alpha))
+        nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
+        nt.links.new(emit.outputs["Emission"], mix.inputs[2])
+        nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+        mat.blend_method = "BLEND"
+    else:
+        nt.links.new(emit.outputs["Emission"], out.inputs["Surface"])
+    return mat
+
+
+def _make_polyline_2d(frame: dict, spec: dict, name: str):
+    """Flat, camera-locked stroked polyline (a bracket), in the same NDC convention and at
+    the same depth as the 2D arrows. Each segment is a quad stretched by half the stroke at
+    both ends so the corners close. `polylines` (a list of point lists) draws several
+    disjoint ones as one object — the dashes of an outline."""
+    cam = bpy.context.scene.camera
+    render_w = max(1, bpy.context.scene.render.resolution_x)
+    render_h = max(1, bpy.context.scene.render.resolution_y)
+    aspect = render_w / render_h
+    if cam and cam.data.type == "ORTHO":
+        frame_h = float(cam.data.ortho_scale) * _ARROW_LABEL_DEPTH
+    else:
+        frame_h = 2.0 * math.tan(float(frame["camera"]["fov_rad"]) / 2.0) * _ARROW_LABEL_DEPTH
+    half = frame_h / 2.0
+    lines = spec.get("polylines") or [spec["points"]]
+    lines = [[Vector((p[0] * aspect, p[1])) for p in ln] for ln in lines]  # -> frame-height units
+    sw = spec["stroke_w"] / 2.0
+    z = -_ARROW_LABEL_DEPTH
+    verts, faces = [], []
+    for p, q in ((p, q) for pts in lines for p, q in zip(pts, pts[1:])):
+        d = q - p
+        if d.length < 1e-9:
+            continue
+        d.normalize()
+        n = Vector((-d.y, d.x))
+        p0, q0 = p - d * sw, q + d * sw
+        k = len(verts)
+        for v in (p0 + n * sw, q0 + n * sw, q0 - n * sw, p0 - n * sw):
+            verts.append((v.x * half, v.y * half, z))
+        faces.append([k, k + 1, k + 2, k + 3])
+    if not faces:
+        return None
+    mesh = bpy.data.meshes.new(f"poly2d_{name}")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(f"poly2d_{name}", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    obj.parent = cam
+    obj.matrix_parent_inverse = Matrix.Identity(4)
+    obj.visible_shadow = False
+    obj.data.materials.append(_flat_emission_material(f"poly2d_mat_{name}",
+                                                      spec.get("color", [1.0, 1.0, 1.0]),
+                                                      spec.get("opacity", 1.0)))
     return obj
 
 
@@ -1193,12 +1289,23 @@ def _build_arrow_labels(frame: dict) -> None:
             bpy.data.objects.remove(o, do_unlink=True)
     objs = []
     for i, lbl in enumerate(frame.get("arrow_labels", [])):
-        objs.append(_make_arrow_label_quad(frame, lbl, f"live{i}"))
-        if lbl.get("arrow"):
-            a = _make_arrow_2d(frame, lbl["arrow"], f"live{i}")
-            if a is not None:
-                objs.append(a)
+        objs += _callout_objects(frame, lbl, f"live{i}")
     _arrow_label_objs = objs
+
+
+def _callout_objects(frame: dict, lbl: dict, name: str) -> list:
+    """One callout's overlay objects: its label, arrow(s) and bracket/outline strokes."""
+    objs = [_make_arrow_label_quad(frame, lbl, name)]
+    arrows = ([lbl["arrow"]] if lbl.get("arrow") else []) + list(lbl.get("extra_arrows") or [])
+    for j, spec in enumerate(arrows):
+        a = _make_arrow_2d(frame, spec, name if j == 0 else f"{name}_{j}")
+        if a is not None:
+            objs.append(a)
+    if lbl.get("bracket"):
+        b = _make_polyline_2d(frame, lbl["bracket"], name)
+        if b is not None:
+            objs.append(b)
+    return objs
 
 
 def _set_camera(frame: dict) -> None:
@@ -1499,11 +1606,7 @@ def _keyframe_arrow_labels(frame: dict, f: int) -> None:
     the scale bar and EM slice quads — the camera's type/FOV must already be set for this
     frame (see `_keyframe_camera`), since the overlay's placement math reads it live."""
     for i, lbl in enumerate(frame.get("arrow_labels", [])):
-        objs = [_make_arrow_label_quad(frame, lbl, f"f{f:05d}_{i}")]
-        if lbl.get("arrow"):
-            a = _make_arrow_2d(frame, lbl["arrow"], f"f{f:05d}_{i}")
-            if a is not None:
-                objs.append(a)
+        objs = _callout_objects(frame, lbl, f"f{f:05d}_{i}")
         for obj in objs:
             for kf, hidden in ((f - 1, True), (f, False), (f + 1, True)):
                 obj.hide_render = obj.hide_viewport = hidden

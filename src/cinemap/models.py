@@ -161,6 +161,9 @@ class AnnotationInstance(BaseModel):
     # spans). One global size is right for a single arrow on a close-up and too loud for
     # a wide shot showing all of them at once. None = the project setting.
     screen_frac: Optional[float] = None
+    # Per-layer multiplier on the project's arrow thickness (shaft + head width), so a
+    # layer of short arrows can stay as bold as the long ones. None = 1.
+    arrow_weight: Optional[float] = None
 
 
 class Lighting(BaseModel):
@@ -323,6 +326,10 @@ class Sweep(BaseModel):
     easing: Literal["linear", "ease-in-out", "ease-in", "ease-out"] = "linear"
     opacity: float = 1.0                   # EM slice overlay strength (slice kind)
     mirror: bool = False                   # ping-pong: sweep from->to then back to->from
+    # slice: move the camera WITH the plane (like scrolling in neuroglancer), so the
+    # picture keeps its scale instead of zooming as the plane nears the camera, and
+    # callouts on the plane stay still on screen.
+    camera_follow: bool = False
     cap: bool = True                       # cutaway: fill the cut face (slower, solid)
     enabled: bool = True
 
@@ -393,3 +400,15 @@ class Project(BaseModel):
     look: dict[str, Any] = Field(default_factory=dict)  # render look overrides (preset +
     # glow/roughness/specular/ng_shader/view) — the look-experiment panel writes this.
     render_prefs: Optional[RenderPrefs] = None  # last-used render-control settings (UI)
+    # Intentional, whole-frame left/right flip — e.g. to match a publication figure's
+    # orientation — layered on TOP of the dataset's own chirality correction
+    # (RenderWorker._resolve_flip_handed's z,y,x-axis-order fix), not a replacement for
+    # it. The two are independent booleans that XOR together into the effective camera
+    # mirror, so this stays off (False) for every project except ones that explicitly
+    # want the published-orientation mirror.
+    mirror_horizontal: bool = False
+    # Draw the EM's "no data" as see-through instead of black: outside the volume, and
+    # the zero-filled regions (acquisition padding) connected to the image edge. Off by
+    # default (neuroglancer shows padding as black); on for a light background, where
+    # black bands at the volume's edge would read as part of the picture.
+    em_nodata_transparent: bool = False

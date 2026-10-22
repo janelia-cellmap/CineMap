@@ -160,6 +160,9 @@ class FrameAnnotation:
     line_props: dict = field(default_factory=dict)
     box_props: dict = field(default_factory=dict)
     ellipsoid_props: dict = field(default_factory=dict)
+    # Per-layer callout size overrides (AnnotationInstance.screen_frac / arrow_weight).
+    screen_frac: float | None = None
+    arrow_weight: float | None = None
 
 
 @dataclass
@@ -487,7 +490,8 @@ def _state_at(a: Keyframe, b: Keyframe, t: float,
             src.name, src.color, op, src.points, src.lines, src.boxes, src.ellipsoids,
             src.point_radius_nm, src.line_radius_nm,
             src.shader, dict(src.shader_controls), dict(src.point_props),
-            dict(src.line_props), dict(src.box_props), dict(src.ellipsoid_props)))
+            dict(src.line_props), dict(src.box_props), dict(src.ellipsoid_props),
+            getattr(src, "screen_frac", None), getattr(src, "arrow_weight", None)))
     return fs
 
 

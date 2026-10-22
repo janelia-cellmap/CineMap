@@ -634,6 +634,7 @@ class MeshLoader:
                 decimate_fraction=max(0.0, float(label_decimate_fraction)),
                 blockwise=label_blockwise,
                 colorize=colorize,
+                cache_dir=self._cache_dir,
             )
         # default: precomputed meshes (LOD-adaptive, total vertex budget per layer so
         # a many-segment layer can't balloon when one frame zooms in)

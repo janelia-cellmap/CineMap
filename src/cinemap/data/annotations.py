@@ -50,6 +50,19 @@ def is_arrow_layer(name: str, arrow_layers=None) -> bool:
     return nm in listed if listed else "arrow" in nm
 
 
+def is_bracket_layer(name: str) -> bool:
+    """Whether an annotation layer's first LINE is a bracketed stretch (a figure-style
+    bracket over a region) rather than a line or an arrow: any layer named "... bracket"."""
+    return "bracket" in (name or "").lower()
+
+
+def is_outline_layer(name: str) -> bool:
+    """Whether an annotation layer's LINES are a figure-style dashed outline (e.g. the
+    box a figure draws around the region an inset zooms into): any layer named
+    "... outline". Every line is one edge of the outline."""
+    return "outline" in (name or "").lower()
+
+
 ARROW_LENGTH_FRAC = 0.03      # shaft RADIUS as a fraction of the arrow's length
 
 

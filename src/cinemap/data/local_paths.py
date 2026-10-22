@@ -18,6 +18,20 @@ _JANELIA_DATA_HOSTS = {
     "cellmap-vm1.int.janelia.org",
 }
 
+# s3.janelia.org/<bucket>/<rest> mirrors onto <boundary>/<subdir>/<rest> — e.g.
+# https://s3.janelia.org/cellmap/<dataset>/<dataset>.zarr/... is the same bytes as
+# /nrs/cellmap/data/<dataset>/<dataset>.zarr/... on a node that can see /nrs. Only
+# covers what's actually mirrored: EM volumes are synced, but not every label/segmentation
+# layer is (`local_path`'s require_exists check falls back to HTTP for those automatically).
+# `boundary` (not `boundary/subdir`) is what containment is checked against, because some
+# dataset dirs under .../data are themselves symlinks out to a `data_external` sibling —
+# a real, intentional layout, not a path-traversal attempt, so the safe boundary is the
+# shared parent both live under.
+_S3_HOST = "s3.janelia.org"
+_S3_BUCKET_LOCAL_ROOTS = {
+    "cellmap": ("/nrs/cellmap", "data"),
+}
+
 
 def _configured_mappings() -> list[tuple[str, str]]:
     """Mappings from CINEMAP_DATA_ROOTS.
@@ -69,6 +83,17 @@ def local_path(url: str, *, require_exists: bool = True) -> str | None:
             return None
 
     parsed = urllib.parse.urlparse(url)
+    if parsed.scheme in ("http", "https") and parsed.hostname == _S3_HOST:
+        parts = parsed.path.lstrip("/").split("/", 1)
+        if len(parts) == 2:
+            bucket, rest = parts
+            mapping = _S3_BUCKET_LOCAL_ROOTS.get(bucket)
+            if mapping:
+                boundary, subdir = mapping
+                path = _join_under(boundary, f"{subdir}/{rest}")
+                if path and (not require_exists or os.path.exists(path)):
+                    return path
+
     if parsed.scheme in ("http", "https") and parsed.hostname in _JANELIA_DATA_HOSTS:
         # Common CellMap deployment: browser URLs expose mounted data through cellmap-vm1,
         # while cluster nodes can read the same tree directly.

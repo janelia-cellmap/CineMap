@@ -19,6 +19,7 @@ from typing import Callable
 from ..config import NM_PER_BU, PROJECTS_DIR
 from ..models import Manifest, Project, RenderJob
 from ..data import ng_shader as _ng_shader
+from ..data.annotations import is_bracket_layer, is_outline_layer
 from ..data.mesh_loader import MeshLoader
 from ..data.slice_loader import EMVolume, get_volume
 from .interpolate import (FrameAnnotation, FrameState, build_frames, plane_normal,
@@ -52,8 +53,19 @@ def _export_mesh_npz(mesh, out: Path) -> None:
         vc = None
     if vc is not None and len(vc) == len(v):
         arrs["c"] = np.ascontiguousarray(vc, dtype=np.uint8)
-    # raw save (no compression) — load speed in Blender matters more than disk
-    np.savez(str(out), **arrs)
+    # raw save (no compression) — load speed in Blender matters more than disk.
+    # Write to a per-process-per-thread temp then rename into place: two array-job
+    # prep shards that both need this same content-addressed mesh (e.g. a layer used
+    # across many keyframes) can end up building and writing it concurrently, and a
+    # direct np.savez(out, ...) would let a reader observe (or a second writer
+    # truncate) a partially-written archive.
+    # np.savez appends ".npz" to a string path if not already present, which would
+    # rename this exact tmp path out from under us — pass an open file object instead,
+    # which it writes to as-is.
+    tmp = f"{out}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "wb") as fh:
+        np.savez(fh, **arrs)
+    os.replace(tmp, out)
 
 
 def _ease(t: float, mode: str) -> float:
@@ -74,6 +86,8 @@ def _sweep_progress(sw, t: float) -> float:
     if getattr(sw, "mirror", False):
         u = u * 2 if u < 0.5 else (1 - u) * 2
     return _ease(u, sw.easing)
+
+
 
 
 def _clip_params(cl) -> dict | None:
@@ -108,6 +122,11 @@ class RenderWorker:
         # raw per-(segment, LOD) mesh download cache, shared across ALL projects (keyed
         # by mesh_url+seg+lod) so changing quality/zoom only fetches new finer LODs.
         self._mesh_cache_dir = PROJECTS_DIR / ".mesh_cache"
+        # LOD variants whose built geometry turned out identical (a label layer with a
+        # single usable pyramid level meshes the same at every zoom): uid -> the uid of
+        # the one copy the scene keeps. See _dedupe_mesh_asset.
+        self._mesh_alias: dict[str, str] = {}
+        self._mesh_by_sig: dict[tuple, str] = {}
         self.blend_path = self.workdir / "scene.blend"
         self.cancel = threading.Event()   # set to request cancellation
         self._proc: subprocess.Popen | None = None
@@ -283,7 +302,7 @@ class RenderWorker:
             # the overlay alpha is baked into the PNG, so it keys the cached image too
             tuple((u, tuple(sorted(int(i) for i in ids)), lc.cache_key(), round(a, 4))
                   for u, ids, lc, a in seg_overlays),
-        )
+        ) + (("nodata-alpha-v2",) if self._nodata_alpha() and not is_label else ())
 
     def _slice_cache_paths(self, key: tuple, axis: str) -> tuple[Path, Path]:
         import hashlib
@@ -311,7 +330,7 @@ class RenderWorker:
 
     @staticmethod
     def _atomic_write_json(data, path: Path) -> None:
-        tmp = f"{path}.{threading.get_ident()}.tmp"
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         Path(tmp).write_text(json.dumps(data, separators=(",", ":")))
         os.replace(tmp, path)
 
@@ -319,6 +338,46 @@ class RenderWorker:
         self._atomic_write_json(out, meta_path)
         with self._slice_cache_lock:
             self._slice_cache[key] = out
+
+    def _nodata_alpha(self) -> bool:
+        return bool(getattr(self.project, "em_nodata_transparent", False))
+
+    NODATA_RIM_PX = 2
+
+    @staticmethod
+    def _outside_volume(res, vol, shape):
+        """Pixels of a slice result whose world position lies outside the volume. The
+        image spans origin + (col/(W-1))*u + (row/(H-1))*v (row 0 at the origin corner,
+        as the Blender quad maps it)."""
+        import numpy as np
+
+        H, W = shape
+        o, u, v = (np.asarray(x, float) for x in (res.origin_nm, res.u_nm, res.v_nm))
+        cols = np.linspace(0.0, 1.0, W)[None, :, None]
+        rows = np.linspace(0.0, 1.0, H)[:, None, None]
+        world = o + cols * u + rows * v                              # (H, W, 3) xyz nm
+        lo, hi = (np.asarray(x, float) for x in vol.extent_nm())
+        return ((world < lo) | (world > hi)).any(-1)
+
+    @classmethod
+    def _nodata_mask(cls, raw, outside):
+        """EM pixels that are "no data": outside the volume, plus zero-valued regions
+        (acquisition padding) connected to the outside. Zero-valued TISSUE — a heavily
+        stained tissue edge saturates to 0 and can run off the frame edge — is not
+        connected to the outside and stays as data (touching the frame edge was the
+        old test, and it cut such edges out). Grown by NODATA_RIM_PX: interpolation
+        blends the data's edge toward 0, which would otherwise leave a dark outline."""
+        import numpy as np
+        from scipy import ndimage as ndi
+
+        outside = np.asarray(outside, bool)
+        if not outside.any():
+            return outside
+        zero = (np.asarray(raw) == 0) | outside
+        lab, _ = ndi.label(zero)
+        touch = np.unique(lab[ndi.binary_dilation(outside) & zero])
+        mask = np.isin(lab, touch[touch > 0])
+        return ndi.binary_dilation(mask, iterations=cls.NODATA_RIM_PX)
 
     def _slice_png(self, sl, region, seg_overlays, slice_seg=None,
                    target_nm_per_px: float | None = None) -> dict:
@@ -348,7 +407,7 @@ class RenderWorker:
             target_px = self._em_target_px
             if target_nm_per_px:
                 target_px = min(target_px, max(8, int(round(2 * half / target_nm_per_px))))
-            res = vol.read_oblique_slice(normal, cproj, half, target_px=target_px)
+            res = vol.read_oblique_slice(normal, cproj, half, target_px=target_px, raw=is_label)
         else:
             res = vol.read_slice(axis, position_nm, level=sl.scale_level,
                                  target_px=self._em_target_px, region=region,
@@ -403,7 +462,12 @@ class RenderWorker:
             m = mask[:, :, None]
             rgb = np.where(m, rgb * (1 - a) + color * 255 * a, rgb)
 
-        self._atomic_save(Image.fromarray(rgb.clip(0, 255).astype(np.uint8)), path)
+        img8 = rgb.clip(0, 255).astype(np.uint8)
+        if self._nodata_alpha():            # see-through where there's no data
+            outside = self._outside_volume(res, vol, raw.shape[:2])
+            alpha = np.where(self._nodata_mask(raw, outside), 0, 255).astype(np.uint8)
+            img8 = np.dstack([img8, alpha])
+        self._atomic_save(Image.fromarray(img8), path)
         out = {
             "image_path": str(path),
             "origin_bu": _bu(res.origin_nm, self.nm_per_bu),
@@ -484,10 +548,13 @@ class RenderWorker:
                     "position_nm": float(pos), "cap": bool(getattr(sw, "cap", True))}
         return None
 
-    def _slices_from_sweeps(self, t: float) -> list:
+    def _slices_from_sweeps(self, t: float, fr: FrameState | None = None) -> list:
         """EM slice planes from active 'slice' sweeps at global time `t` — swept on the
-        sweep's OWN timeline (independent of the camera keyframes). Unlike a cutaway,
-        a slice sweep is a timeline clip: it is visible only during its own span."""
+        sweep's OWN timeline (independent of the camera keyframes) using its own authored
+        from_nm/to_nm/axis/normal. A slice sweep is a timeline clip: visible only during
+        its own span, and gone (hard cutoff) the instant it ends — same as how it just
+        appears with no fade-in when it starts. `fr` is accepted but unused (kept so
+        callers don't need to special-case whether a sweep is active)."""
         from .interpolate import FrameSlice
         out = []
         if not self._include_timeline_sweeps():
@@ -496,10 +563,9 @@ class RenderWorker:
         for sw in getattr(self.project, "sweeps", []) or []:
             if not getattr(sw, "enabled", True) or getattr(sw, "kind", "") != "slice":
                 continue
-            if t < sw.start_s:
+            if t < sw.start_s or t > sw.start_s + (sw.duration_s or 0.0):
                 continue
-            if t > sw.start_s + (sw.duration_s or 0.0):
-                continue
+            em_name = sw.em_name or default_em
             pos = sw.from_nm + (sw.to_nm - sw.from_nm) * _sweep_progress(sw, t)
             # None lets read_slice auto-pick the EM pyramid level from the camera region.
             # 0 forces full-resolution s0, which turns full-plane sweeps into hundreds-MB
@@ -508,12 +574,11 @@ class RenderWorker:
             # says where the plane goes, not how the EM is windowed, so without this a
             # slice sweep would render at neuroglancer's default contrast while the
             # surrounding keyframes render at the user's.
-            em_name = sw.em_name or default_em
             ksl = next((s for kf in self.project.keyframes for s in kf.slices
                         if s.em_name == em_name and (s.shader or s.shader_controls)), None)
-            out.append(FrameSlice(em_name, sw.axis, float(pos), None,
-                                  float(sw.opacity), normal=sw.normal,
-                                  shader=(ksl.shader if ksl else ""),
+            out.append(FrameSlice(em_name, sw.axis, float(pos), None, float(sw.opacity),
+                                  normal=sw.normal,
+                                  shader=ksl.shader if ksl else "",
                                   shader_controls=dict(ksl.shader_controls) if ksl else {}))
         return out
 
@@ -541,12 +606,18 @@ class RenderWorker:
     # --- slice-read derivation (shared by the parallel warm pass and the build loop, so
     # the two can never drift) -------------------------------------------------------
     def _frame_region(self, fr):
-        """EM crop around the camera target, sized to what's on screen this frame."""
+        """EM crop around the camera target, sized to what's on screen this frame.
+
+        The crop is a square in the PLANE's own basis, which sits at an arbitrary roll
+        against the screen, so it has to reach the frame's corners — sizing it off the
+        frame height alone left the sides of a wide frame (and rotated corners) empty."""
         if fr.orthographic and fr.ortho_scale_nm:
             half = max(500.0, fr.ortho_scale_nm / 2 * 1.25)
         else:
+            aspect = self.job.settings.width / max(1, self.job.settings.height)
+            cover = max(1.25, 1.05 * math.hypot(1.0, aspect))
             dist = math.dist(fr.position_nm, fr.look_at_nm)
-            half = max(500.0, dist * math.tan(math.radians(fr.fov_deg) / 2) * 1.25)
+            half = max(500.0, dist * math.tan(math.radians(fr.fov_deg) / 2) * cover)
         return (tuple(fr.look_at_nm), half)
 
     def _frame_nm_per_px(self, fr) -> float:
@@ -600,7 +671,13 @@ class RenderWorker:
         return {"length_px": physical_len_m / m_per_px,
                 "label": f"{significand:g} {prefix}m"}
 
-    _SCALE_BAR_FONTS = ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    # Bundled first: cluster GPU nodes are heterogeneous and some lack a system
+    # DejaVu install entirely, silently falling back to PIL's bitmap default font
+    # (no glyph for e.g. "µ" -> renders as a tofu box). Shipping our own copy makes
+    # text rendering independent of whatever fonts happen to be on a given node.
+    _SCALE_BAR_FONTS = (str(Path(__file__).resolve().parent.parent / "assets" / "fonts"
+                            / "DejaVuSans-Bold.ttf"),
+                        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
                         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf")
 
     def _scale_bar_scale(self) -> float:
@@ -637,7 +714,13 @@ class RenderWorker:
 
         sc = self._scale_bar_px()
         length_px = max(1, round(dims["length_px"]))
-        digest = hashlib.md5(f"{length_px}:{dims['label']}:{sc}".encode()).hexdigest()[:16]
+        # On a light background neuroglancer's white-on-dark bar all but vanishes (1.5:1
+        # on white), so it flips to a black bar and label on a light box, as in a figure.
+        bg = list(getattr(self.project.lighting, "background", None) or [0.0, 0.0, 0.0])
+        light = (0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2]) > 0.5
+        ink, box = ((0, 0, 0, 255), (255, 255, 255, 110)) if light else \
+            ((255, 255, 255, 255), (0, 0, 0, 90))
+        digest = hashlib.md5(f"{length_px}:{dims['label']}:{sc}:{light}".encode()).hexdigest()[:16]
         path = self.assets_dir / f"scale_bar_{digest}.png"
         if path.exists():
             return str(path)
@@ -663,10 +746,10 @@ class RenderWorker:
         w, h = inner_w + 2 * pad, bar_h + top_margin + text_h + 2 * pad
         img = Image.new("RGBA", (int(w), int(h)), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        d.rectangle([0, 0, w, h], fill=(0, 0, 0, 90))
-        d.text((w / 2, pad), dims["label"], font=font, fill=(255, 255, 255, 255), anchor="ma")
+        d.rectangle([0, 0, w, h], fill=box)
+        d.text((w / 2, pad), dims["label"], font=font, fill=ink, anchor="ma")
         bar_y0 = h - pad - bar_h
-        d.rectangle([pad, bar_y0, pad + length_px, bar_y0 + bar_h], fill=(255, 255, 255, 255))
+        d.rectangle([pad, bar_y0, pad + length_px, bar_y0 + bar_h], fill=ink)
         self.assets_dir.mkdir(parents=True, exist_ok=True)
         self._atomic_save(img, path)
         return str(path)
@@ -711,7 +794,7 @@ class RenderWorker:
         The sweep wins there (it's the explicit timeline clip that says "scan now")."""
         import numpy as np
 
-        sweeps = self._slices_from_sweeps(t_global)
+        sweeps = self._slices_from_sweeps(t_global, fr)
         out = []
         kept: list[tuple[str, object]] = []
         for sl in sweeps + list(fr.slices):   # sweeps first: they win a collision
@@ -755,11 +838,42 @@ class RenderWorker:
     @staticmethod
     def _atomic_save(img, path) -> None:
         """Save a PNG so parallel writers of the SAME path can't leave/observe a partial
-        file: write a per-thread temp, then atomically rename into place (last wins).
-        Identical-key slices (e.g. a camera hold fetched concurrently) hit the same path."""
-        tmp = f"{path}.{threading.get_ident()}.tmp"
+        file: write a per-process-per-thread temp, then atomically rename into place (last
+        wins). Identical-key slices (e.g. a camera hold fetched concurrently within one
+        process, or the same slice/mesh rebuilt redundantly by two array-job shards) hit
+        the same path — the pid is required, not just the thread ident, since two separate
+        OS processes can get colliding ident values and clobber each other's temp file."""
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         img.save(tmp, format="PNG")
         os.replace(tmp, path)
+
+    def _dedupe_mesh_asset(self, uid: str, path: str) -> bool:
+        """True if an identical mesh is already in the scene (then `uid` becomes an alias
+        of it). Different LOD buckets of a label layer usually land on the same pyramid
+        level — for one big label layer all four zoom buckets built the same 9M
+        faces — and loading each as its own object put 36M faces in the scene for one
+        shape: slower to import, and more for the GPU renderer to rebuild every frame."""
+        import hashlib
+
+        import numpy as np
+
+        try:
+            with np.load(path) as z:
+                h = hashlib.md5()
+                shapes = []
+                for k in sorted(z.files):
+                    a = z[k]
+                    shapes.append((k, a.shape, str(a.dtype)))
+                    h.update(np.ascontiguousarray(a.reshape(-1)[::997]).tobytes())
+            sig = (tuple(shapes), h.hexdigest())
+        except Exception:  # noqa: BLE001 — unreadable: just keep it as its own object
+            return False
+        canon = self._mesh_by_sig.get(sig)
+        if canon is None:
+            self._mesh_by_sig[sig] = uid
+            return False
+        self._mesh_alias[uid] = canon
+        return True
 
     def _mesh_obj(self, mesh_name, segment_ids, lc, nmpp=None) -> str | None:
         src = next((m for m in self.manifest.meshes if m.name == mesh_name), None)
@@ -882,11 +996,23 @@ class RenderWorker:
         import re
 
         name = getattr(an, "name", "") or ""
-        s = re.sub(r"arrows?", "", name, flags=re.IGNORECASE)
+        s = re.sub(r"arrows?|brackets?|outlines?", "", name, flags=re.IGNORECASE)
         s = re.sub(r"[\s_-]+", " ", s).strip(" _-")
         s = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", s)          # 'pore1' -> 'pore 1'
         s = " ".join(w[:1].upper() + w[1:] for w in s.split() if w)
         return s or name
+
+    # Reference frame height the base 28px font size below is tuned for — matches
+    # SCALE_BAR_REF_HEIGHT's approach so the label's SOURCE pixel resolution scales with
+    # arrow_label_scale/frame height instead of staying fixed while its on-screen size
+    # (label_h = _ARROW_LABEL_FRAC * arrow_label_scale, in screen pixels) grows past it,
+    # which is what was blurring the text: a 40px-tall texture stretched to ~76px on a
+    # 720p final (arrow_label_scale=3) is a ~2x upscale Blender's texture filter blurs.
+    ARROW_LABEL_REF_HEIGHT = 720
+
+    def _arrow_label_px(self) -> float:
+        return self._arrow_label_scale() * (max(1, self.job.settings.height)
+                                            / self.ARROW_LABEL_REF_HEIGHT)
 
     def _arrow_label_png(self, text: str) -> tuple[str, int, int]:
         """Render one text tag to a small RGBA PNG (cached by content, like the scale
@@ -897,13 +1023,14 @@ class RenderWorker:
 
         from PIL import Image, ImageDraw, ImageFont
 
-        digest = hashlib.md5(text.encode()).hexdigest()[:16]
+        sc = self._arrow_label_px()
+        digest = hashlib.md5(f"{text}:{sc}".encode()).hexdigest()[:16]
         path = self.assets_dir / f"arrow_label_{digest}.png"
         if path.exists():
             with Image.open(path) as im:
                 return str(path), im.size[0], im.size[1]
 
-        text_h, pad = 28, 6
+        text_h, pad = max(12, round(28 * sc)), max(2, round(6 * sc))
         font = None
         for fp in self._SCALE_BAR_FONTS:
             if os.path.exists(fp):
@@ -1069,11 +1196,13 @@ class RenderWorker:
     ARROW_2D_HEAD_W = 0.220      # of the arrow's length (before the thickness knob)
     ARROW_2D_LABEL_GAP = 0.015   # between the tail and the label box
 
-    def _arrow_2d_len(self) -> float:
+    def _arrow_2d_len(self, an=None) -> float:
         """Flat arrow length as a fraction of frame height — the same `screen` setting that
-        sizes a screen-locked 3D arrow, since it means exactly this."""
+        sizes a screen-locked 3D arrow, since it means exactly this. A layer's own
+        `screen_frac` wins, so a layer marking many small things can use shorter arrows."""
+        own = getattr(an, "screen_frac", None) if an is not None else None
         try:
-            frac = float(getattr(self.project, "arrow_screen_frac", 0.0) or 0.0)
+            frac = float(own if own else (getattr(self.project, "arrow_screen_frac", 0.0) or 0.0))
         except (TypeError, ValueError):
             frac = 0.0
         return max(0.02, min(frac if frac > 0 else self.ARROW_2D_LEN, 1.0))
@@ -1081,7 +1210,84 @@ class RenderWorker:
     def _arrows_2d(self) -> bool:
         return bool(getattr(self.project, "arrows_2d", False))
 
-    def _arrow_callout_spec(self, an, fr) -> dict | None:
+    _RIDE_TOL_NM = 30.0   # how close to a sweep's rest plane a callout point must lie to ride it
+
+    def _sweep_ride(self, point_nm, t_global):
+        """Offset that keeps a callout pinned to a scrolling EM plane's content.
+
+        A slice sweep slides its plane along the normal; a callout whose point lies ON
+        that plane at rest would otherwise stay behind while the picture moves under it
+        (under perspective the plane's content also spreads out as it nears the camera),
+        so an arrow drifts off its structure mid-scroll. Zero for points not on an active
+        sweep's rest plane.
+
+        The rest plane is where the sweep starts, or the plane its anchor keyframe shows:
+        a scroll built from several legs (out one way, across, back) starts most legs away
+        from the panel's own plane, and the callouts marked on that plane must ride every
+        leg, not just the first."""
+        import numpy as np
+
+        p = np.asarray(point_nm, dtype=float)
+        for sw, n, rest, pos in self._active_slice_sweeps(t_global):
+            base = float(p @ n)
+            if min(abs(base - r) for r in rest) > self._RIDE_TOL_NM:
+                continue
+            return (pos - base) * n
+        return np.zeros(3)
+
+    def _active_slice_sweeps(self, t_global):
+        """(sweep, unit normal, rest positions, current position) for each slice sweep
+        active at `t_global`. Rest positions: where the sweep starts, plus the plane its
+        anchor keyframe shows (see _sweep_ride)."""
+        import numpy as np
+
+        if t_global is None or not self._include_timeline_sweeps():
+            return
+        kf_by_id = {k.id: k for k in self.project.keyframes}
+        for sw in getattr(self.project, "sweeps", []) or []:
+            if not getattr(sw, "enabled", True) or getattr(sw, "kind", "") != "slice":
+                continue
+            if t_global < sw.start_s or t_global > sw.start_s + (sw.duration_s or 0.0):
+                continue
+            n = (np.asarray(sw.normal, dtype=float) if sw.normal
+                 else np.eye(3)["xyz".index(sw.axis)])
+            n = n / (float(np.linalg.norm(n)) or 1.0)
+            anchor_rest = []
+            anchor = kf_by_id.get(getattr(sw, "anchor_kf", None) or "")
+            for s in (anchor.slices if anchor else []):
+                sn = (np.asarray(s.normal, dtype=float) if s.normal
+                      else np.eye(3)["xyz".index(s.axis)])
+                sn = sn / (float(np.linalg.norm(sn)) or 1.0)
+                if float(sn @ n) > 0.999:
+                    anchor_rest.append(float(s.position_nm))
+            pos = sw.from_nm + (sw.to_nm - sw.from_nm) * _sweep_progress(sw, t_global)
+            yield sw, n, anchor_rest + [float(sw.from_nm)], float(pos)
+
+    def _camera_follow_offset(self, t_global):
+        """How far to move the camera at `t_global` so it travels with a scrolling plane
+        (sweeps with camera_follow): the plane's offset from the keyframe's own plane."""
+        import numpy as np
+
+        for sw, n, rest, pos in self._active_slice_sweeps(t_global):
+            if getattr(sw, "camera_follow", False):
+                return (pos - rest[0]) * n
+        return np.zeros(3)
+
+    def _apply_camera_follow(self, frames, times) -> None:
+        """Move each frame's camera with its camera-following scroll, once, before
+        anything reads the camera (EM crop, LOD, callouts, the Blender camera)."""
+        import numpy as np
+
+        for fr, t in zip(frames, times):
+            if getattr(fr, "_camera_followed", False):
+                continue
+            d = self._camera_follow_offset(t)
+            if np.any(d):
+                fr.position_nm = (np.asarray(fr.position_nm, float) + d).tolist()
+                fr.look_at_nm = (np.asarray(fr.look_at_nm, float) + d).tolist()
+            fr._camera_followed = True
+
+    def _arrow_callout_spec(self, an, fr, t_global=None) -> dict | None:
         """A flat, screen-space arrow + label pointing at this annotation's tip.
 
         Drawn in 2D rather than as scene geometry because it is a callout ABOUT the
@@ -1092,6 +1298,10 @@ class RenderWorker:
         part of the specimen. Flat on the screen, every arrow reads identically and nothing
         can cover it. The 3D tip is still projected per frame, so it stays nailed to the
         structure it marks.
+
+        Every line in the layer is an arrow (a figure marking the same structure in
+        several places); the label goes with the first one only, so one name covers the
+        set instead of repeating at every arrowhead.
         """
         if not getattr(an, "lines", None):
             return None
@@ -1100,52 +1310,207 @@ class RenderWorker:
             return None
         import numpy as np
 
-        tail3, tip3 = (np.array(v, dtype=float) for v in an.lines[0][:2])
         pos, fwd, right, up = self._cam_axes(fr)
         aspect = self.job.settings.width / max(1, self.job.settings.height)
-        visible_nm = self._visible_nm_at(tip3, fr)
-        if visible_nm <= 0:
-            return None
-        half_h = visible_nm / 2.0
-        d = tip3 - pos
-        # frame-height units: y spans -1..1, x spans -aspect..aspect (isotropic, so the
-        # arrow keeps its proportions instead of shearing with the aspect ratio)
-        tip = np.array([float(d @ right) / half_h, float(d @ up) / half_h])
-
-        # Point the callout the way the author's 3D arrow pointed, flattened to the screen.
-        v = tail3 - tip3
-        dirn = np.array([float(v @ right), float(v @ up)])
-        n = float(np.linalg.norm(dirn))
-        # Straight down the view axis it has no on-screen direction left; come from above.
-        dirn = dirn / n if n > 1e-9 else np.array([0.0, 1.0])
-
-        arrow_len = self._arrow_2d_len()
+        arrow_len = self._arrow_2d_len(an)
         weight = self._arrow_scale()          # THICKNESS knob (see _arrow_scale)
+        try:                                  # ... times the layer's own, if it has one
+            weight *= max(0.05, min(float(getattr(an, "arrow_weight", None) or 1.0), 20.0))
+        except (TypeError, ValueError):
+            pass
+        color = list(getattr(an, "color", None) or [1.0, 1.0, 1.0])[:3]
+
+        def flat_arrow(line):
+            tail3, tip3 = (np.array(v, dtype=float) for v in line[:2])
+            ride = self._sweep_ride(tip3, t_global)
+            tail3, tip3 = tail3 + ride, tip3 + ride
+            visible_nm = self._visible_nm_at(tip3, fr)
+            if visible_nm <= 0:
+                return None
+            half_h = visible_nm / 2.0
+            d = tip3 - pos
+            # frame-height units: y spans -1..1, x spans -aspect..aspect (isotropic, so
+            # the arrow keeps its proportions instead of shearing with the aspect ratio)
+            tip = np.array([float(d @ right) / half_h, float(d @ up) / half_h])
+            # Point the callout the way the author's 3D arrow pointed, flattened to the
+            # screen. Straight down the view axis it has no on-screen direction left;
+            # come from above.
+            v = tail3 - tip3
+            dirn = np.array([float(v @ right), float(v @ up)])
+            n = float(np.linalg.norm(dirn))
+            dirn = dirn / n if n > 1e-9 else np.array([0.0, 1.0])
+            tail = tip + dirn * arrow_len
+            return tip, dirn, {"tip": [tip[0] / aspect, tip[1]],
+                               "tail": [tail[0] / aspect, tail[1]],
+                               "shaft_w": self.ARROW_2D_SHAFT_W * arrow_len * weight,
+                               "head_len": self.ARROW_2D_HEAD_LEN * arrow_len,
+                               "head_w": self.ARROW_2D_HEAD_W * arrow_len * weight,
+                               "color": color}
+
+        first = flat_arrow(an.lines[0])
+        if first is None:
+            return None
+        tip, dirn, arrow = first
+        extra = [a[2] for a in (flat_arrow(ln) for ln in an.lines[1:]) if a is not None]
         tail = tip + dirn * arrow_len
         path, img_w, img_h = self._arrow_label_png(text)
         label_h = self._ARROW_LABEL_FRAC * self._arrow_label_scale()
         label_w = label_h * (img_w / max(1, img_h))
-        centre = tail + dirn * (self.ARROW_2D_LABEL_GAP + label_h / 2.0)
+        # label_h/label_w are fractions of the FULL frame height (what the renderer's
+        # height_frac means), but positions here are in HALF-height units — so in these
+        # units the tag's half-extents are label_w and label_h, not half of them. Mixing
+        # the two let tags hang off the frame edge and sit on their own arrow.
+        hw, hh = label_w, label_h
+        reach = abs(float(dirn[0])) * hw + abs(float(dirn[1])) * hh   # box extent along dirn
+        centre = tail + dirn * (self.ARROW_2D_LABEL_GAP + reach)
 
         # Keep the label in frame while the structure it names is in frame; once the tip
         # leaves, let the whole callout travel off with it (see _arrow_on_screen).
         pinned = not (abs(tip[0]) <= aspect and abs(tip[1]) <= 1.0)
         if not pinned:
             m = 2.0 * self.ARROW_LABEL_MARGIN_FRAC
-            lim_x = max(0.0, aspect - label_w / 2.0 - m)
-            lim_y = max(0.0, 1.0 - label_h / 2.0 - m)
+            lim_x = max(0.0, aspect - hw - m)
+            lim_y = max(0.0, 1.0 - hh - m)
             centre = np.array([min(max(centre[0], -lim_x), lim_x),
                                min(max(centre[1], -lim_y), lim_y)])
         return {"image_path": path,
                 "ndc": [centre[0] / aspect, centre[1]],
                 "height_frac": label_h,
-                "arrow": {"tip": [tip[0] / aspect, tip[1]],
-                          "tail": [tail[0] / aspect, tail[1]],
-                          "shaft_w": self.ARROW_2D_SHAFT_W * arrow_len * weight,
-                          "head_len": self.ARROW_2D_HEAD_LEN * arrow_len,
-                          "head_w": self.ARROW_2D_HEAD_W * arrow_len * weight,
-                          "color": list(getattr(an, "color", None) or [1.0, 1.0, 1.0])[:3]},
-                "_half_ndc": [(label_w / 2.0) / aspect, label_h / 2.0],
+                "arrow": arrow,
+                **({"extra_arrows": extra} if extra else {}),
+                "_half_ndc": [hw / aspect, hh],
+                "_pinned": pinned}
+
+    BRACKET_TICK = 0.045   # tick length, half-frame-height units (a 2D arrow is 0.25 long)
+    BRACKET_GAP = 0.012    # between the bracketed structure and the tick ends
+
+    def _bracket_callout_spec(self, an, fr, t_global=None) -> dict | None:
+        """A flat, figure-style bracket over a stretch of structure, labelled past its spine.
+
+        For a region rather than a point (a fibre bundle, a rootlet): the layer's first
+        line gives the stretch — both ends on the structure — and the bracket sits on the
+        LEFT of pointA -> pointB as seen on screen, ticks toward the structure, so the order
+        the ends were clicked in chooses the side. Same flat overlay, weight and label as
+        the 2D arrows, and like them it rides a scrolling EM plane."""
+        if not getattr(an, "lines", None):
+            return None
+        text = self._arrow_label_text(an)
+        if not text:
+            return None
+        import numpy as np
+
+        a3, b3 = (np.array(v, dtype=float) for v in an.lines[0][:2])
+        ride = self._sweep_ride(a3, t_global)
+        a3, b3 = a3 + ride, b3 + ride
+        pos, fwd, right, up = self._cam_axes(fr)
+        aspect = self.job.settings.width / max(1, self.job.settings.height)
+
+        def proj(p):
+            half_h = self._visible_nm_at(p, fr) / 2.0
+            d = p - pos
+            return np.array([float(d @ right) / half_h, float(d @ up) / half_h])
+
+        a, b = proj(a3), proj(b3)
+        span = float(np.linalg.norm(b - a))
+        if span < 1e-6:
+            return None
+        along = (b - a) / span
+        perp = np.array([-along[1], along[0]])          # left of a -> b on screen
+        g, tk = self.BRACKET_GAP, self.BRACKET_TICK
+        stroke = self.ARROW_2D_SHAFT_W * self._arrow_2d_len() * self._arrow_scale()
+        a0, b0 = a + perp * g, b + perp * g              # tick ends, by the structure
+        a1, b1 = a + perp * (g + tk), b + perp * (g + tk)   # the spine
+
+        path, img_w, img_h = self._arrow_label_png(text)
+        label_h = self._ARROW_LABEL_FRAC * self._arrow_label_scale()
+        label_w = label_h * (img_w / max(1, img_h))
+        hw, hh = label_w, label_h            # half-extents in half-height units
+        reach = abs(float(perp[0])) * hw + abs(float(perp[1])) * hh
+        centre = (a1 + b1) / 2.0 + perp * (self.ARROW_2D_LABEL_GAP + stroke / 2.0 + reach)
+        mid = (a + b) / 2.0
+        pinned = not (abs(mid[0]) <= aspect and abs(mid[1]) <= 1.0)
+        if not pinned:
+            m = 2.0 * self.ARROW_LABEL_MARGIN_FRAC
+            lim_x = max(0.0, aspect - hw - m)
+            lim_y = max(0.0, 1.0 - hh - m)
+            centre = np.array([min(max(centre[0], -lim_x), lim_x),
+                               min(max(centre[1], -lim_y), lim_y)])
+        return {"image_path": path,
+                "ndc": [centre[0] / aspect, centre[1]],
+                "height_frac": label_h,
+                "bracket": {"points": [[p[0] / aspect, p[1]] for p in (a0, a1, b1, b0)],
+                            "stroke_w": stroke,
+                            "color": list(getattr(an, "color", None) or [1.0, 1.0, 1.0])[:3]},
+                "_half_ndc": [hw / aspect, hh],
+                "_pinned": pinned}
+
+    OUTLINE_DASH = 0.035   # dash and gap lengths of a 2D outline, half-height units
+    OUTLINE_GAP = 0.022
+
+    def _outline_callout_spec(self, an, fr, t_global=None) -> dict | None:
+        """A flat, dashed, figure-style outline (every line of the layer is one edge),
+        labelled above its top edge — the box a figure draws around the region an inset
+        zooms into. Same flat overlay, stroke and label as the brackets, and like them it
+        rides a scrolling EM plane."""
+        if not getattr(an, "lines", None):
+            return None
+        text = self._arrow_label_text(an)
+        if not text:
+            return None
+        import numpy as np
+
+        pos, fwd, right, up = self._cam_axes(fr)
+        aspect = self.job.settings.width / max(1, self.job.settings.height)
+        ride = self._sweep_ride(np.array(an.lines[0][0], dtype=float), t_global)
+
+        def proj(p):
+            p = np.array(p, dtype=float) + ride
+            half_h = self._visible_nm_at(p, fr) / 2.0
+            if half_h <= 0:
+                return None
+            d = p - pos
+            return np.array([float(d @ right) / half_h, float(d @ up) / half_h])
+
+        dashes, pts = [], []
+        for line in an.lines:
+            a, b = proj(line[0]), proj(line[1])
+            if a is None or b is None:
+                continue
+            pts += [a, b]
+            span = float(np.linalg.norm(b - a))
+            if span < 1e-6:
+                continue
+            along = (b - a) / span
+            s = 0.0
+            while s < span:
+                e = min(span, s + self.OUTLINE_DASH)
+                dashes.append([a + along * s, a + along * e])
+                s = e + self.OUTLINE_GAP
+        if not dashes:
+            return None
+        stroke = self.ARROW_2D_SHAFT_W * self._arrow_2d_len() * self._arrow_scale()
+        pts = np.array(pts)
+        path, img_w, img_h = self._arrow_label_png(text)
+        label_h = self._ARROW_LABEL_FRAC * self._arrow_label_scale()
+        label_w = label_h * (img_w / max(1, img_h))
+        hw, hh = label_w, label_h            # half-extents in half-height units
+        top = pts[np.argmax(pts[:, 1])]
+        centre = np.array([top[0], top[1] + self.ARROW_2D_LABEL_GAP + stroke / 2.0 + hh])
+        mid = pts.mean(0)
+        pinned = not (abs(mid[0]) <= aspect and abs(mid[1]) <= 1.0)
+        if not pinned:
+            m = 2.0 * self.ARROW_LABEL_MARGIN_FRAC
+            lim_x = max(0.0, aspect - hw - m)
+            lim_y = max(0.0, 1.0 - hh - m)
+            centre = np.array([min(max(centre[0], -lim_x), lim_x),
+                               min(max(centre[1], -lim_y), lim_y)])
+        color = list(getattr(an, "color", None) or [1.0, 1.0, 1.0])[:3]
+        return {"image_path": path,
+                "ndc": [centre[0] / aspect, centre[1]],
+                "height_frac": label_h,
+                "bracket": {"polylines": [[[p[0] / aspect, p[1]] for p in d] for d in dashes],
+                            "stroke_w": stroke, "color": color},
+                "_half_ndc": [hw / aspect, hh],
                 "_pinned": pinned}
 
     def _box_label_spec(self, an, fr) -> dict | None:
@@ -1183,17 +1548,35 @@ class RenderWorker:
         path, img_w, img_h = self._arrow_label_png(text)
         label_h = self._ARROW_LABEL_FRAC * self._arrow_label_scale()
         label_w = label_h * (img_w / max(1, img_h))
+        hw, hh = label_w, label_h      # half-extents in half-height units (see callout spec)
         cx = (min(xs) + max(xs)) / 2.0
-        cy = max(ys) + self.ARROW_2D_LABEL_GAP + label_h / 2.0     # clear of the top edge
+        cy = max(ys) + self.ARROW_2D_LABEL_GAP + hh     # clear of the top edge
         m = 2.0 * self.ARROW_LABEL_MARGIN_FRAC
-        lim_x = max(0.0, aspect - label_w / 2.0 - m)
-        lim_y = max(0.0, 1.0 - label_h / 2.0 - m)
+        lim_x = max(0.0, aspect - hw - m)
+        lim_y = max(0.0, 1.0 - hh - m)
         cx = min(max(cx, -lim_x), lim_x)
         cy = min(max(cy, -lim_y), lim_y)
         return {"image_path": path, "ndc": [cx / aspect, cy], "height_frac": label_h,
-                "_half_ndc": [(label_w / 2.0) / aspect, label_h / 2.0], "_pinned": False}
+                "_half_ndc": [hw / aspect, hh], "_pinned": False}
 
-    def _spread_arrow_labels(self, labels: list[dict]) -> list[dict]:
+    def _scale_bar_keepout(self, sb) -> list[tuple[float, float, float, float]]:
+        """The scale bar's box in label-placement units (NDC centre + half extents), so
+        a tag clamped into the bottom-left corner moves clear of it instead of being
+        drawn under it. Mirrors blender_script._make_scale_bar_quad (10 px margin)."""
+        if not sb:
+            return []
+        from PIL import Image
+
+        try:
+            with Image.open(sb["image_path"]) as im:
+                w, h = im.size
+        except OSError:
+            return []
+        W, H = max(1, self.job.settings.width), max(1, self.job.settings.height)
+        return [(-1.0 + 2.0 * (10.0 + w / 2.0) / W, -1.0 + 2.0 * (10.0 + h / 2.0) / H,
+                 w / W, h / H)]
+
+    def _spread_arrow_labels(self, labels: list[dict], keepout=()) -> list[dict]:
         """Nudge overlapping label tags apart so every one stays readable.
 
         Clamping labels into the frame makes two arrows that point off the same edge land
@@ -1205,9 +1588,11 @@ class RenderWorker:
         Labels riding an off-screen arrow sit this out entirely: they aren't visible, so
         moving them (or letting them shove a visible label around) would only disturb the
         tags the viewer can actually read.
+
+        `keepout` boxes (the scale bar) count as already placed.
         """
         margin = 2.0 * self.ARROW_LABEL_MARGIN_FRAC     # frame-height frac -> -1..1 units
-        placed: list[tuple[float, float, float, float]] = []   # (x, y, half_w, half_h)
+        placed: list[tuple[float, float, float, float]] = list(keepout)   # (x, y, half_w, half_h)
         out, onscreen = [], []
         for lbl in labels:
             if lbl.pop("_pinned", False):
@@ -1517,6 +1902,9 @@ class RenderWorker:
     # ---- scene spec ----
     def _build_scene_spec(self, frames: list[FrameState], index_offset: int = 0,
                           frame_times: list[float] | None = None) -> dict:
+        self._apply_camera_follow(
+            frames, frame_times or [(index_offset + i) / max(1, self.job.settings.fps)
+                                    for i in range(len(frames))])
         # On-screen scale (nm per pixel) per frame, for picking precomputed-mesh LOD
         # like neuroglancer. With dynamic LOD this varies per frame (coarser when the
         # layer is far/small on screen); otherwise every frame uses the finest.
@@ -1570,9 +1958,9 @@ class RenderWorker:
                     nmpp = _eff_nmpp(m.mesh_name, fi)
                     lc = self._frame_colors(m)
                     uid = self._mesh_uid(m.mesh_name, m.segment_ids, lc.cache_key(), nmpp)
-                    if uid not in mesh_specs:
+                    if uid not in mesh_specs and uid not in self._mesh_alias:
                         obj = self._mesh_obj(m.mesh_name, m.segment_ids, lc, nmpp)
-                        if obj:
+                        if obj and not self._dedupe_mesh_asset(uid, obj):
                             mesh_specs[uid] = {"id": uid, "obj_path": obj, "color": m.color}
             # annotation layers -> geometry assets via the same import path
             for an in fr.annotations:
@@ -1694,6 +2082,7 @@ class RenderWorker:
                 else:
                     uid = self._mesh_uid(m.mesh_name, m.segment_ids,
                                          self._frame_colors(m).cache_key(), _eff_nmpp(m.mesh_name, fi))
+                    uid = self._mesh_alias.get(uid, uid)
                 if uid and uid in mesh_specs:
                     # effective 3D alpha = layer visibility * cinematic fade * NG "Opacity (3d)"
                     eff = self._mesh_render_alpha(m)
@@ -1731,23 +2120,37 @@ class RenderWorker:
                 if uid in mesh_specs:
                     ov = {"opacity": an.opacity, "visible": an.opacity > 0.001,
                           "silhouette": 0.0}
-                    lock = self._arrow_screen_lock(an, fr)
+                    is_bracket = flat and is_bracket_layer(getattr(an, "name", ""))
+                    is_outline = flat and is_outline_layer(getattr(an, "name", ""))
+                    is_arrow = self._ann_arrows(an) and not (is_bracket or is_outline)
+                    lock = self._arrow_screen_lock(an, fr) if is_arrow else {}
                     ov.update(lock)
-                    is_arrow = self._ann_arrows(an)
                     shown = an.opacity > 0.001
-                    if flat and is_arrow:
+                    if flat and (is_arrow or is_bracket or is_outline):
                         # drawn as a 2D overlay instead — hide the scene geometry, or the
-                        # same arrow renders twice
+                        # same callout renders twice
                         ov["visible"] = False
                         ov["opacity"] = 0.0
                     overrides[uid] = ov
                     if shown and getattr(self.project, "arrow_labels", False):
-                        if is_arrow:
-                            lbl = (self._arrow_callout_spec(an, fr) if flat
+                        if is_bracket:
+                            lbl = self._bracket_callout_spec(an, fr, t_global)
+                        elif is_outline:
+                            lbl = self._outline_callout_spec(an, fr, t_global)
+                        elif is_arrow:
+                            lbl = (self._arrow_callout_spec(an, fr, t_global) if flat
                                    else self._arrow_label_spec(an, fr, lock))
                         else:                      # region box -> name what it contains
                             lbl = self._box_label_spec(an, fr)
                         if lbl:
+                            # a callout fades with its layer (e.g. a region box fading
+                            # out as the arrows inside it come on)
+                            if an.opacity < 0.999:
+                                lbl["opacity"] = float(an.opacity)
+                                for part in ([lbl.get("arrow"), lbl.get("bracket")]
+                                             + list(lbl.get("extra_arrows") or [])):
+                                    if part:
+                                        part["opacity"] = float(an.opacity)
                             arrow_labels.append(lbl)
             frame_specs.append({
                 "camera": {
@@ -1762,8 +2165,9 @@ class RenderWorker:
                 "slices": slices,
                 "mesh_overrides": overrides,
                 "fade_alpha": max(0.0, min(1.0, float(getattr(fr, "fade_alpha", 0.0) or 0.0))),
-                "scale_bar": self._scale_bar_spec(fr) if self._show_scale_bar else None,
-                "arrow_labels": self._spread_arrow_labels(arrow_labels),
+                "scale_bar": (sb := self._scale_bar_spec(fr) if self._show_scale_bar else None),
+                "arrow_labels": self._spread_arrow_labels(arrow_labels,
+                                                          self._scale_bar_keepout(sb)),
                 "index": index_offset + fi,   # global frame index (split cluster jobs)
             })
             self._progress(0.45 + 0.15 * (fi + 1) / len(frames),
@@ -1909,6 +2313,33 @@ class RenderWorker:
         smooth = self._auto_direct and _director.DirectorSettings().smooth_camera
         return state_at_time(kfs, t, smooth_ends=smooth)
 
+    def _resolve_flip_handed(self) -> bool:
+        """Whether the render needs a mirrored camera: the dataset's own chirality
+        correction (NG axis order is a reflection, e.g. z,y,x) XOR the project's
+        opt-in `mirror_horizontal` (an intentional whole-frame left/right flip, e.g.
+        to match a publication's orientation — see Project.mirror_horizontal). The two
+        stack instead of one overriding the other, so a z,y,x dataset that also wants
+        the publication mirror ends up NOT flipped (the two cancel out), which is
+        correct: chirality-correct-then-mirror == the identity camera.
+
+        The dataset half is constant per dataset, so any keyframe's `ng_state` would
+        do — but keyframes created by duplicating an existing one don't carry
+        `ng_state` along, and a project can end up with none at all (every keyframe a
+        copy of a copy). Fall back to the project's own scouting link, which always
+        has one, so the flip doesn't silently default to "off" (mirrored EM/meshes/
+        arrows, but otherwise looking like a normal render)."""
+        from ..data.ng_camera import handedness_flipped
+        st0 = next((k.ng_state for k in self.project.keyframes if k.ng_state), None)
+        if st0 is None and self.project.data_path:
+            from ..data.manifest import fetch_state
+            try:
+                st0 = fetch_state(self.project.data_path)
+            except Exception:
+                st0 = None
+        dataset_flip = bool(st0 and handedness_flipped(st0))
+        mirror = bool(getattr(self.project, "mirror_horizontal", False))
+        return dataset_flip != mirror
+
     def render_snapshots(self, times: list[float], out_dir) -> list[str]:
         """Render single still frames at the given GLOBAL times (seconds) into out_dir —
         used for clip preview thumbnails. The camera is interpolated at each time and any
@@ -1916,11 +2347,9 @@ class RenderWorker:
         import json
         from pathlib import Path
 
-        from ..data.ng_camera import handedness_flipped
         self._cb = None
         self._kfs = self.project.keyframes
-        st0 = next((k.ng_state for k in self.project.keyframes if k.ng_state), None)
-        self._flip_handed = bool(st0 and handedness_flipped(st0))
+        self._flip_handed = self._resolve_flip_handed()
         frames = [self._state_at_time(t) for t in times]
         if any(f is None for f in frames):
             return []
@@ -1943,12 +2372,7 @@ class RenderWorker:
             a, b = self.job.kf_range
             kfs = kfs[a : b + 1]
         self._kfs = kfs   # the exact keyframes these frames came from (for the director)
-        # Whether this dataset's NG axis order is a reflection (e.g. z,y,x): the camera
-        # is reordered to xyz, which flips image chirality, so the render mirrors the
-        # camera to match neuroglancer. Constant per dataset -> read once from any kf.
-        from ..data.ng_camera import handedness_flipped
-        st0 = next((k.ng_state for k in self.project.keyframes if k.ng_state), None)
-        self._flip_handed = bool(st0 and handedness_flipped(st0))
+        self._flip_handed = self._resolve_flip_handed()
         self._progress(0.05, "interpolating keyframes")
         # Timing matches neuroglancer's video_tool exactly (per-transition frame counts
         # and t-values). NG interpolates LINEARLY (constant velocity), so we default to
@@ -2033,7 +2457,11 @@ class RenderWorker:
         #                   QuickTime. 4:2:0 throws away the fine colored detail (sparkly
         #                   meshes on black); no crf recovers it, only full chroma does.
         # (The retained PNG frames are the true lossless master for publication/ProRes.)
-        common = ["-c:v", "libx264", "-preset", "slow", "-crf", "12", "-movflags", "+faststart"]
+        # BT.709 matrix + tags: untagged, ffmpeg encodes BT.601 but players decode HD as
+        # BT.709, so saturated colours shifted by viewer (see render_cli.BT709_ARGS)
+        common = ["-c:v", "libx264", "-preset", "slow", "-crf", "12", "-movflags", "+faststart",
+                  "-vf", "scale=out_color_matrix=bt709:out_range=tv",
+                  "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
         subprocess.run([
             ffmpeg, "-y", "-framerate", str(self.job.settings.fps),
             "-i", str(self.frames_dir / "frame_%05d.png"),

@@ -8,7 +8,13 @@ boundaries while choosing the finest label scale that fits the render budget.
 from __future__ import annotations
 
 import colorsys
+import contextlib
+import hashlib
+import json
 import os
+import socket
+import threading
+import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -432,7 +438,9 @@ def _mesh_to_trimesh(mesh, seg_id: int, origin_zyx_nm, colorize=None) -> trimesh
     if colorize is not None:
         r, g, b = colorize(int(seg_id))
         vcolors = np.tile(np.array([r, g, b, 1.0]) * 255, (len(verts_xyz), 1)).astype(np.uint8)
-    return trimesh.Trimesh(vertices=verts_xyz, faces=faces, vertex_colors=vcolors, process=False)
+    out = trimesh.Trimesh(vertices=verts_xyz, faces=faces, vertex_colors=vcolors, process=False)
+    out.metadata["seg_id"] = int(seg_id)
+    return out
 
 
 def _cleanup_mesh_lossless(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
@@ -556,13 +564,19 @@ def _postprocess_label_mesh(
     min_decimate_faces: int = _MIN_DECIMATE_FACES,
 ) -> trimesh.Trimesh:
     mesh = _cleanup_mesh_lossless(mesh)
-    if smooth_iters:
-        trimesh.smoothing.filter_taubin(mesh, iterations=smooth_iters)
-        mesh = _cleanup_mesh_lossless(mesh)
+    # Decimate BEFORE smoothing: Taubin's neighbor-averaging only diffuses a few
+    # edge-lengths of real distance per iteration, so smoothing a dense
+    # marching-cubes mesh (vertex spacing ~1 source voxel) barely moves the
+    # surface relative to voxel-scale staircasing. Coarsening first widens the
+    # edges smoothing averages over, so the same iteration count actually erases
+    # the staircase instead of leaving it untouched.
     if target_faces is not None and len(mesh.faces) > max(int(min_decimate_faces), int(target_faces)):
         simplified = _simplify_with_pyfqmr(mesh, int(target_faces))
         if simplified is not None:
             mesh = _cleanup_mesh_lossless(simplified)
+    if smooth_iters:
+        trimesh.smoothing.filter_taubin(mesh, iterations=smooth_iters)
+        mesh = _cleanup_mesh_lossless(mesh)
     return mesh
 
 
@@ -863,6 +877,7 @@ def _blockwise_raw_parts(vol, plan, seg_ids, *, colorize, block_voxels, max_work
             welded.merge_vertices()  # weld coincident boundary vertices across blocks
         except Exception:  # noqa: BLE001
             pass
+        welded.metadata["seg_id"] = int(seg_id)
         raw_parts.append(welded)
     return raw_parts, sc
 
@@ -965,6 +980,177 @@ def _raw_parts_for_plan(
     return raw_parts, sc
 
 
+# --- per-level geometry cache ---------------------------------------------------------
+# Meshing a big label layer at full resolution (e.g. a 9M-face mesh) is the most
+# expensive step of a render, and its result depends only on the labels and the meshing
+# parameters — not on colour, and not on which frames a render task happens to cover.
+# The coloured, per-LOD render assets are keyed on both, so without this a recolour or a
+# differently-chunked task re-meshed identical geometry (and parallel tasks all meshed
+# it at once). Cached here: each segment's finished (post-processed) part for one read
+# plan, colour-free; colours are applied on the way out. A lock lets one process build
+# a given entry while the others wait for it.
+_GEOM_CACHE_VERSION = "geom1"
+_GEOM_LOCK_HEARTBEAT_S = 20.0
+_GEOM_LOCK_STALE_S = 180.0      # a lock not refreshed for this long is abandoned
+_GEOM_LOCK_POLL_S = 10.0
+
+
+def _geom_cache_key(label_zarr_url, seg_ids, plan, blockwise, block_voxels, block_halo,
+                    smooth_iters, decimate_fraction) -> str:
+    bbox = (None if plan.bbox_xyz_nm is None
+            else [[round(float(v), 1) for v in c] for c in plan.bbox_xyz_nm])
+    spec = {"v": _GEOM_CACHE_VERSION, "url": label_zarr_url.rstrip("/"),
+            "ids": sorted(int(s) for s in seg_ids), "level": int(plan.level),
+            "stride": int(plan.stride or 1), "bbox": bbox, "blockwise": bool(blockwise),
+            "block_voxels": int(block_voxels) if blockwise else None,
+            "halo": int(block_halo) if blockwise else None,
+            "smooth": int(smooth_iters), "decimate": round(float(decimate_fraction), 6)}
+    return hashlib.md5(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _geom_cache_path(cache_dir, key) -> str:
+    return os.path.join(str(cache_dir), f"labelgeom_{key}.npz")
+
+
+def _geom_cache_load(cache_dir, key):
+    """(parts, raw_vertices) from the cache, or None. Parts carry metadata["seg_id"]."""
+    if not cache_dir:
+        return None
+    path = _geom_cache_path(cache_dir, key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            ids = [int(x) for x in z["ids"]]
+            parts = []
+            for i, sid in enumerate(ids):
+                m = trimesh.Trimesh(vertices=z[f"v{i}"], faces=z[f"f{i}"].astype(np.int64),
+                                    process=False)
+                m.metadata["seg_id"] = sid
+                parts.append(m)
+            return parts, int(z["raw_vertices"])
+    except Exception as e:  # noqa: BLE001 — a bad entry is rebuilt, never fatal
+        print(f"[labels] geometry cache entry unreadable ({e}); rebuilding", flush=True)
+        return None
+
+
+def _geom_cache_save(cache_dir, key, parts, raw_vertices) -> None:
+    if not cache_dir:
+        return
+    os.makedirs(str(cache_dir), exist_ok=True)
+    arrs = {"ids": np.array([int(p.metadata["seg_id"]) for p in parts], dtype=np.uint64),
+            "raw_vertices": np.array(int(raw_vertices))}
+    for i, p in enumerate(parts):
+        arrs[f"v{i}"] = np.asarray(p.vertices, dtype=np.float64)
+        arrs[f"f{i}"] = np.asarray(p.faces, dtype=np.int32 if len(p.vertices) < 2**31 else np.int64)
+    path = _geom_cache_path(cache_dir, key)
+    tmp = f"{path}.{socket.gethostname()}.{os.getpid()}.tmp"
+    with open(tmp, "wb") as fh:
+        np.savez(fh, **arrs)
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def _geom_build_lock(cache_dir, key):
+    """Hold the build lock for one cache entry: yields once this process may build it —
+    or once another process has finished it (the caller re-checks the cache first).
+    The holder refreshes the lock's mtime; a lock left by a killed process goes stale
+    after _GEOM_LOCK_STALE_S and is taken over."""
+    if not cache_dir:
+        yield
+        return
+    os.makedirs(str(cache_dir), exist_ok=True)
+    lock = os.path.join(str(cache_dir), f"labelgeom_{key}.lock")
+    waited = False
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{socket.gethostname()}:{os.getpid()}".encode())
+            os.close(fd)
+            break
+        except FileExistsError:
+            if os.path.exists(_geom_cache_path(cache_dir, key)):
+                yield                               # someone else built it
+                return
+            try:
+                age = time.time() - os.path.getmtime(lock)
+            except FileNotFoundError:
+                continue
+            if age > _GEOM_LOCK_STALE_S:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(lock)
+                continue
+            if not waited:
+                print(f"[labels] another process is meshing this layer; waiting ({key})",
+                      flush=True)
+                waited = True
+            time.sleep(_GEOM_LOCK_POLL_S)
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(_GEOM_LOCK_HEARTBEAT_S):
+            with contextlib.suppress(OSError):
+                os.utime(lock)
+
+    th = threading.Thread(target=beat, daemon=True)
+    th.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(lock)
+
+
+def _colorize_parts(parts, colorize):
+    """Flat per-segment vertex colours (what _mesh_to_trimesh would have baked)."""
+    if colorize is None:
+        return parts
+    for p in parts:
+        r, g, b = colorize(int(p.metadata["seg_id"]))
+        p.visual.vertex_colors = np.tile(np.array([r, g, b, 1.0]) * 255,
+                                         (len(p.vertices), 1)).astype(np.uint8)
+    return parts
+
+
+def _plan_parts(vol, plan, seg_ids, *, blockwise, block_voxels, block_halo, max_workers,
+                label_name, target_vertices, smooth_iters, decimate_fraction):
+    """Mesh one read plan and post-process each segment (colour-free): returns
+    ``(parts, raw_vertices)``; ``raw_vertices == 0`` when the plan produced nothing."""
+    decimate_active = 0.0 < decimate_fraction < 1.0
+    raw_parts, sc = _raw_parts_for_plan(
+        vol, plan, seg_ids, colorize=None, blockwise=blockwise, block_voxels=block_voxels,
+        block_halo=block_halo, max_workers=max_workers, label_name=label_name,
+        target_vertices=target_vertices,
+    )
+    if not raw_parts:
+        return [], 0
+    # Vertices we LOADED (pre-decimation) — the budget/refinement gate when
+    # decimation is active, so target_vertices governs the read scale and the
+    # decimation step reduces the final mesh from there.
+    raw_vertices = sum(len(p.vertices) for p in raw_parts)
+    parts = []
+    for part in raw_parts:
+        part_target = None
+        min_decimate_faces = _MIN_DECIMATE_FACES
+        if decimate_active:
+            # Decimate each segment to the keep-fraction (per segment so colors
+            # are preserved), flooring only at a small viable face count so the
+            # fraction holds even on many-small-segment layers.
+            part_target = max(_DECIMATE_MIN_FACES, int(len(part.faces) * decimate_fraction))
+            min_decimate_faces = _DECIMATE_MIN_FACES
+        out = _postprocess_label_mesh(
+            part,
+            target_faces=part_target,
+            smooth_iters=smooth_iters,
+            min_decimate_faces=min_decimate_faces,
+        )
+        out.metadata["seg_id"] = int(part.metadata["seg_id"])
+        parts.append(out)
+    parts = [p for p in parts if len(p.faces) and len(p.vertices)]
+    return parts, raw_vertices
+
+
 def generate_zmesh_auto(
     label_zarr_url: str,
     seg_ids,
@@ -979,6 +1165,7 @@ def generate_zmesh_auto(
     block_halo: int = 1,
     max_workers: int | None = None,
     colorize=None,
+    cache_dir=None,
 ) -> trimesh.Trimesh:
     """Generate selected IDs with zmesh at the finest scale that fits the budget.
 
@@ -999,6 +1186,10 @@ def generate_zmesh_auto(
     so the final mesh lands BELOW the budget (e.g. load 15M, decimate 0.25 -> ~3.7M).
     `smooth_iters` applies Taubin smoothing. Decimation/smoothing run per segment so
     instance colors are preserved.
+
+    `cache_dir` keeps each level's finished geometry colour-free (see
+    _geom_cache_key), so re-colouring a layer or re-rendering it from another task
+    reuses it instead of meshing again.
     """
     decimate_fraction = float(decimate_fraction or 0.0)
     decimate_active = 0.0 < decimate_fraction < 1.0
@@ -1034,44 +1225,28 @@ def generate_zmesh_auto(
                     f"threshold={_blockwise_read_threshold_bytes() / 1e9:.2f}GB",
                     flush=True,
                 )
-            raw_parts, sc = _raw_parts_for_plan(
-                vol,
-                plan,
-                seg_ids,
-                colorize=colorize,
-                blockwise=plan_blockwise,
-                block_voxels=block_voxels,
-                block_halo=block_halo,
-                max_workers=max_workers,
-                label_name=_label_source_name(label_zarr_url),
-                target_vertices=target_vertices,
-            )
-            if not raw_parts:
+            key = _geom_cache_key(label_zarr_url, seg_ids, plan, plan_blockwise,
+                                  block_voxels, block_halo, smooth_iters, decimate_fraction)
+            cached = _geom_cache_load(cache_dir, key)
+            if cached is None:
+                with _geom_build_lock(cache_dir, key):
+                    cached = _geom_cache_load(cache_dir, key)   # built while we waited?
+                    if cached is None:
+                        cached = _plan_parts(
+                            vol, plan, seg_ids, blockwise=plan_blockwise,
+                            block_voxels=block_voxels, block_halo=block_halo,
+                            max_workers=max_workers,
+                            label_name=_label_source_name(label_zarr_url),
+                            target_vertices=target_vertices, smooth_iters=smooth_iters,
+                            decimate_fraction=decimate_fraction)
+                        _geom_cache_save(cache_dir, key, *cached)
+            else:
+                print(f"[labels] zmesh cached {_label_source_name(label_zarr_url)} "
+                      f"level=s{plan.level} ({key})", flush=True)
+            parts, raw_vertices = cached
+            if raw_vertices == 0:           # the level had no geometry: try the next one
                 continue
-            # Vertices we LOADED (pre-decimation) — the budget/refinement gate when
-            # decimation is active, so target_vertices governs the read scale and the
-            # decimation step reduces the final mesh from there.
-            raw_vertices = sum(len(p.vertices) for p in raw_parts)
-
-            parts = []
-            for part in raw_parts:
-                part_target = None
-                min_decimate_faces = _MIN_DECIMATE_FACES
-                if decimate_active:
-                    # Decimate each segment to the keep-fraction (per segment so colors
-                    # are preserved), flooring only at a small viable face count so the
-                    # fraction holds even on many-small-segment layers.
-                    part_target = max(_DECIMATE_MIN_FACES, int(len(part.faces) * decimate_fraction))
-                    min_decimate_faces = _DECIMATE_MIN_FACES
-                parts.append(
-                    _postprocess_label_mesh(
-                        part,
-                        target_faces=part_target,
-                        smooth_iters=smooth_iters,
-                        min_decimate_faces=min_decimate_faces,
-                    )
-                )
-            parts = [p for p in parts if len(p.faces) and len(p.vertices)]
+            parts = _colorize_parts(parts, colorize)
             if not parts:
                 print(
                     "[labels] zmesh probe empty after cleanup; trying finer level "

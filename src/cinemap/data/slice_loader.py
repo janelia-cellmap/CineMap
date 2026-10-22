@@ -180,14 +180,43 @@ class EMVolume:
         hi_zyx = [float(tr[i]) + shp[i] * float(sc[i]) for i in range(3)]
         return [lo_zyx[2], lo_zyx[1], lo_zyx[0]], [hi_zyx[2], hi_zyx[1], hi_zyx[0]]
 
-    def pick_level_for_box(self, bbox_xyz_nm, target_voxels: int = 8_000_000) -> int:
-        """Finest level whose voxel count inside the bbox is <= target_voxels."""
+    def pick_level_for_box(self, bbox_xyz_nm, target_voxels: int = 8_000_000,
+                           nm_per_px: float | None = None) -> int:
+        """Level for reading a 3D bbox.
+
+        If `nm_per_px` is given, prefers the same physical-zoom reasoning as
+        `pick_level_for_nm_per_px` — the coarsest level that still resolves at
+        least one voxel per screen pixel — so tilted/oblique planes track
+        camera zoom instead of only the box's raw voxel count (which used to
+        make oblique reads go coarser than an equivalent axis-aligned view
+        whenever the bbox was large, independent of how zoomed-in the camera
+        actually was). `target_voxels` remains a memory safety net: the
+        result never reads more than that many voxels, even if the zoom-ideal
+        level would.
+        """
         ext = [bbox_xyz_nm[1][i] - bbox_xyz_nm[0][i] for i in range(3)]  # x,y,z nm
-        for lvl, sc in enumerate(self.level_scale_nm):  # sc is z,y,x
-            nvox = (ext[0] / sc[2]) * (ext[1] / sc[1]) * (ext[2] / sc[0])
-            if nvox <= target_voxels:
-                return lvl
-        return len(self.level_scale_nm) - 1
+
+        def nvox_at(lvl: int) -> float:
+            sc = self.level_scale_nm[lvl]  # z,y,x nm/voxel
+            return (ext[0] / sc[2]) * (ext[1] / sc[1]) * (ext[2] / sc[0])
+
+        budget_lvl = len(self.level_scale_nm) - 1
+        for lvl in range(len(self.level_scale_nm)):
+            if nvox_at(lvl) <= target_voxels:
+                budget_lvl = lvl
+                break
+
+        if nm_per_px is None or nm_per_px <= 0:
+            return budget_lvl
+
+        zoom_lvl = 0
+        for lvl, sc in enumerate(self.level_scale_nm):
+            in_plane_nm = max(sc)
+            if in_plane_nm <= nm_per_px:
+                zoom_lvl = lvl
+            else:
+                break
+        return max(zoom_lvl, budget_lvl)  # never finer than the memory budget allows
 
     def read_box(self, bbox_xyz_nm, level: int, pad: int = 2):
         """Read a 3D subvolume covering bbox at `level`.
@@ -217,38 +246,137 @@ class EMVolume:
         return u, v, n
 
     def read_oblique_slice(self, normal_xyz, point_xyz, half_nm: float,
-                           target_px: int = 640, target_voxels: int = 24_000_000) -> SliceResult:
+                           target_px: int = 640, target_voxels: int = 800_000_000,
+                           raw: bool = False) -> SliceResult:
         """Resample a tilted plane (unit `normal` through `point`) over a 2*half_nm
-        square patch. Reads the bounding-box subvolume at a level bounded by
-        target_voxels, then nearest-samples the plane grid (fast; fine for EM)."""
+        square patch, matching neuroglancer's approach on two axes:
+
+        - Level is chosen from the plane's physical on-screen scale (nm/px), same
+          as the axis-aligned path, so a tilted plane gets the same resolution an
+          equivalent axis-aligned view would.
+        - Only the chunks the plane's sample grid actually touches are fetched —
+          not the full axis-aligned bounding cuboid, which for a steeply tilted
+          plane can be orders of magnitude bigger than the plane itself (a thin
+          tilted rectangle's AABB is roughly cube-shaped, mostly empty space far
+          from the plane).
+
+        Samples are trilinearly interpolated (`raw=False`, continuous EM/image
+        data) or nearest-neighbor (`raw=True`, segmentation ids — blending ids
+        would be meaningless).
+        """
         u, v, n = self.plane_basis(normal_xyz)
         p = np.asarray(point_xyz, float)
         px = max(8, int(target_px))
         s = np.linspace(-half_nm, half_nm, px)
         su, sv = np.meshgrid(s, s)                                  # (px,px)
         world = p[None, None, :] + su[..., None] * u + sv[..., None] * v   # (px,px,3) xyz nm
+        nm_per_px = (2.0 * half_nm) / max(1, px - 1)
+
         flat = world.reshape(-1, 3)
         wmin, wmax = flat.min(0), flat.max(0)
         bbox = ((wmin[0], wmin[1], wmin[2]), (wmax[0], wmax[1], wmax[2]))
-        level = self.pick_level_for_box(bbox, target_voxels)
-        sub, (z0, y0, x0), sc, tr = self.read_box(bbox, level)      # sub is z,y,x
-        sub = _to_display_dtype(np.asarray(sub))
-        fx = (world[..., 0] - tr[2]) / sc[2] - x0
-        fy = (world[..., 1] - tr[1]) / sc[1] - y0
-        fz = (world[..., 2] - tr[0]) / sc[0] - z0
-        oob = ((fz < 0) | (fz > sub.shape[0] - 1) | (fy < 0) | (fy > sub.shape[1] - 1)
-               | (fx < 0) | (fx > sub.shape[2] - 1))
-        iz = np.clip(np.round(fz).astype(int), 0, sub.shape[0] - 1)
-        iy = np.clip(np.round(fy).astype(int), 0, sub.shape[1] - 1)
-        ix = np.clip(np.round(fx).astype(int), 0, sub.shape[2] - 1)
-        img = sub[iz, iy, ix]
+        level = self.pick_level_for_box(bbox, target_voxels, nm_per_px=nm_per_px)
+
+        arr = self._open_level(level)
+        sc = self.level_scale_nm[level]          # z,y,x nm/voxel
+        tr = self.level_translation_nm[level]    # z,y,x nm
+        shape = arr.shape                        # z,y,x voxels
+
+        fx = (world[..., 0] - tr[2]) / sc[2]
+        fy = (world[..., 1] - tr[1]) / sc[1]
+        fz = (world[..., 2] - tr[0]) / sc[0]
+        oob = ((fz < 0) | (fz > shape[0] - 1) | (fy < 0) | (fy > shape[1] - 1)
+               | (fx < 0) | (fx > shape[2] - 1))
+
+        img = self._gather_plane(arr, shape, fz, fy, fx, raw=raw)
         img[oob] = 0
+
         origin = p - half_nm * u - half_nm * v   # corner at su=-half, sv=-half (rows=v, cols=u)
         return SliceResult(
             image=img, axis="oblique", position_nm=float(np.dot(p, n)),
             origin_nm=tuple(origin), u_nm=tuple(2 * half_nm * u), v_nm=tuple(2 * half_nm * v),
             scale_level=level,
         )
+
+    @staticmethod
+    def _gather_plane(arr, shape, fz, fy, fx, raw: bool) -> np.ndarray:
+        """Sample `arr` at fractional voxel coords (fz,fy,fx), fetching only the
+        chunks actually touched instead of one dense box covering their full
+        extent. `raw=True` -> nearest-neighbor (segmentation ids); otherwise
+        trilinear. Coordinates may be out of [0, shape-1]; callers are expected
+        to mask those out afterward (this clips them in for the gather).
+
+        Samples are grouped by chunk with one sort per lookup, so each chunk reads
+        exactly its own samples. (Masking the whole sample grid once per chunk, as
+        before, cost chunks x samples: a full-resolution tilted plane touches
+        thousands of chunks with 2.5M samples, which took minutes per frame.)"""
+        cz, cy, cx = arr.chunk_layout.read_chunk.shape
+        dtype = arr.dtype.numpy_dtype
+        out_shape = fz.shape
+        ny = -(-shape[1] // cy)
+        nx = -(-shape[2] // cx)
+
+        def chunk_keys(za, ya, xa):
+            return ((za // cz) * ny + (ya // cy)) * nx + (xa // cx)
+
+        def fetch_chunks(keys):
+            pending = {}
+            for k in keys:
+                zc, rem = divmod(int(k), ny * nx)
+                yc, xc = divmod(rem, nx)
+                z0, z1 = zc * cz, min(shape[0], (zc + 1) * cz)
+                y0, y1 = yc * cy, min(shape[1], (yc + 1) * cy)
+                x0, x1 = xc * cx, min(shape[2], (xc + 1) * cx)
+                pending[int(k)] = (arr[z0:z1, y0:y1, x0:x1].read(), (z0, y0, x0))
+            return {k: (np.asarray(fut.result()), origin) for k, (fut, origin) in pending.items()}
+
+        def lookup(chunks, za, ya, xa):
+            zf, yf, xf = za.ravel(), ya.ravel(), xa.ravel()
+            key = chunk_keys(zf, yf, xf)
+            order = np.argsort(key, kind="stable")
+            sk = key[order]
+            cut = np.flatnonzero(np.diff(sk)) + 1
+            out = np.empty(key.size, dtype=dtype)
+            for s0, s1 in zip(np.r_[0, cut], np.r_[cut, key.size]):
+                idx = order[s0:s1]
+                data, (z0, y0, x0) = chunks[int(sk[s0])]
+                out[idx] = data[zf[idx] - z0, yf[idx] - y0, xf[idx] - x0]
+            return out.reshape(za.shape)
+
+        if raw:
+            iz = np.clip(np.round(fz), 0, shape[0] - 1).astype(np.int64)
+            iy = np.clip(np.round(fy), 0, shape[1] - 1).astype(np.int64)
+            ix = np.clip(np.round(fx), 0, shape[2] - 1).astype(np.int64)
+            chunks = fetch_chunks(np.unique(chunk_keys(iz, iy, ix)))
+            return lookup(chunks, iz, iy, ix)
+
+        iz0 = np.clip(np.floor(fz), 0, shape[0] - 1).astype(np.int64)
+        iy0 = np.clip(np.floor(fy), 0, shape[1] - 1).astype(np.int64)
+        ix0 = np.clip(np.floor(fx), 0, shape[2] - 1).astype(np.int64)
+        iz1 = np.clip(iz0 + 1, 0, shape[0] - 1)
+        iy1 = np.clip(iy0 + 1, 0, shape[1] - 1)
+        ix1 = np.clip(ix0 + 1, 0, shape[2] - 1)
+        wz = np.clip(fz - iz0, 0.0, 1.0)
+        wy = np.clip(fy - iy0, 0.0, 1.0)
+        wx = np.clip(fx - ix0, 0.0, 1.0)
+
+        corners = [
+            (za, ya, xa, wa * wb * wc)
+            for za, wa in ((iz0, 1 - wz), (iz1, wz))
+            for ya, wb in ((iy0, 1 - wy), (iy1, wy))
+            for xa, wc in ((ix0, 1 - wx), (ix1, wx))
+        ]
+        chunks = fetch_chunks(np.unique(np.concatenate(
+            [chunk_keys(za, ya, xa).ravel() for za, ya, xa, _ in corners])))
+
+        img_f = np.zeros(out_shape, dtype=np.float64)
+        for za, ya, xa, wgt in corners:
+            img_f += wgt * lookup(chunks, za, ya, xa).astype(np.float64)
+
+        if np.issubdtype(dtype, np.integer):
+            info = np.iinfo(dtype)
+            img_f = np.clip(np.round(img_f), info.min, info.max)
+        return img_f.astype(dtype)
 
     def pick_level_for_nm_per_px(self, axis: str, nm_per_px: float) -> int:
         """Neuroglancer-style multiscale choice from physical screen scale.
